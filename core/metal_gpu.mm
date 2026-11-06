@@ -3088,13 +3088,18 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
     Image dil;
     id<MTLComputePipelineState> dpipe = c.pipe("rob_gcam_dilate");
-    if (!resample && !cfg.gcam_sabre_min5x5 && dpipe) {
+    // Run the soft §7 dilate on the GPU for BOTH guide-res and raw/merge-res (resample):
+    // rob_gcam_dilate operates on b_R at its own dims, so it works at raw res too. The 2x
+    // guide->quarter downsample is forced OFF on the resample path (already finer than the
+    // guide), matching the host twin. Only the opt-in extra n x n min (gcam_sabre_min5x5)
+    // still forces the host §7 below.
+    if (!cfg.gcam_sabre_min5x5 && dpipe) {
         id<MTLBuffer> b_dil = buf(nullptr, mask_b);
         if (b_dil) {
             struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
             RobGcamDilateParamsCPU dp{};
             dp.h = (uint32_t)th; dp.w = (uint32_t)tw;
-            dp.dilate_2x = cfg.gcam_sabre_dilate_2x ? 1u : 0u;
+            dp.dilate_2x = (!resample && cfg.gcam_sabre_dilate_2x) ? 1u : 0u;
             dp.deadzone = cfg.gcam_sabre_dilate_deadzone; dp.div = cfg.gcam_sabre_dilate_div;
             id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc2 = cmd2 ? [cmd2 computeCommandEncoder] : nil;
