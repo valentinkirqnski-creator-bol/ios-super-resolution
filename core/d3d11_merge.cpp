@@ -282,6 +282,7 @@ bool merge_comp_band_d3d11(const Image& comp_raw, const FlowField& flow, const C
                            int frame_id) {
     // Unsupported configurations -> let the caller run the CPU accumulate.
     if (flow.has_dense() || (cfg.affine_flow_enabled && flow.has_affine())) return false;
+    if (cfg.gcam_flow_bilinear_active()) return false;   // bilinear flow not ported -> CPU
     if (robustness.c > 1) return false;                 // per-channel R not ported yet
     if (comp_raw.h <= 0 || comp_raw.w <= 0) return false;  // no resident raw pixels
     if (robustness.h <= 0 || robustness.w <= 0) return false;

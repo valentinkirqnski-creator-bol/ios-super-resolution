@@ -3338,7 +3338,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = false ? 1u : 0u;
+    mp.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;
     mp.affine_flow = rob_use_affine ? 1u : 0u;
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
@@ -5620,7 +5620,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
             (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
              p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
         p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
-        p.flow_bilinear = 0u;
+        p.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;   // gcam_sabre_flow_bilinear
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
         p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || cfg.gcam_sabre_merge_res || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
@@ -5880,7 +5880,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // falls back to guide resolution when the reference's Dodgson-upscaled
     // stats are missing, so the flag can say "raw" while the mask is guide.
     // See accumulate_comp in merge.cpp.
-    p.flow_bilinear = false ? 1u : 0u;
+    p.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;   // gcam_sabre_flow_bilinear
     // robustness_guide_res_bilinear: bilinear fetch of the guide-res mask = its
     // upsample to the merge grid.
     p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || cfg.gcam_sabre_merge_res || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;

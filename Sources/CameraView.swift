@@ -1227,6 +1227,11 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_gcam_enabled {
+                        Toggle("Motion Field Bilinear Interpolation", isOn: $cam.tuningParams.gcam_sabre_flow_bilinear)
+                        Text("""
+                             To eliminate tile-boundary artifacts under rotation or sub-pixel motion, the per-tile motion vectors are bilinearly interpolated across tile centres into a smooth per-pixel motion field. The robustness model already computes its local colour difference on this field (as GCam does); turning this ON makes the merge place its samples (kernel regression) with the same continuous field, so the mask grades exactly the samples the merge fetches. Off (default) = the merge uses one vector per tile. Dense / affine motion take precedence when they are on. Requires GCam SABRE Robustness.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("Noise Model (Monte-Carlo)", isOn: $cam.tuningParams.gcam_sabre_noise_model)
                         Text("""
                              Builds the real noise LUT from the DNG NoiseProfile (shot S + read O per channel) propagated through WB gain, white clip, sqrt and the two-green average by Monte Carlo, then applies it: the guide's green-only decision uses the true green noise, and the operator subtracts (ref+comp) noise before rejecting — the paper's noise-corrected form, which lets the ×6 boost's variance test actually gate and stops calm textured areas from being over-rejected. OFF = noise-blind device match (most aggressive). When ON, the "Robustness Noise" slider below is ignored (the LUT is applied in full).

@@ -246,6 +246,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_noise_model"))  cfg.gcam_sabre_noise_model = bv("gcam_sabre_noise_model");
     if (has("gcam_sabre_dilate_2x"))    cfg.gcam_sabre_dilate_2x = bv("gcam_sabre_dilate_2x");
     if (has("gcam_sabre_rejection_only")) cfg.gcam_sabre_rejection_only = bv("gcam_sabre_rejection_only");
+    if (has("gcam_sabre_flow_bilinear")) cfg.gcam_sabre_flow_bilinear = bv("gcam_sabre_flow_bilinear");
     if (has("gcam_sabre_kernel"))       cfg.gcam_sabre_kernel = bv("gcam_sabre_kernel");
     if (has("gcam_cov_shrinked_sigma")) cfg.gcam_cov_shrinked_sigma = fv("gcam_cov_shrinked_sigma");
     if (has("gcam_cov_stretched_sigma")) cfg.gcam_cov_stretched_sigma = fv("gcam_cov_stretched_sigma");

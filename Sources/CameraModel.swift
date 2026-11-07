@@ -319,6 +319,9 @@ struct TuningParams: Equatable, Codable {
     /// the cubic B-spline (SampleBicubicAbsolute) + bicubic pair. Off = the exact
     /// non-REJECTION_ONLY (#else) match.
     var gcam_sabre_rejection_only: Bool = false
+    /// Bilinear motion field for the merge: per-tile flow interpolated between tile
+    /// centres, the same field the gcam robustness operator warps with. Off by default.
+    var gcam_sabre_flow_bilinear: Bool = false
     /// GCam ComputeGuideImage o_gauss_cov: build the MERGE kernel from the GCam structure
     /// tensor (ConstructGaussianCovariance) instead of estimate_kernels. Opt-in, merge-
     /// critical; the six covariance constants default to the realshot2 2x-SRZ capture
@@ -576,7 +579,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_kernel, gcam_cov_scale
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -727,6 +730,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_noise_model = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_noise_model) ?? gcam_sabre_noise_model
         gcam_sabre_dilate_2x = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_2x) ?? gcam_sabre_dilate_2x
         gcam_sabre_rejection_only = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_rejection_only) ?? gcam_sabre_rejection_only
+        gcam_sabre_flow_bilinear = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_flow_bilinear) ?? gcam_sabre_flow_bilinear
         gcam_sabre_kernel = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_kernel) ?? gcam_sabre_kernel
         gcam_cov_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_cov_scale) ?? gcam_cov_scale
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
@@ -2582,6 +2586,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_noise_model": NSNumber(value: tuningParams.gcam_sabre_noise_model),
             "gcam_sabre_dilate_2x": NSNumber(value: tuningParams.gcam_sabre_dilate_2x),
             "gcam_sabre_rejection_only": NSNumber(value: tuningParams.gcam_sabre_rejection_only),
+            "gcam_sabre_flow_bilinear": NSNumber(value: tuningParams.gcam_sabre_flow_bilinear),
             "gcam_sabre_kernel": NSNumber(value: tuningParams.gcam_sabre_kernel),
             "gcam_cov_scale": NSNumber(value: tuningParams.gcam_cov_scale),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),

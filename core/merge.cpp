@@ -163,6 +163,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 // rotation/yaw/pitch warp correctly. At a tile centre this
                 // equals flow.dx/dy(py,px), so flag-off behaviour is unchanged.
                 flow.sample_affine(lr_y, lr_x, tile_size, flowx, flowy);
+            } else if (cfg.gcam_flow_bilinear_active()) {
+                // gcam_sabre_flow_bilinear: smooth per-pixel field (tile vectors
+                // interpolated between tile centres) -- the same field the gcam
+                // robustness operator warps with (gcam_tile_bilinear), so the mask
+                // grades this exact fetch.
+                flow.sample_bilinear(lr_y, lr_x, tile_size, flowx, flowy);
             } else {
                 flowx = flow.dx(py, px);
                 flowy = flow.dy(py, px);
