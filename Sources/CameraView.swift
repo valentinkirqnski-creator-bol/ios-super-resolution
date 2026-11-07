@@ -1186,6 +1186,22 @@ struct CameraView: View {
                     .pickerStyle(.segmented)
                     Toggle("Viewfinder Grid", isOn: $cam.gridEnabled)
                 }
+
+                Section(header: Text("JPG Look")) {
+                    ispRow("Black Level", $cam.tuningParams.hdr_black_percentile, 0...0.05, "%.3f")
+                    ispRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
+                    Button("Reset JPG Look") {
+                        cam.tuningParams.hdr_black_percentile = TuningParams.appDefaults.hdr_black_percentile
+                        cam.tuningParams.hdr_vibrance = TuningParams.appDefaults.hdr_vibrance
+                    }
+                    Text("""
+                         Black Level sets how deep the shadows render \u{2014} higher crushes \
+                         more of the darkest tones to pure black. Vibrance lifts muted colours \
+                         without over-saturating skin or blown highlights. Both apply to the \
+                         JPG export and the DNG's in-app/Photos preview.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

@@ -642,6 +642,7 @@ bool process_gpu(const std::vector<const uint16_t*>& frames, int w, int h,
     std::memcpy(rgb_out.data(), out8.contents, (size_t)w*h*3);
     return true;
     } // autoreleasepool
+    return false; // unreachable; satisfies -Werror=return-type
 }
 
 }} // namespace hhsr::hdrplus

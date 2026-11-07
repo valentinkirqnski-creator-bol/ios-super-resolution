@@ -272,8 +272,6 @@ static std::vector<uint8_t> serialize_ifd_at(IFD& ifd, uint32_t base_offset) {
     return out;
 }
 
-} // namespace (anonymous) — write_bayer_dng follows, then the anon block reopens
-
 // ---------------------------------------------------------------------------
 // Minimal single-strip CFA (Bayer) DNG. Used by HDR mode, whose merge output is
 // a denoised Bayer mosaic in the sensor's native scale (not demosaiced RGB like
@@ -357,8 +355,6 @@ bool write_bayer_dng(const std::string& path,
     std::fclose(f);
     return ok;
 }
-
-namespace {
 
 // EXIF RATIONAL from a float (exposure/aperture/focal length): denominator by
 // magnitude so short shutter speeds (1/8000) and long ones keep precision.
