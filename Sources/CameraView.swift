@@ -69,8 +69,10 @@ struct CameraView: View {
             }
             cam.start()
         }
-        .onDisappear { cam.stop() }
+        .onDisappear { cam.cancelSelfTimer(); cam.stop() }
         .onChange(of: scenePhase) { phase in
+            // Don't let a pending self-timer fire a capture in the background.
+            if phase != .active { cam.cancelSelfTimer() }
             cam.setAppActive(phase == .active)
         }
         .onChange(of: showViewer) { open in
@@ -136,9 +138,21 @@ struct CameraView: View {
                     .allowsHitTesting(false)
             }
 
-            thirdsGrid
-                .frame(width: width, height: height)
-                .allowsHitTesting(false)
+            if cam.gridEnabled {
+                thirdsGrid
+                    .frame(width: width, height: height)
+                    .allowsHitTesting(false)
+            }
+
+            if cam.isCountingDown {
+                Text("\(cam.countdownRemaining)")
+                    .font(.system(size: 92, weight: .thin, design: .rounded).monospacedDigit())
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 8)
+                    .frame(width: width, height: height)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
 
             // ISO/shutter controls live in the exposure bar ABOVE the viewfinder
             // (see `exposureBar`), so nothing covers the preview here.
@@ -334,7 +348,9 @@ struct CameraView: View {
             HStack(spacing: 14) {
                 frameCountControl
                 resolutionControl
+                hdrControl
                 formatControl
+                timerControl
                 Spacer()
                 // ISO/shutter now live in the exposure bar below the top strip,
                 // so they are not duplicated here.
@@ -364,10 +380,13 @@ struct CameraView: View {
     /// Output upscale factor: 1× (12MP) or 2× (48MP super-resolution). Sits next
     /// to the frame-count selector; governs both live capture and imports.
     private var resolutionControl: some View {
-        HStack(spacing: 0) {
+        // Disabled while HDR mode is on: HDR+ runs at native 12MP, so the
+        // 12/48 choice does not apply.
+        let locked = cam.isBusy || cam.hdrMode
+        return HStack(spacing: 0) {
             ForEach(OutputResolutionMode.allCases) { mode in
                 let selected = cam.outputResolutionMode == mode
-                Button(action: { if !cam.isBusy { cam.outputResolutionMode = mode } }) {
+                Button(action: { if !locked { cam.outputResolutionMode = mode } }) {
                     Text(mode.label)   // "12MP" / "48MP"
                         .font(.system(size: 11, weight: selected ? .bold : .medium, design: .rounded))
                         .foregroundColor(selected ? .black : .white.opacity(0.8))
@@ -375,12 +394,30 @@ struct CameraView: View {
                         .frame(height: 26)
                         .background(selected ? Color.white.opacity(0.92) : Color.clear)
                 }
-                .disabled(cam.isBusy)
+                .disabled(locked)
             }
         }
         .background(Capsule().fill(Color.white.opacity(0.12)))
         .clipShape(Capsule())
+        .opacity(locked ? 0.5 : 1)
+    }
+
+    /// HDR toggle beside the 12/48 switch. On = route capture through the HDR+
+    /// pipeline (a different algorithm); the 12/48 control greys out.
+    private var hdrControl: some View {
+        Button(action: { if !cam.isBusy { cam.hdrMode.toggle() } }) {
+            Text("HDR")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(cam.hdrMode ? .black : .white.opacity(0.8))
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(Capsule().fill(cam.hdrMode ? Color.yellow.opacity(0.92)
+                                                       : Color.white.opacity(0.12)))
+        }
+        .disabled(cam.isBusy)
         .opacity(cam.isBusy ? 0.5 : 1)
+        .accessibilityLabel("HDR mode")
+        .accessibilityValue(cam.hdrMode ? "On" : "Off")
     }
 
     /// What lands in Photos: the linear DNG, or the HDR-finished JPG rendered
@@ -404,6 +441,37 @@ struct CameraView: View {
         .opacity(cam.isBusy ? 0.5 : 1)
         .accessibilityLabel("Save format")
         .accessibilityValue(cam.exportFormat.label)
+    }
+
+    /// Self-timer chip: taps cycle Off → 3s → 5s → 10s → Off. The same value is
+    /// editable in Settings (both bind `cam.selfTimerSeconds`), so the two stay
+    /// in sync. When armed, the shutter starts a countdown before the burst.
+    private var timerControl: some View {
+        let secs = cam.selfTimerSeconds
+        let on = secs > 0
+        return Button(action: {
+            guard !cam.isBusy else { return }
+            let ladder = [0, 3, 5, 10]
+            let idx = ladder.firstIndex(of: secs) ?? 0
+            cam.selfTimerSeconds = ladder[(idx + 1) % ladder.count]
+        }) {
+            HStack(spacing: 3) {
+                Image(systemName: "timer")
+                    .font(.system(size: 11, weight: .bold))
+                if on {
+                    Text("\(secs)s")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                }
+            }
+            .foregroundColor(on ? .black : .white.opacity(0.8))
+            .padding(.horizontal, 9)
+            .frame(height: 26)
+            .background(Capsule().fill(on ? Color.white.opacity(0.92) : Color.white.opacity(0.12)))
+        }
+        .disabled(cam.isBusy)
+        .opacity(cam.isBusy ? 0.5 : 1)
+        .accessibilityLabel("Self-timer")
+        .accessibilityValue(on ? "\(secs) seconds" : "Off")
     }
 
     private func miniStepper(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
@@ -646,11 +714,17 @@ struct CameraView: View {
 
     private var shutterButton: some View {
         Button(action: {
+            // A tap during the self-timer countdown cancels it.
+            if cam.isCountingDown { cam.cancelSelfTimer(); return }
             if cam.isBusy { return }
             // Out of free captures: don't shoot, offer the unlock instead.
             if outOfFreeCaptures { showPaywall = true; return }
-            cam.captureBurst()
-            store.registerCapture()
+            // Arm the self-timer (fires immediately when the timer is off), then
+            // shoot + count the capture once the countdown reaches zero.
+            cam.startSelfTimer {
+                cam.captureBurst()
+                store.registerCapture()
+            }
         }) {
             ZStack {
                 Circle()
@@ -1100,6 +1174,17 @@ struct CameraView: View {
                     }
                     Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
                         .font(.footnote).foregroundColor(.secondary)
+                }
+
+                Section(header: Text("Capture")) {
+                    Picker("Self-Timer", selection: $cam.selfTimerSeconds) {
+                        Text("Off").tag(0)
+                        Text("3s").tag(3)
+                        Text("5s").tag(5)
+                        Text("10s").tag(10)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("Viewfinder Grid", isOn: $cam.gridEnabled)
                 }
             }
             .navigationTitle("Settings")

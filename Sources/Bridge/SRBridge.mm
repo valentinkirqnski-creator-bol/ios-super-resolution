@@ -18,6 +18,7 @@
 #include "core/finish_hdr.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
+#include "core/hdrplus/hdrplus.h"
 
 using namespace hhsr;
 
@@ -279,6 +280,13 @@ struct CaptureMetaCache {
 static CaptureMetaCache g_capture_meta;
 static std::string g_capture_meta_path;
 
+// HDR+ finished render, stashed by the HDR capture path so the JPEG export and
+// the DNG Photos-preview can reuse it (the merged output is a Bayer DNG, which
+// finish_hdr_from_dng cannot decode — the HDR+ finish IS the render here).
+static std::vector<uint8_t> g_hdr_rgb;     // sRGB8 interleaved, g_hdr_w*g_hdr_h*3
+static int g_hdr_w = 0, g_hdr_h = 0, g_hdr_orientation = 1;
+static std::string g_hdr_path;             // the DNG path this render belongs to
+
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
            std::fabs(wb[1] - 1.f) < 1e-4f &&
@@ -438,6 +446,7 @@ static inline void render_python14_pixel(float r, float g, float b,
 }
 
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
+    if (tuning[@"hdr_mode"]) cfg.hdr_mode = tuning[@"hdr_mode"].boolValue;
     if (!tuning) return;
     if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
     if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
@@ -960,6 +969,188 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     return img;
 }
 
+// ---------------------------------------------------------------------------
+// HDR+ capture path (core/hdrplus). Routed here when cfg.hdr_mode is set. Reads
+// the raw u16 Bayer frames straight from the capture dictionaries (NOT the
+// normalized float the MFSR path uses — HDR+ does its own black/white/WB in
+// finish), merges + finishes, writes the merged Bayer DNG, and stashes the
+// finished sRGB render for the JPEG export / Photos preview. Returns a small
+// sRGB preview Image (empty on failure).
+
+// ColorMatrix1 (XYZ->cam) -> camera->sRGB for WHITE-BALANCED input, transposed
+// into HDR+ ccm layout (out_c = sum_r ccm[r*3+c] * in_r). Mirrors finish_hdr's
+// build_render_matrix with total_gain = the WB gains HDR+ applies.
+static bool BuildHdrCcm(const Config& cfg, float wb_r, float wb_b, float ccm[9]) {
+    // identity fallback
+    for (int i = 0; i < 9; ++i) ccm[i] = (i % 4 == 0) ? 1.f : 0.f;
+    if (!cfg.has_color_matrix) return true;
+    const float* m = cfg.color_matrix;             // XYZ -> camera
+    // invert 3x3
+    const float a=m[0],b=m[1],c=m[2],d=m[3],e=m[4],f=m[5],g=m[6],h=m[7],i=m[8];
+    const float det = a*(e*i-f*h) - b*(d*i-f*g) + c*(d*h-e*g);
+    if (!(std::fabs(det) > 1e-9f) || !std::isfinite(det)) return true;
+    const float s = 1.f/det;
+    float cam2xyz[9] = {
+        (e*i-f*h)*s, (c*h-b*i)*s, (b*f-c*e)*s,
+        (f*g-d*i)*s, (a*i-c*g)*s, (c*d-a*f)*s,
+        (d*h-e*g)*s, (b*g-a*h)*s, (a*e-b*d)*s };
+    static const float kXyzToSrgb[9] = {
+         3.2404542f,-1.5371385f,-0.4985314f,
+        -0.9692660f, 1.8760108f, 0.0415560f,
+         0.0556434f,-0.2040259f, 1.0572252f };
+    float M[9];
+    for (int r = 0; r < 3; ++r)
+        for (int col = 0; col < 3; ++col)
+            M[r*3+col] = kXyzToSrgb[r*3+0]*cam2xyz[0*3+col] +
+                         kXyzToSrgb[r*3+1]*cam2xyz[1*3+col] +
+                         kXyzToSrgb[r*3+2]*cam2xyz[2*3+col];
+    // Divide out the WB gains per input channel so the matrix expects WB'd input.
+    const float gain[3] = {wb_r, 1.f, wb_b};
+    for (int col = 0; col < 3; ++col) {
+        if (!(std::fabs(gain[col]) > 1e-6f) || !std::isfinite(gain[col])) return true;
+        for (int r = 0; r < 3; ++r) M[r*3+col] /= gain[col];
+    }
+    // Normalise rows to sum 1 (neutral -> neutral).
+    for (int r = 0; r < 3; ++r) {
+        float sum = M[r*3+0]+M[r*3+1]+M[r*3+2];
+        if (!(std::fabs(sum) > 1e-6f) || !std::isfinite(sum)) return true;
+        for (int col = 0; col < 3; ++col) M[r*3+col] /= sum;
+    }
+    // HDR+ ccm is the transpose: ccm[in*3+out] = M[out*3+in].
+    for (int in = 0; in < 3; ++in)
+        for (int out = 0; out < 3; ++out) ccm[in*3+out] = M[out*3+in];
+    return true;
+}
+
+static int MapCfaToHdrPlus(const CFA& cfa) {
+    const uint8_t a=cfa.p[0][0],b=cfa.p[0][1],c=cfa.p[1][0],d=cfa.p[1][1];
+    if (a==0&&b==1&&c==1&&d==2) return hhsr::hdrplus::CFA_RGGB;
+    if (a==1&&b==0&&c==2&&d==1) return hhsr::hdrplus::CFA_GRBG;
+    if (a==2&&b==1&&c==1&&d==0) return hhsr::hdrplus::CFA_BGGR;
+    if (a==1&&b==2&&c==0&&d==1) return hhsr::hdrplus::CFA_GBRG;
+    return hhsr::hdrplus::CFA_RGGB;
+}
+
+// Pull one frame dictionary's raw u16 Bayer into a contiguous OW*OH buffer,
+// de-padding rows and applying the centred, even-aligned crop. Returns false if
+// the frame's dimensions don't match the reference.
+static bool GatherRawU16(NSDictionary* frame, int w0, int h0,
+                         int ox0, int oy0, int OW, int OH,
+                         std::vector<uint16_t>& out) {
+    NSData* data = frame[@"data"];
+    if (![data isKindOfClass:NSData.class]) {
+        NSString* path = frame[@"path"];
+        if ([path isKindOfClass:NSString.class])
+            data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    }
+    NSNumber* wn=frame[@"width"]; NSNumber* hn=frame[@"height"]; NSNumber* bn=frame[@"bytesPerRow"];
+    if (![data isKindOfClass:NSData.class] || ![wn isKindOfClass:NSNumber.class] ||
+        ![hn isKindOfClass:NSNumber.class] || ![bn isKindOfClass:NSNumber.class]) return false;
+    if (wn.intValue != w0 || hn.intValue != h0) return false;
+    const int bpr = bn.intValue;
+    if (bpr < w0*2 || data.length < (NSUInteger)((size_t)bpr*h0)) return false;
+    const uint8_t* base = (const uint8_t*)data.bytes;
+    out.assign((size_t)OW*OH, 0);
+    for (int y = 0; y < OH; ++y)
+        std::memcpy(&out[(size_t)y*OW],
+                    base + (size_t)(oy0+y)*bpr + (size_t)ox0*2,
+                    (size_t)OW*2);
+    return true;
+}
+
+static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *frames,
+                                     Config& cfg, const std::string& outPath) {
+    if (frames.count < 2) return Image();
+    NSDictionary* ref = frames[0];
+    if (![ref isKindOfClass:NSDictionary.class]) return Image();
+    FillReferenceMetadataFromRawFrame(ref, cfg);
+
+    NSNumber* wn=ref[@"width"]; NSNumber* hn=ref[@"height"];
+    if (![wn isKindOfClass:NSNumber.class] || ![hn isKindOfClass:NSNumber.class]) return Image();
+    const int w0 = wn.intValue, h0 = hn.intValue;
+    if (w0 < 32 || h0 < 32) return Image();
+
+    // Centred, even-aligned crop (zoom), matching DecodeRawFrameDictionary.
+    int OW = w0, OH = h0, ox0 = 0, oy0 = 0;
+    if (cfg.input_crop_zoom > 1.f) {
+        const float z = cfg.input_crop_zoom;
+        const int cw = (int)((float)w0 / z + 1e-4f) & ~1;
+        const int ch = (int)((float)h0 / z + 1e-4f) & ~1;
+        if (cw > 0 && ch > 0) { ox0=((w0-cw)/2)&~1; oy0=((h0-ch)/2)&~1; OW=cw; OH=ch; }
+    }
+
+    std::vector<std::vector<uint16_t>> bufs;
+    bufs.reserve(frames.count);
+    std::vector<const uint16_t*> ptrs;
+    for (NSUInteger n = 0; n < frames.count; ++n) {
+        if (![frames[n] isKindOfClass:NSDictionary.class]) continue;
+        std::vector<uint16_t> b;
+        if (!GatherRawU16(frames[n], w0, h0, ox0, oy0, OW, OH, b)) {
+            if (n == 0) return Image();   // reference must decode
+            continue;                     // skip an odd comp frame
+        }
+        bufs.push_back(std::move(b));
+        ptrs.push_back(bufs.back().data());
+    }
+    if (ptrs.size() < 2) return Image();
+
+    hhsr::hdrplus::Params p;
+    float black4[4];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            int c = std::max(0, std::min(2, (int)cfg.cfa.p[i][j]));
+            black4[i*2+j] = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+        }
+    float bp_min = std::min(std::min(black4[0],black4[1]), std::min(black4[2],black4[3]));
+    p.black_point = (uint16_t)std::max(0L, std::lround(bp_min));
+    p.white_point = (uint16_t)std::max(1L, std::lround((double)cfg.white_level));
+    const float wb_g = (cfg.white_balance[1] > 1e-6f) ? cfg.white_balance[1] : 1.f;
+    const float wb_r = cfg.white_balance[0] / wb_g;
+    const float wb_b = cfg.white_balance[2] / wb_g;
+    p.wb_r = (std::isfinite(wb_r) && wb_r > 0.f) ? wb_r : 1.f;
+    p.wb_g0 = 1.f; p.wb_g1 = 1.f;
+    p.wb_b = (std::isfinite(wb_b) && wb_b > 0.f) ? wb_b : 1.f;
+    p.cfa_pattern = MapCfaToHdrPlus(cfg.cfa);
+    BuildHdrCcm(cfg, p.wb_r, p.wb_b, p.ccm);
+    // p.compression / p.gain keep HDR+ defaults (3.8 / 1.1).
+
+    std::vector<uint16_t> merged;
+    std::vector<uint8_t> finished;
+    if (!hhsr::hdrplus::process(ptrs, OW, OH, p, merged, finished)) return Image();
+
+    // Write the merged Bayer DNG (native scale, original CFA).
+    uint8_t cfa4[4] = { cfg.cfa.p[0][0], cfg.cfa.p[0][1], cfg.cfa.p[1][0], cfg.cfa.p[1][1] };
+    float neutral[3];
+    for (int c = 0; c < 3; ++c) {
+        float wbx = cfg.white_balance[c];
+        neutral[c] = (wbx > 1e-6f && std::isfinite(wbx)) ? (1.f / wbx) : 1.f;
+    }
+    const float* cm = cfg.has_color_matrix ? cfg.color_matrix : nullptr;
+    hhsr::write_bayer_dng(outPath, merged.data(), OW, OH, cfa4, black4,
+                          (float)cfg.white_level, neutral, cm,
+                          cfg.orientation, cfg.camera_make,
+                          cfg.camera_model.empty() ? std::string("HandheldSR-HDR") : cfg.camera_model);
+
+    // Stash the finished render for the JPEG export + Photos preview.
+    g_hdr_rgb = std::move(finished);
+    g_hdr_w = OW; g_hdr_h = OH; g_hdr_orientation = cfg.orientation;
+    g_hdr_path = outPath;
+
+    // Downscaled sRGB preview (longest side <= 256).
+    const int longest = std::max(OW, OH);
+    int step = std::max(1, (longest + 255) / 256);
+    const int pw = std::max(1, OW / step), ph = std::max(1, OH / step);
+    Image preview(ph, pw, 3);
+    for (int y = 0; y < ph; ++y)
+        for (int x = 0; x < pw; ++x) {
+            const size_t so = ((size_t)(y*step) * OW + (size_t)(x*step)) * 3;
+            preview.at(y, x, 0) = g_hdr_rgb[so + 0] / 255.f;
+            preview.at(y, x, 1) = g_hdr_rgb[so + 1] / 255.f;
+            preview.at(y, x, 2) = g_hdr_rgb[so + 2] / 255.f;
+        }
+    return preview;
+}
+
 @implementation SRBridge
 
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
@@ -1051,6 +1242,21 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 progress([NSString stringWithUTF8String:stage.c_str()], f);
             }
         };
+    }
+
+    // HDR mode: a completely different algorithm (core/hdrplus). Reads the raw
+    // u16 Bayer straight from the capture dictionaries, writes the merged Bayer
+    // DNG + stashes the HDR+ render for the JPEG/preview. Forced to native scale.
+    if (cfg.hdr_mode) {
+        cfg.scale = 1.f;
+        if (progress) progress(@"HDR+ merge", 0.2f);
+        Image hp;
+        @autoreleasepool { hp = RunHdrPlusFromRawFrames(frames, cfg, std::string(outPath.UTF8String)); }
+        if (hp.w <= 0) return NO;
+        g_capture_meta_path = outPath.UTF8String;
+        if (progress) progress(@"HDR+ done", 1.0f);
+        if (previewOut) *previewOut = UIImageFromPreview(hp);
+        return YES;
     }
 
     NSArray<NSDictionary<NSString *, id> *> *heldFrames = frames;
@@ -1260,9 +1466,15 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
 
     std::vector<uint8_t> srgb;
     int W = 0, H = 0, orientation = 1;
-    if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
-                                   srgb, W, H, orientation))
+    // HDR capture: the DNG is a Bayer mosaic that finish_hdr_from_dng cannot
+    // decode -- the HDR+ finish IS the render, stashed by the capture path.
+    if (!g_hdr_path.empty() && g_hdr_path == std::string(dngPath.UTF8String) &&
+        !g_hdr_rgb.empty() && g_hdr_w > 0 && g_hdr_h > 0) {
+        srgb = g_hdr_rgb; W = g_hdr_w; H = g_hdr_h; orientation = g_hdr_orientation;
+    } else if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
+                                          srgb, W, H, orientation)) {
         return NO;
+    }
 
     CGImageRef cgOut = CGImageFromRGB8(std::move(srgb), W, H);
     if (!cgOut) return NO;
@@ -1324,10 +1536,15 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
     // same capture all come from finish_hdr and agree.
     std::vector<uint8_t> full;
     int W = 0, H = 0, orientation = 1;
-    if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
-                                   full, W, H, orientation) ||
-        W <= 0 || H <= 0)
+    // HDR capture: use the stashed HDR+ render (Bayer DNG is not decodable here).
+    if (!g_hdr_path.empty() && g_hdr_path == std::string(dngPath.UTF8String) &&
+        !g_hdr_rgb.empty() && g_hdr_w > 0 && g_hdr_h > 0) {
+        full = g_hdr_rgb; W = g_hdr_w; H = g_hdr_h; orientation = g_hdr_orientation;
+    } else if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
+                                          full, W, H, orientation) ||
+               W <= 0 || H <= 0) {
         return nil;
+    }
     // The preview carries no orientation of its own: the DNG's IFD0 Orientation
     // governs how a reader presents it, and tagging the SubIFD as well would
     // rotate it twice.

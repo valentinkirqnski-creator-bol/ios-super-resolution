@@ -474,6 +474,31 @@ final class CameraModel: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(shutterSoundEnabled, forKey: "ShutterSoundOn") }
     }
 
+    /// Self-timer delay in seconds before the burst fires. 0 = off. Chosen in
+    /// Settings; the capture screen only arms/disarms it. Persisted like the
+    /// other capture-UI flags above.
+    @Published var selfTimerSeconds: Int = {
+        // object(forKey:) distinguishes "never set" from an explicit 0.
+        guard UserDefaults.standard.object(forKey: "SelfTimerSeconds") != nil else { return 0 }
+        return max(0, UserDefaults.standard.integer(forKey: "SelfTimerSeconds"))
+    }() {
+        didSet { UserDefaults.standard.set(selfTimerSeconds, forKey: "SelfTimerSeconds") }
+    }
+    /// Live countdown shown over the viewfinder while a self-timer capture is
+    /// pending. 0 = no countdown in flight. Transient (not persisted).
+    @Published var countdownRemaining: Int = 0
+    /// Draw the rule-of-thirds grid over the viewfinder. Persisted; default off.
+    @Published var gridEnabled: Bool = UserDefaults.standard.bool(forKey: "ViewfinderGrid") {
+        didSet { UserDefaults.standard.set(gridEnabled, forKey: "ViewfinderGrid") }
+    }
+    /// HDR mode: route capture through the HDR+ pipeline (align + merge +
+    /// exposure-fusion finish) instead of the super-resolution path. Disables
+    /// the 12MP/48MP choice (always native 12MP). DNG = merged linear Bayer,
+    /// JPG = HDR+ tone-mapped render. Persisted; default off.
+    @Published var hdrMode: Bool = UserDefaults.standard.bool(forKey: "HDRMode") {
+        didSet { UserDefaults.standard.set(hdrMode, forKey: "HDRMode") }
+    }
+
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
@@ -1699,6 +1724,39 @@ final class CameraModel: NSObject, ObservableObject {
 
     // MARK: - Capture burst
 
+    /// True while a self-timer countdown is running (burst not yet fired).
+    var isCountingDown: Bool { countdownRemaining > 0 }
+
+    private var countdownTimer: Timer?
+
+    /// Arm the self-timer: count `selfTimerSeconds` down at 1 Hz, then call
+    /// `onFire` on the main thread. With the timer off (0s) it fires at once, so
+    /// callers always go through here. The caller owns the actual capture and
+    /// its free-tier bookkeeping; this only handles the delay + countdown UI.
+    func startSelfTimer(onFire: @escaping () -> Void) {
+        cancelSelfTimer()
+        let secs = selfTimerSeconds
+        guard secs > 0 else { onFire(); return }
+        countdownRemaining = secs
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            self.countdownRemaining -= 1
+            if self.countdownRemaining <= 0 {
+                t.invalidate()
+                self.countdownTimer = nil
+                self.countdownRemaining = 0
+                onFire()
+            }
+        }
+    }
+
+    /// Stop a pending self-timer without firing (e.g. a second shutter tap).
+    func cancelSelfTimer() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        countdownRemaining = 0
+    }
+
     func captureBurst() {
         guard !isBusy else { return }
         flushPendingLensSwitch()
@@ -2116,9 +2174,11 @@ final class CameraModel: NSObject, ObservableObject {
         // cropped away; any zoom is realised as crop-then-2x, which is what the
         // 2x lens button always did and is now what every magnification does.
         let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
-        let algorithmScale: Float = useSelectedOutputScale
-            ? outputResolutionMode.algorithmScale
-            : 2.0
+        // HDR mode runs the HDR+ pipeline at native resolution — the 12/48 choice
+        // does not apply, so the scale is forced to 1 regardless.
+        let algorithmScale: Float = hdrMode
+            ? 1.0
+            : (useSelectedOutputScale ? outputResolutionMode.algorithmScale : 2.0)
         let outputName = algorithmScale <= 1.01 ? "handheld_sr_x1.dng" : "handheld_sr_x2.dng"
         let outURL = (burstDir ?? FileManager.default.temporaryDirectory)
             .appendingPathComponent(outputName)
@@ -2194,6 +2254,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),
             "hdr_vibrance": NSNumber(value: tuningParams.hdr_vibrance),
+            "hdr_mode": NSNumber(value: hdrMode),
         ]
 
         var preview: UIImage?

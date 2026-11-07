@@ -22,6 +22,22 @@ struct CaptureExif {
 bool write_linear_dng(const std::string& path, const Image& rgb,
                       const std::string& camera_model = "HandheldSR-x2");
 
+// Minimal single-strip CFA (Bayer) DNG for HDR mode's merged mosaic. The buffer
+// is the native-scale Bayer frame; `cfa` is the 2x2 pattern row-major (0=R,1=G,
+// 2=B), `black4` the per-site black in that same order, `neutral` the
+// AsShotNeutral RGB (nullptr -> 1,1,1), `colorMatrixXYZtoCam` ColorMatrix1
+// (nullptr -> omitted). Uncompressed; any editor demosaics it.
+bool write_bayer_dng(const std::string& path,
+                     const uint16_t* bayer, int W, int H,
+                     const uint8_t cfa[4],
+                     const float black4[4],
+                     float white,
+                     const float neutral[3],
+                     const float colorMatrixXYZtoCam[9],
+                     int orientation,
+                     const std::string& camera_make,
+                     const std::string& camera_model);
+
 // Decode a HandheldSR LinearRaw DNG to interleaved RGB16. Handles every codec
 // the writer emits: uncompressed (1), lossless JPEG (7), Deflate (8, Predictor
 // 1 or 2), single- or multi-strip.

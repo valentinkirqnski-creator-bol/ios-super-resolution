@@ -44,6 +44,8 @@ targets:
           - "robustness.cpp"
           - "kernels.cpp"
           - "merge.cpp"
+          - "hdrplus/hdrplus.cpp"
+          - "hdrplus/hdrplus_metal.mm"
           - "pipeline.cpp"
           - "pipeline_paths.cpp"
           - "raw_io.cpp"

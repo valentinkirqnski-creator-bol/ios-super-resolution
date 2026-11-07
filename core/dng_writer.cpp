@@ -272,6 +272,94 @@ static std::vector<uint8_t> serialize_ifd_at(IFD& ifd, uint32_t base_offset) {
     return out;
 }
 
+} // namespace (anonymous) — write_bayer_dng follows, then the anon block reopens
+
+// ---------------------------------------------------------------------------
+// Minimal single-strip CFA (Bayer) DNG. Used by HDR mode, whose merge output is
+// a denoised Bayer mosaic in the sensor's native scale (not demosaiced RGB like
+// the LinearRaw path above). Any editor demosaics it; it is a normal raw DNG.
+// Uncompressed (Compression = 1): the file is written once from a resident
+// buffer, so the codec choice is latency/size only and simplicity wins here.
+bool write_bayer_dng(const std::string& path,
+                     const uint16_t* bayer, int W, int H,
+                     const uint8_t cfa[4],              // 2x2 pattern row-major, 0=R,1=G,2=B
+                     const float black4[4],             // per-site black, CFA row-major order
+                     float white,
+                     const float neutral[3],            // AsShotNeutral RGB; nullptr -> 1,1,1
+                     const float colorMatrixXYZtoCam[9],// ColorMatrix1; nullptr -> omit
+                     int orientation,
+                     const std::string& camera_make,
+                     const std::string& camera_model) {
+    if (!bayer || W <= 0 || H <= 0) return false;
+
+    IFD ifd;
+    ifd.longv(254, 0);                         // NewSubfileType
+    ifd.longv(256, (uint32_t)W);               // ImageWidth
+    ifd.longv(257, (uint32_t)H);               // ImageLength
+    ifd.shortv(258, 16);                       // BitsPerSample
+    ifd.shortv(259, 1);                        // Compression = none
+    ifd.shortv(262, 32803);                    // PhotometricInterpretation = CFA
+    if (!camera_make.empty())  ifd.ascii(271, camera_make);
+    if (!camera_model.empty()) ifd.ascii(272, camera_model);
+    ifd.longv(273, 0);                         // StripOffsets (patched below)
+    ifd.shortv(274, (orientation >= 1 && orientation <= 8) ? (uint16_t)orientation : 1);
+    ifd.shortv(277, 1);                        // SamplesPerPixel
+    ifd.longv(278, (uint32_t)H);               // RowsPerStrip (single strip)
+    ifd.longv(279, (uint32_t)((size_t)W * H * 2)); // StripByteCounts
+    ifd.shortv(284, 1);                        // PlanarConfiguration
+    ifd.shorts(33421, {2, 2});                 // CFARepeatPatternDim
+    ifd.bytes4(33422, cfa[0], cfa[1], cfa[2], cfa[3]); // CFAPattern
+    ifd.bytes4(50706, 1, 4, 0, 0);             // DNGVersion 1.4.0.0
+    ifd.bytes4(50707, 1, 1, 0, 0);             // DNGBackwardVersion 1.1.0.0
+    ifd.ascii(50708, camera_model.empty() ? std::string("HandheldSR-HDR") : camera_model); // UniqueCameraModel
+    ifd.shorts(50713, {2, 2});                 // BlackLevelRepeatDim
+    {   // BlackLevel: 4 per-site LONGs in CFA row-major order
+        std::vector<uint32_t> bl(4);
+        for (int i = 0; i < 4; ++i) {
+            float b = black4 ? black4[i] : 0.f;
+            bl[i] = (uint32_t)std::lround(std::max(0.f, b));
+        }
+        ifd.longs(50714, bl);
+    }
+    ifd.longv(50717, (uint32_t)std::lround(std::max(1.f, white))); // WhiteLevel
+    if (colorMatrixXYZtoCam) {                  // ColorMatrix1 (XYZ(D65) -> camera)
+        std::vector<int32_t> nd;
+        for (int i = 0; i < 9; ++i) { nd.push_back((int32_t)std::lround(colorMatrixXYZtoCam[i] * 10000.f)); nd.push_back(10000); }
+        ifd.srational(50721, nd);
+    }
+    {   // AsShotNeutral
+        std::vector<uint32_t> nd;
+        for (int c = 0; c < 3; ++c) {
+            float n = (neutral && neutral[c] > 1e-6f && std::isfinite(neutral[c])) ? neutral[c] : 1.f;
+            nd.push_back((uint32_t)std::lround(n * 1000000.f)); nd.push_back(1000000);
+        }
+        ifd.rational(50728, nd);
+    }
+    ifd.shortv(50778, 21);                      // CalibrationIlluminant1 = D65
+
+    // Two-pass to resolve StripOffsets: serialize once for the size, point the
+    // strip just past the IFD, serialize again (same size, value changed only).
+    std::vector<uint8_t> ifd_bytes = serialize_ifd_at(ifd, 8);
+    const uint32_t data_offset = 8 + (uint32_t)ifd_bytes.size();
+    for (auto& en : ifd.e) if (en.tag == 273) { en.inlineval = data_offset; en.payload.clear(); }
+    ifd_bytes = serialize_ifd_at(ifd, 8);
+
+    std::vector<uint8_t> hdr;
+    hdr.push_back('I'); hdr.push_back('I');     // little-endian
+    w16(hdr, 42);
+    w32(hdr, 8);                                // first IFD at offset 8
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(hdr.data(), 1, hdr.size(), f) == hdr.size() &&
+              std::fwrite(ifd_bytes.data(), 1, ifd_bytes.size(), f) == ifd_bytes.size() &&
+              std::fwrite(bayer, 2, (size_t)W * H, f) == (size_t)W * H;
+    std::fclose(f);
+    return ok;
+}
+
+namespace {
+
 // EXIF RATIONAL from a float (exposure/aperture/focal length): denominator by
 // magnitude so short shutter speeds (1/8000) and long ones keep precision.
 static void push_rational_from_float(std::vector<uint32_t>& nd, float v) {

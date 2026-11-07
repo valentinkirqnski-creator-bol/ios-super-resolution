@@ -302,6 +302,13 @@ struct CFA {
 // Full pipeline configuration, mirroring configs/default.yaml.
 struct Config {
     float scale = 1.0f;
+    // HDR mode: route the burst through the vendored HDR+ pipeline
+    // (core/hdrplus) instead of the Wronski MFSR pipeline. A different
+    // algorithm entirely — align + temporal/spatial merge + exposure-fusion
+    // finish. Forces scale = 1 (native 12 MP). The DNG holds the merged linear
+    // Bayer mosaic; the JPG holds the HDR+ tone-mapped render. Off = the normal
+    // super-resolution path.
+    bool hdr_mode = false;
     // Centre-crop the Bayer input by this factor before SR, which is how zoom
     // is realised: at 2.0 a 12 MP sensor frame becomes a 3 MP crop that SR takes
     // back to 12 MP. Continuous rather than integral, so any magnification works
