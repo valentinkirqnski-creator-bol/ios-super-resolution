@@ -2053,6 +2053,15 @@ struct Config {
     SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
+    // TRUE (default): the merge uses Handheld-Multi-Frame-Super-Resolution-1.4's merge.py
+    // accumulate() conventions -- output pixel centre lr = (hr + 0.5) / scale; kernel
+    // lookup kmap = lr_mov/2 - 0.5 (Bayer); centre tap int(lr_mov) with distances measured
+    // from lr_mov - 0.5; robustness fetched at r[min(int(lr//2 - 0.5), h/2 - 1)] (guide-res
+    // Bayer mask; int(lr) on a raw-res mask); the iso kernel goes through the diag(k_detail)
+    // covariance -- and the REFERENCE frame is merged by the same accumulate with zero flow
+    // and r = 1, as 1.4's super_resolution.py does. FALSE: the 460-main conventions
+    // (lr = hr / scale, (lr_mov-0.5)/2, round() centre, Alg. 11 reference merge).
+    bool  merge_match_14 = true;
     // User override of the merge kernel's base scale k_detail (Alg. 5: k1, k2 =
     // k_detail * (...)). When on, k_detail = k_detail_override_value, applied AFTER
     // the SNR auto-tune (tune_config_snr) so it wins either way. Smaller = narrower

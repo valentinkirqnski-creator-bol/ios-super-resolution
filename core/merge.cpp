@@ -69,7 +69,7 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy, bool raw_det,
-                                  bool no_invert = false) {
+                                  bool no_invert = false, bool soften = true) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -119,7 +119,9 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    // soften = false under Config::merge_match_14: 1.4 uses inv_det * cov as-is; the cap
+    // at 32 would reshape the sharp anisotropic 1.4 kernels (measured: ~20% of pixels).
+    if (soften) soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -136,13 +138,15 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     // gcam_sabre_merge_res: the mask is a compact 8-bit output-grid mask (Mask8),
     // read 1:1 at the output pixel (v/255). Avoids a 48MP fp32 mask in memory.
     const bool use_m8 = (rob8 && !rob8->empty());
+    const bool m14 = cfg.merge_match_14;   // 1.4 merge.py conventions (see Config)
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python accumulate(): coarse_ref_sub_pos = output_pixel / scale.
-            const f32 lr_x = (f32)hr_j / scale;
-            const f32 lr_y = (f32)hr_i / scale;
+            // 460 accumulate(): coarse_ref_sub_pos = output_pixel / scale.
+            // 1.4 accumulate() (merge_match_14): lr = (hr + 0.5) / scale -- pixel centres.
+            const f32 lr_x = m14 ? ((f32)hr_j + 0.5f) / scale : (f32)hr_j / scale;
+            const f32 lr_y = m14 ? ((f32)hr_i + 0.5f) / scale : (f32)hr_i / scale;
 
             // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);
@@ -214,6 +218,22 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
+            } else if (m14) {
+                // 1.4: Bayer guide-res mask -> r[min(int(lr_y//2 - 0.5), lr_h//2 - 1)]
+                // (floor division, minus 0.5, int() truncation); a raw-res mask (and grey
+                // mode) -> r[min(int(lr_y), lr_h - 1)].
+                int iy, ix;
+                if (!rob_is_raw && cfg.bayer_mode) {
+                    iy = (int)(std::floor(lr_y / 2.f) - 0.5f);
+                    ix = (int)(std::floor(lr_x / 2.f) - 0.5f);
+                } else {
+                    iy = (int)lr_y;
+                    ix = (int)lr_x;
+                }
+                iy = std::max(0, std::min(iy, robustness.h - 1));
+                ix = std::max(0, std::min(ix, robustness.w - 1));
+                for (int rc = 0; rc < 3; ++rc)
+                    local_r[rc] = robustness.at(iy, ix, rc < rnc ? rc : rnc - 1);
             } else {
                 const int iy = std::min(robustness.h - 1,
                                         std::max(0, (int)std::floor(rob_y + 0.5f)));
@@ -253,9 +273,13 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             }
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
-            if (!iso) {
+            if (!iso || m14) {   // 1.4: iso reads the diag(k_detail) covariance too
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) {
+                if (cfg.bayer_mode && m14) {
+                    // 1.4 merge.py: kmap = lr_mov/2 - 0.5 (with lr at pixel centres).
+                    kmap_j = lr_mov_x / 2.f - 0.5f;
+                    kmap_i = lr_mov_y / 2.f - 0.5f;
+                } else if (cfg.bayer_mode) {
                     // 460-parity: a half-res grey cell g sits at coarse 2g+0.5,
                     // so g = (x-0.5)/2 (merge.py accumulate, and the ref path
                     // below). Was x/2 - 0.5 -- a 0.25-cell (0.5 raw-px) offset on
@@ -267,17 +291,20 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_i = lr_mov_y - 0.5f;
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
-                               /*no_invert=*/cfg.gcam_sabre_kernel);
+                               /*no_invert=*/cfg.gcam_sabre_kernel, /*soften=*/!m14);
             }
 
             // GCam SampleNeighborhoodRBF anchors at floor(coord) and measures the kernel
             // offset from each neighbour's pixel CENTRE (pos+0.5): offset = (j+0.5) - coord.
             // Our default path anchors at round() and uses offset = j - coord (a benign
             // half-pixel). Match GCam exactly on the gcam-kernel path.
+            // 1.4 (merge_match_14): center = int(lr_mov) (>= 0 here, so == floor) and
+            // dist = j - (lr_mov - 0.5) == (j + 0.5) - lr_mov -- the same as the GCam form.
             const bool gk = cfg.gcam_sabre_kernel;
-            const f32 ctr = gk ? 0.5f : 0.f;
-            const int center_j = gk ? (int)std::floor(lr_mov_x) : cuda_round_to_int(lr_mov_x);
-            const int center_i = gk ? (int)std::floor(lr_mov_y) : cuda_round_to_int(lr_mov_y);
+            const bool fl = gk || m14;
+            const f32 ctr = fl ? 0.5f : 0.f;
+            const int center_j = fl ? (int)std::floor(lr_mov_x) : cuda_round_to_int(lr_mov_x);
+            const int center_i = fl ? (int)std::floor(lr_mov_y) : cuda_round_to_int(lr_mov_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
@@ -292,7 +319,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     const f32 dist_x = ((f32)j + ctr) - lr_mov_x;
                     const f32 dist_y = ((f32)i + ctr) - lr_mov_y;
                     f32 z;
-                    if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
+                    if (iso && !m14) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z);
                     // GCam GetKernelWeight = exp2(-0.5*kd) + 5e-5. On the gcam-kernel path
@@ -324,21 +351,30 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
     (void)acc_rob;  // Adaptive denoiser removed: the reference merge is a fixed
                     // radius-1 kernel with no accumulated-robustness enlargement.
+    // merge_match_14: 1.4 merges the reference through merge.py accumulate() with a zero
+    // alignment and r = 1 (super_resolution.py), so the reference takes exactly the
+    // comparison-frame conventions: pixel-centre lr, kmap = lr/2 - 0.5, raw-det inverse,
+    // int() centre with (j + 0.5) - lr distances, iso via the diag(k_detail) covariance.
+    const bool m14 = cfg.merge_match_14;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python: coarse_ref_sub_pos = output_pixel / scale  (no +0.5)
-            const f32 coarse_x = (f32)hr_j / scale;
-            const f32 coarse_y = (f32)hr_i / scale;
+            // 460: coarse_ref_sub_pos = output_pixel / scale  (no +0.5); 1.4: (hr + 0.5)/scale
+            const f32 coarse_x = m14 ? ((f32)hr_j + 0.5f) / scale : (f32)hr_j / scale;
+            const f32 coarse_y = m14 ? ((f32)hr_i + 0.5f) / scale : (f32)hr_i / scale;
 
             const f32 additional_denoise_power = 1.f;
             const int rad = 1;
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
-            if (!iso) {
+            if (!iso || m14) {
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) {
+                if (m14) {
+                    // 1.4 accumulate(): Bayer lr/2 - 0.5, grey lr - 0.5
+                    kmap_j = cfg.bayer_mode ? coarse_x / 2.f - 0.5f : coarse_x - 0.5f;
+                    kmap_i = cfg.bayer_mode ? coarse_y / 2.f - 0.5f : coarse_y - 0.5f;
+                } else if (cfg.bayer_mode) {
                     // Python: grey_pos = (coarse - 0.5) / 2
                     kmap_j = (coarse_x - 0.5f) / 2.f;
                     kmap_i = (coarse_y - 0.5f) / 2.f;
@@ -347,16 +383,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
-                               /*no_invert=*/cfg.gcam_sabre_kernel);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/m14,
+                               /*no_invert=*/cfg.gcam_sabre_kernel, /*soften=*/!m14);
             }
 
-            // Python: center = round(coarse). GCam merge kernel: floor anchor + (j+0.5)
-            // pixel-centre offset (matches SampleNeighborhoodRBF for the base frame too).
+            // Python: center = round(coarse). GCam merge kernel / 1.4: floor anchor +
+            // (j+0.5) pixel-centre offset (1.4: int(lr) and j - (lr - 0.5)).
             const bool gk = cfg.gcam_sabre_kernel;
-            const f32 ctr = gk ? 0.5f : 0.f;
-            const int center_j = gk ? (int)std::floor(coarse_x) : cuda_round_to_int(coarse_x);
-            const int center_i = gk ? (int)std::floor(coarse_y) : cuda_round_to_int(coarse_y);
+            const bool fl = gk || m14;
+            const f32 ctr = fl ? 0.5f : 0.f;
+            const int center_j = fl ? (int)std::floor(coarse_x) : cuda_round_to_int(coarse_x);
+            const int center_i = fl ? (int)std::floor(coarse_y) : cuda_round_to_int(coarse_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
@@ -371,7 +408,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     const f32 dist_x = ((f32)j + ctr) - coarse_x;
                     const f32 dist_y = ((f32)i + ctr) - coarse_y;
                     f32 y;
-                    if (iso) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
+                    if (iso && !m14) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;

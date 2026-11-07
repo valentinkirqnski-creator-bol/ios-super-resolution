@@ -1144,6 +1144,11 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Steerable Kernels")) {
+                    Toggle("Match 1.4 Merge", isOn: $cam.tuningParams.merge_match_14)
+                    Text("""
+                         ON (default): the merge follows Handheld-Multi-Frame-Super-Resolution-1.4's merge.py — output pixels mapped at their centres ((x+0.5)/scale), the 1.4 kernel lookup and centre tap, the 1.4 robustness index, the iso kernel through its diag(k_detail) covariance, and the reference frame merged as a zero-motion frame. OFF: the 460-main conventions.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Override k_detail", isOn: $cam.tuningParams.k_detail_override)
                     if cam.tuningParams.k_detail_override {
                         ispRow("k_detail", $cam.tuningParams.k_detail_override_value, 0.05...1.0, "%.3f")

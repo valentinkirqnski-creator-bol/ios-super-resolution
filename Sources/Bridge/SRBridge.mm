@@ -478,6 +478,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
             std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_detail_override"]) cfg.k_detail_override = tuning[@"k_detail_override"].boolValue;
+    if (tuning[@"merge_match_14"]) cfg.merge_match_14 = tuning[@"merge_match_14"].boolValue;
     if (tuning[@"k_detail_override_value"])
         cfg.k_detail_override_value = tuning[@"k_detail_override_value"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;

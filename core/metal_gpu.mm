@@ -4799,8 +4799,10 @@ struct MergeCompParamsCPU {
     uint32_t rob_output_res = 0;
     // 1 = GCam merge kernel (gcam_sabre_kernel): +5e-5 kernel epsilon + border MirrorUVs.
     uint32_t gcam_kernel = 0;
+    uint32_t match14 = 0;   // Config::merge_match_14 (1.4 merge.py conventions)
+    uint32_t _m14pad0 = 0, _m14pad1 = 0, _m14pad2 = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 192, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 208, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -4817,7 +4819,8 @@ struct MergeRefParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t cov_stride = 4;      // see MergeCompParamsCPU::cov_stride
     uint32_t gcam_kernel = 0;     // 1 = GCam merge kernel (precision cov, floor anchor, +eps)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    uint32_t match14 = 0;         // Config::merge_match_14 (was _pad2)
+    uint32_t _pad3 = 0;
 };
 static_assert(sizeof(MergeRefParamsCPU) == 112, "MergeRefParamsCPU layout");
 
@@ -5642,6 +5645,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
             (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
              p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
         p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
+        p.match14 = cfg.merge_match_14 ? 1u : 0u;
         p.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;   // gcam_sabre_flow_bilinear
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
@@ -5701,6 +5705,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     rp.raw_res_robustness = 0u;
     rp.cov_stride = g_bf.cov_stride;
     rp.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
+    rp.match14 = cfg.merge_match_14 ? 1u : 0u;
 
     MergeNormParamsCPU np = merge_norm_params(bh, Ws, nch, cfg);
     np.y0 = (uint32_t)y0;
@@ -5950,6 +5955,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
          p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
     p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
+    p.match14 = cfg.merge_match_14 ? 1u : 0u;
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
     // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
     // ghosted/blurred output. The direct call has the frame's flow in hand, but
@@ -6063,6 +6069,8 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     // accumulate_ref in merge.cpp.
     p.raw_res_robustness =
         (denoise && p.acc_h == p.lr_h && p.acc_w == p.lr_w) ? 1u : 0u;
+    p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;   // was never set here (fused path did)
+    p.match14 = cfg.merge_match_14 ? 1u : 0u;
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
