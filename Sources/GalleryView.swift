@@ -20,6 +20,12 @@ struct GalleryView: View {
         let asset: PHAsset
         var id: String { asset.localIdentifier }
     }
+    /// One month's worth of captures, for the grouped grid.
+    private struct MonthSection: Identifiable {
+        let id: String
+        let title: String
+        let assets: [PHAsset]
+    }
     @State private var selected: Pick?
 
     /// Apple Photos-style tight 3-up grid, 2pt gutters, edge to edge.
@@ -62,13 +68,27 @@ struct GalleryView: View {
 
     private var grid: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 2) {
-                ForEach(assets, id: \.localIdentifier) { asset in
-                    Button { selected = Pick(asset: asset) } label: {
-                        GalleryCell(image: thumbs[asset.localIdentifier])
+            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                ForEach(monthSections) { section in
+                    Section {
+                        LazyVGrid(columns: columns, spacing: 2) {
+                            ForEach(section.assets, id: \.localIdentifier) { asset in
+                                Button { selected = Pick(asset: asset) } label: {
+                                    GalleryCell(image: thumbs[asset.localIdentifier])
+                                }
+                                .buttonStyle(.plain)
+                                .onAppear { loadThumb(asset) }
+                            }
+                        }
+                        .padding(.bottom, 2)
+                    } header: {
+                        Text(section.title)
+                            .font(.title3.weight(.bold))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color(.systemBackground))
                     }
-                    .buttonStyle(.plain)
-                    .onAppear { loadThumb(asset) }
                 }
             }
 
@@ -77,6 +97,28 @@ struct GalleryView: View {
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
+        }
+    }
+
+    /// Group captures by calendar month, newest first, for Apple Photos-style
+    /// month sections. `assets` is already sorted by creation date descending,
+    /// so months appear in that order.
+    private var monthSections: [MonthSection] {
+        let cal = Calendar.current
+        var order: [String] = []
+        var map: [String: [PHAsset]] = [:]
+        for a in assets {
+            let date = a.creationDate ?? .distantPast
+            let c = cal.dateComponents([.year, .month], from: date)
+            let key = "\(c.year ?? 0)-\(c.month ?? 0)"
+            if map[key] == nil { order.append(key); map[key] = [] }
+            map[key]?.append(a)
+        }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "LLLL yyyy"
+        return order.map { key in
+            let d = map[key]?.first?.creationDate ?? .distantPast
+            return MonthSection(id: key, title: fmt.string(from: d), assets: map[key] ?? [])
         }
     }
 

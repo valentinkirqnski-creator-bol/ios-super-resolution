@@ -1176,7 +1176,7 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Capture")) {
+                Section(header: Text("Timer length")) {
                     Picker("Self-Timer", selection: $cam.selfTimerSeconds) {
                         Text("Off").tag(0)
                         Text("3s").tag(3)
@@ -1184,40 +1184,15 @@ struct CameraView: View {
                         Text("10s").tag(10)
                     }
                     .pickerStyle(.segmented)
+                }
+
+                Section(header: Text("Viewfinder")) {
                     Toggle("Viewfinder Grid", isOn: $cam.gridEnabled)
                 }
 
-                Section(header: Text("JPG Look")) {
-                    ispRow("Black Level", $cam.tuningParams.hdr_black_percentile, 0...0.05, "%.3f")
-                    ispRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
-                    Button("Reset JPG Look") {
-                        cam.tuningParams.hdr_black_percentile = TuningParams.appDefaults.hdr_black_percentile
-                        cam.tuningParams.hdr_vibrance = TuningParams.appDefaults.hdr_vibrance
-                    }
-                    Text("""
-                         Black Level sets how deep the shadows render \u{2014} higher crushes \
-                         more of the darkest tones to pure black. Vibrance lifts muted colours \
-                         without over-saturating skin or blown highlights. Both apply to the \
-                         JPG export and the DNG's in-app/Photos preview.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("HDR Look")) {
-                    ispRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...1.4, "%.2f")
-                    ispRow("Tone Compression", $cam.tuningParams.hdrplus_compression, 1.0...4.0, "%.1f")
-                    Button("Reset HDR Look") {
-                        cam.tuningParams.hdrplus_gain = TuningParams.appDefaults.hdrplus_gain
-                        cam.tuningParams.hdrplus_compression = TuningParams.appDefaults.hdrplus_compression
-                    }
-                    Text("""
-                         Applies only in HDR mode. Brightness is the overall exposure of the \
-                         tone-mapped JPG \u{2014} lower it if HDR shots look too bright. Tone \
-                         Compression sets how hard highlights and shadows are pulled together: \
-                         lower is more natural, higher is a stronger HDR look. The DNG, which \
-                         stays raw, is unaffected.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
+                Section {
+                    NavigationLink(destination: JPGLookView(cam: cam)) { Text("JPG Look") }
+                    NavigationLink(destination: HDRLookView(cam: cam)) { Text("HDR Look") }
                 }
             }
             .navigationTitle("Settings")
@@ -1233,6 +1208,88 @@ struct CameraView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Settings sub-pages
+
+/// A labelled slider row, matching `CameraView.ispRow`, for the Look sub-pages.
+private func lookSliderRow(_ title: String, _ value: Binding<Float>,
+                          _ range: ClosedRange<Float>, _ fmt: String = "%.2f") -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(String(format: fmt, value.wrappedValue))
+                .foregroundColor(.secondary)
+                .monospacedDigit()
+        }
+        Slider(value: value, in: range)
+    }
+}
+
+/// JPG Look controls, pushed from Settings (system back button returns).
+private struct JPGLookView: View {
+    @ObservedObject var cam: CameraModel
+
+    var body: some View {
+        Form {
+            Section {
+                lookSliderRow("Black Level", $cam.tuningParams.hdr_black_percentile, 0...0.05, "%.3f")
+                lookSliderRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
+            }
+            Section {
+                Button("Reset JPG Look") {
+                    cam.tuningParams.hdr_black_percentile = TuningParams.appDefaults.hdr_black_percentile
+                    cam.tuningParams.hdr_vibrance = TuningParams.appDefaults.hdr_vibrance
+                }
+            }
+            Section {
+                Text("""
+                     Black Level sets how deep the shadows render \u{2014} higher crushes \
+                     more of the darkest tones to pure black. Vibrance lifts muted colours \
+                     without over-saturating skin or blown highlights. Both apply to the \
+                     JPG export and the DNG's in-app/Photos preview.
+                     """)
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("JPG Look")
+        .navigationBarTitleDisplayMode(.inline)
+        .md3FormChrome()
+    }
+}
+
+/// HDR Look controls, pushed from Settings (system back button returns).
+private struct HDRLookView: View {
+    @ObservedObject var cam: CameraModel
+
+    var body: some View {
+        Form {
+            Section {
+                lookSliderRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...1.4, "%.2f")
+                lookSliderRow("Tone Compression", $cam.tuningParams.hdrplus_compression, 1.0...4.0, "%.1f")
+            }
+            Section {
+                Button("Reset HDR Look") {
+                    cam.tuningParams.hdrplus_gain = TuningParams.appDefaults.hdrplus_gain
+                    cam.tuningParams.hdrplus_compression = TuningParams.appDefaults.hdrplus_compression
+                }
+            }
+            Section {
+                Text("""
+                     Applies only in HDR mode. Brightness is the overall exposure of the \
+                     tone-mapped JPG \u{2014} lower it if HDR shots look too bright. Tone \
+                     Compression sets how hard highlights and shadows are pulled together: \
+                     lower is more natural, higher is a stronger HDR look. The DNG, which \
+                     stays raw, is unaffected.
+                     """)
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("HDR Look")
+        .navigationBarTitleDisplayMode(.inline)
+        .md3FormChrome()
     }
 }
 
