@@ -319,8 +319,8 @@ struct TuningParams: Equatable, Codable {
     /// the cubic B-spline (SampleBicubicAbsolute) + bicubic pair. Off = the exact
     /// non-REJECTION_ONLY (#else) match.
     var gcam_sabre_rejection_only: Bool = false
-    /// Bilinear motion field for the merge: per-tile flow interpolated between tile
-    /// centres, the same field the gcam robustness operator warps with. Off by default.
+    /// Bilinear motion field: per-tile flow interpolated between tile centres, fetched
+    /// by both the merge and the gcam robustness mask. Off by default (both nearest).
     var gcam_sabre_flow_bilinear: Bool = false
     /// GCam ComputeGuideImage o_gauss_cov: build the MERGE kernel from the GCam structure
     /// tensor (ConstructGaussianCovariance) instead of estimate_kernels. Opt-in, merge-

@@ -1816,8 +1816,10 @@ struct GcamSabreParamsCPU {
     // GCam REJECTION_ONLY (guide-res only): 1 = sample ref+comp with the biquadratic
     // instead of the B-spline. k_rgb/k_green already carry the biquadratic pair.
     uint32_t rejection_only = 0;
+    // gcam_sabre_flow_bilinear: 1 = bilinear tile flow (the merge reads the same field).
+    uint32_t flow_bilinear = 0;
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 120, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 124, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2751,7 +2753,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    false, /*use_affine=*/cfg.affine_flow_enabled,
+                    cfg.gcam_flow_bilinear_active(), /*use_affine=*/cfg.affine_flow_enabled,
                     /*use_dense=*/cfg.dense_flow_enabled,
                     /*bicubic=*/gcam_bicubic,
                     /*catmull=*/false))
@@ -2767,7 +2769,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         int cvh = 0, cvw = 0;
         if (!rob_dogson(b_gvars, b_comp_vars_hires, gh, gw, nch, /*is_ref=*/false,
                         &flow, tile_size, cvh, cvw, cmd,
-                        false, /*use_affine=*/cfg.affine_flow_enabled,
+                        cfg.gcam_flow_bilinear_active(), /*use_affine=*/cfg.affine_flow_enabled,
                         /*use_dense=*/cfg.dense_flow_enabled,
                         /*bicubic=*/gcam_bicubic,
                         /*catmull=*/false))
@@ -3061,6 +3063,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.noise_model = noise_model ? 1u : 0u;
     mp.out_h = (uint32_t)th; mp.out_w = (uint32_t)tw;
     mp.raw_res = resample ? 1u : 0u;   // "resample" flag: raw OR merge grid (Dodgson)
+    mp.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;
     mp.rejection_only = rej_only ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];

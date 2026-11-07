@@ -2419,6 +2419,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     constexpr f32 kGcamTilesAcross = 4128.f / 16.f;   // spec §1: 258 tiles / 4128px frame
     const f32 motion_thresh = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, tile_size) * kGcamTilesAcross;
     const bool aff = cfg.affine_flow_enabled && flow.has_affine();
+    const bool flow_bilin = cfg.gcam_flow_bilinear_active();   // smooth field for mask + merge
     // §3/§6: Monte-Carlo noise for the operator when the model is on (built once,
     // fixed seed -> matches the guide's and the GPU's copy). Off -> affine stand-in.
     const bool noise_model = cfg.gcam_sabre_noise_model;
@@ -2459,10 +2460,11 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 gx = clampf(((f32)rx + 0.5f) * g_per_tx - 0.5f, 0.f, (f32)(gw - 1));
             } else { gy = (f32)ry; gx = (f32)rx; }
             // §5.1 flow at the raw position (2*g ~ raw); halved to guide units because the
-            // stats are sampled in guide coords. GCam does texture(alt_flow_texture) =
-            // BILINEAR over the per-tile flow AND the packed flow.z motion extent -- so we
-            // bilinearly blend the surrounding tiles (gcam_tile_bilinear), not the nearest
-            // tile. (The affine-flow path keeps its own per-tile affine sampling.)
+            // stats are sampled in guide coords. gcam_sabre_flow_bilinear ON: the flow AND
+            // the motion extent are bilinearly blended over the surrounding tiles
+            // (gcam_tile_bilinear) -- the same smooth field the merge fetches. OFF: the
+            // containing tile's vector + extent (GCam's NEAREST alt_flow_texture, and the
+            // merge's nearest fetch). (The affine-flow path keeps its own affine sampling.)
             const int patch_idy = (int)((2.f * gy + 0.5f) / (f32)tile_size);
             const int patch_idx = (int)((2.f * gx + 0.5f) / (f32)tile_size);
             f32 flow_x, flow_y, motion_extent;
@@ -2474,10 +2476,19 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                                         (size_t)std::max(1, flow.nx) +
                                     std::min(std::max(patch_idx, 0), std::max(0, flow.nx - 1));
                 motion_extent = (pidx < irr.size()) ? irr[pidx] : 0.f;
-            } else {
+            } else if (flow_bilin) {
                 f32 fdx, fdy, fz;
                 gcam_tile_bilinear(2.f * gy + 0.5f, 2.f * gx + 0.5f, tile_size, flow, irr, fdx, fdy, fz);
                 flow_x = 0.5f * fdx; flow_y = 0.5f * fdy; motion_extent = fz;
+            } else {
+                // Nearest = exactly the merge's fetch: no clamp on the tile index
+                // (merge.cpp accumulate_comp: int(lr / tile_size)); the extent is clamped.
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                const size_t pidx = (size_t)std::min(std::max(patch_idy, 0), std::max(0, flow.ny - 1)) *
+                                        (size_t)std::max(1, flow.nx) +
+                                    std::min(std::max(patch_idx, 0), std::max(0, flow.nx - 1));
+                motion_extent = (pidx < irr.size()) ? irr[pidx] : 0.f;
             }
             f32 sx = gx + flow_x, sy = gy + flow_y;
             if (flow.has_global_h) {
@@ -2666,12 +2677,14 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         // gcam comp-stats warp (not Catmull-Rom).
         const bool gcam_bicubic = cfg.robustness_bicubic_guide || gcam;
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                        tile_size, cfg.num_threads, false,
+                                        tile_size, cfg.num_threads,
+                                        /*bilinear_flow=*/cfg.gcam_flow_bilinear_active(),
                                         cfg.affine_flow_enabled, gcam_bicubic,
                                         /*catmull=*/false);
         if (gcam)
             comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
-                                           tile_size, cfg.num_threads, false,
+                                           tile_size, cfg.num_threads,
+                                           /*bilinear_flow=*/cfg.gcam_flow_bilinear_active(),
                                            cfg.affine_flow_enabled, gcam_bicubic,
                                            /*catmull=*/false);
     }
@@ -3433,6 +3446,8 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 patch_idx = x / tile_size;
                 if (aff) {
                     flow.sample_affine((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                } else if (cfg.gcam_flow_bilinear_active()) {   // merge's smooth field
+                    flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
                 } else {
                     flow_x = flow.dx(patch_idy, patch_idx);
                     flow_y = flow.dy(patch_idy, patch_idx);
@@ -3445,6 +3460,12 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                     f32 rdx, rdy;
                     flow.sample_affine(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
                                        tile_size, rdx, rdy);
+                    flow_x = 0.5f * rdx;
+                    flow_y = 0.5f * rdy;
+                } else if (cfg.gcam_flow_bilinear_active()) {   // merge's smooth field
+                    f32 rdx, rdy;
+                    flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                         tile_size, rdx, rdy);
                     flow_x = 0.5f * rdx;
                     flow_y = 0.5f * rdy;
                 } else {

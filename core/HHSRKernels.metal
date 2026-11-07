@@ -2075,6 +2075,9 @@ struct GcamSabreParams {
     // (rob_sample_biquad_abs) instead of the B-spline. The host passes the matching
     // biquadratic k in k_rgb/k_green, so only the sampler selection lives here.
     uint  rejection_only;
+    // gcam_sabre_flow_bilinear: 1 = bilinear tile flow + motion extent (the merge reads
+    // the same field); 0 = the containing tile's vector (= the merge's nearest fetch).
+    uint  flow_bilinear;
 };
 
 // §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
@@ -2181,13 +2184,17 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         gy = clamp((float(ty) + 0.5f) * gpt_y - 0.5f, 0.f, float(p.h) - 1.f);
         gx = clamp((float(tx) + 0.5f) * gpt_x - 0.5f, 0.f, float(p.w) - 1.f);
     } else { gy = float(ty); gx = float(tx); }
-    // §5.1 GCam texture(alt_flow_texture) = BILINEAR per-tile flow + flow.z (motion
-    // extent). Tile centre at (i+0.5)*tile -> tile coord = raw/tile - 0.5; blend 4 tiles,
-    // edge-clamped. Twin of gcam_tile_bilinear (robustness.cpp).
-    float t_y = (2.f * gy + 0.5f) / float(max(p.tile_size, 1u)) - 0.5f;
-    float t_x = (2.f * gx + 0.5f) / float(max(p.tile_size, 1u)) - 0.5f;
+    // §5.1 flow + motion extent. p.flow_bilinear (gcam_sabre_flow_bilinear): blend the 4
+    // tiles around this raw position (tile centre at (i+0.5)*tile -> tile coord =
+    // raw/tile - 0.5, edge-clamped; twin of gcam_tile_bilinear) = the merge's smooth
+    // field. Off: the containing tile (weights forced to 0 -> exactly tile fy0/fx0 below,
+    // computed from the un-shifted coordinate) = the merge's nearest fetch.
+    const float tbias = (p.flow_bilinear != 0u) ? 0.5f : 0.f;
+    float t_y = (2.f * gy + 0.5f) / float(max(p.tile_size, 1u)) - tbias;
+    float t_x = (2.f * gx + 0.5f) / float(max(p.tile_size, 1u)) - tbias;
     int fy0 = int(floor(t_y)), fx0 = int(floor(t_x));
     float wfy = t_y - float(fy0), wfx = t_x - float(fx0);
+    if (p.flow_bilinear == 0u) { wfy = 0.f; wfx = 0.f; }   // nearest: tile (fy0, fx0) only
     int ny1 = max(int(p.flow_ny) - 1, 0), nx1 = max(int(p.flow_nx) - 1, 0);
     uint ay = uint(clamp(fy0, 0, ny1)), byy = uint(clamp(fy0 + 1, 0, ny1));
     uint axx = uint(clamp(fx0, 0, nx1)), bxx = uint(clamp(fx0 + 1, 0, nx1));

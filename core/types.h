@@ -1879,15 +1879,16 @@ struct Config {
     bool  gcam_sabre_rejection_only = false;
     // Motion-field bilinear interpolation for the GCam path. Block matching gives one
     // vector per tile; read nearest, the warp is piecewise constant and rotation /
-    // sub-pixel motion leave a staircase at every tile boundary. The gcam robustness
-    // operator already reads the flow bilinearly between tile centres (GCam's
-    // texture(alt_flow_texture); gcam_tile_bilinear / rob_gcam_sabre), so the local
-    // colour difference is computed on the smooth per-pixel field. ON: the merge's
-    // sample placement (kernel regression) uses that SAME field (FlowField::
-    // sample_bilinear, tile t's centre at raw (t+0.5)*tile_size, edge-clamped), so the
-    // mask grades exactly the fetch the merge performs. OFF (default): the merge keeps
-    // the containing tile's vector (unchanged behaviour). Dense / affine flow still take
-    // precedence. Requires robustness_gcam_enabled -- see gcam_flow_bilinear_active().
+    // sub-pixel motion leave a staircase at every tile boundary. ON: the per-tile
+    // vectors are bilinearly interpolated between tile centres (tile t's centre at raw
+    // (t+0.5)*tile_size, edge-clamped; FlowField::sample_bilinear / gcam_tile_bilinear /
+    // flow_sample_bilinear) into one smooth per-pixel field, and BOTH consumers fetch
+    // it: the merge's sample placement (kernel regression) AND every gcam mask warp
+    // (the SABRE operator on CPU + Metal incl. its motion extent, the guide-res
+    // fallback, the raw-res stats warp, rob_make_mask), so the mask grades exactly the
+    // fetch the merge performs. OFF (default): both take the containing tile's vector
+    // (GCam's alt_flow_texture is NEAREST). Dense / affine flow still take precedence.
+    // Requires robustness_gcam_enabled -- see gcam_flow_bilinear_active().
     bool  gcam_sabre_flow_bilinear = false;
     bool gcam_flow_bilinear_active() const {
         return robustness_enabled && robustness_gcam_enabled && gcam_sabre_flow_bilinear;
