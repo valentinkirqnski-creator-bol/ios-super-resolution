@@ -543,10 +543,11 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
     int second_cand = kNone;
 
     if (ref_in) {
-        // Round, do not truncate -- see block_match_level_direct_460 in
-        // align.cpp. round() here matches std::lround: ties away from zero.
-        const int ifx = int(round(local_fx));
-        const int ify = int(round(local_fy));
+        // 460-main cuda_L1/L2_local_search: int(local_flow) -- TRUNCATION toward
+        // zero, as block_match_level_direct_460 in align.cpp (MSL float->int
+        // conversion truncates, like Python int()).
+        const int ifx = int(local_fx);
+        const int ify = int(local_fy);
         for (int c = int(lane); c < ncand; c += int(lanes)) {
             const int row = c / span;
             const int sdy = row - R;
@@ -1588,8 +1589,31 @@ struct KernelEstParams {
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint cov_stride;   // 3 = xx,xy,yy (default); 4 = legacy xx,xy,yx,yy
-    uint _pad1;        // 64 bytes total for setBytes
+    uint cfa_codes;    // colour of CFA site (y&1, x&1): byte ((y&1)*2 + (x&1))
+    float alpha_c0, alpha_c1, alpha_c2;   // per-colour GAT alpha (R, G, B)
+    float beta_c0, beta_c1, beta_c2;      // per-colour GAT beta
+    uint iso;          // 1 = KernelShape::Iso -> covs = diag(k_detail)
+    uint _pad2;        // 96 bytes total for setBytes
 };
+
+// 1.4 cuda_GAT on the RAW mosaic: each site uses its own colour's alpha/beta.
+// VST = alpha*v + 3/8*alpha^2 + beta (1.4 order), clamped at 0; 2/alpha * sqrt(VST).
+// Grey (non-Bayer) input uses the scalar alpha/beta. Runs BEFORE kernel_decimate_grey.
+kernel void kernel_gat_raw(device float* out [[buffer(0)]],
+                           device const float* raw [[buffer(1)]],
+                           constant KernelEstParams& p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
+    float alpha = p.alpha, beta = p.beta;
+    if (p.bayer != 0u) {
+        const uint c = (p.cfa_codes >> (((gid.y & 1u) * 2u + (gid.x & 1u)) * 8u)) & 0xFFu;
+        alpha = (c == 0u) ? p.alpha_c0 : ((c == 1u) ? p.alpha_c1 : p.alpha_c2);
+        beta  = (c == 0u) ? p.beta_c0  : ((c == 1u) ? p.beta_c1  : p.beta_c2);
+    }
+    const uint i = gid.y * p.raw_w + gid.x;
+    const float vst = max(0.f, alpha * raw[i] + 0.375f * alpha * alpha + beta);
+    out[i] = 2.f / alpha * sqrt(vst);
+}
 
 inline float gat_sample(float v, float alpha, float beta) {
     // apply_gat: c = 0.375*alpha^2 + beta; out = (2/alpha)*sqrt(max(0, alpha*v+c))
@@ -1600,7 +1624,7 @@ inline float gat_sample(float v, float alpha, float beta) {
 
 // linalg.h real_polyroots_2 / eigen_val / eigen_vect / eigen_elmts
 inline void real_polyroots_2(float a, float b, float c, thread float roots[2]) {
-    float delta = b * b - 4.f * a * c;
+    float delta = max(b * b - 4.f * a * c, 0.f);   // 1.4: max(delta, 0)
     float r1 = (-b + sqrt(delta)) / (2.f * a);
     float r2 = (-b - sqrt(delta)) / (2.f * a);
     if (fabs(r1) >= fabs(r2)) { roots[0] = r1; roots[1] = r2; }
@@ -1707,6 +1731,14 @@ kernel void kernel_estimate_cov(device float* covs [[buffer(0)]],
                                 constant KernelEstParams& p [[buffer(2)]],
                                 uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
+    if (p.iso != 0u) {   // cuda_estimate_kernel: iso -> diag(k_detail)
+        const uint st = (p.cov_stride == 3u) ? 3u : 4u;
+        const uint b0 = (gid.y * p.grey_w + gid.x) * st;
+        covs[b0 + 0u] = p.k_detail; covs[b0 + 1u] = 0.f;
+        if (st == 4u) { covs[b0 + 2u] = 0.f; covs[b0 + 3u] = p.k_detail; }
+        else          { covs[b0 + 2u] = p.k_detail; }
+        return;
+    }
     int y = int(gid.y), x = int(gid.x);
     int grad_h = int(p.grey_h) - 1;
     int grad_w = int(p.grey_w) - 1;
@@ -4410,7 +4442,7 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
     int oy = int(gid.y) * p.ts;
     float best = INFINITY;
     float second = INFINITY;
-    float2 best_flow = cand0;
+    float2 best_flow = float2(0.f, 0.f);   // 460: optimal_flow_x/y = 0
     uint best_ci = 0u;
     for (uint ci = 0u; ci < 3u; ++ci) {
         float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : cand2);
@@ -4419,8 +4451,8 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
         // containment. Hoisting it removes eight comparisons per pixel from the
         // inner loop and drops the loop entirely for candidates that cannot
         // win: those scored INFINITY, and INFINITY < INFINITY is false, so they
-        // could never take `best` anyway. best_flow still defaults to cand0
-        // when every candidate is out of bounds, as before.
+        // could never take `best` anyway. When EVERY candidate is out of bounds
+        // best_flow stays (0,0): 460-main's optimal_flow starts at zero.
         const int cx = int(c.x);
         const int cy = int(c.y);
         const bool inside =
@@ -5061,4 +5093,272 @@ kernel void rnn15_out(device const float* hband [[buffer(0)]],
     if (p.sharp_hi > p.sharp_lo)
         R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
     r_out[y * W + x] = R;
+}
+
+// ---------------------------------------------------------------------------
+// Handheld-Multi-Frame-Super-Resolution-1.4 alignment, exact (Config::align_match_14).
+// Twins of bm_l1_14 / bm_l2_14 / ica_14 / compute_sobel_grad* / compute_hessian in
+// align.cpp -- see the align_14 header there for the 1.4 source each line follows.
+// Metal has no double: the per-pixel ICA arithmetic that Numba promotes to float64 runs
+// in float here (CPU keeps the double), and the L2 cost is the direct SSD (equal to
+// sum(S^2) - 2 sum(ref S) up to the constant sum(ref^2), without its float cancellation).
+// ---------------------------------------------------------------------------
+struct Align14Params {
+    uint ny, nx;
+    int ts, R;
+    int ref_h, ref_w, mov_h, mov_w;
+    uint l1, n_iter;
+    uint _pad0, _pad1;
+};
+
+// Block matching, one thread per tile.
+kernel void align14_bm(device const float* ref [[buffer(0)]],
+                       device const float* mov [[buffer(1)]],
+                       device float* flow [[buffer(2)]],
+                       constant Align14Params& p [[buffer(3)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.ny * p.nx) return;
+    const int ts = p.ts, R = p.R;
+    const int ty = int(gid / p.nx), tx = int(gid % p.nx);
+    const int oy0 = ty * ts, ox0 = tx * ts;
+    const float fx = flow[gid * 2u + 0u], fy = flow[gid * 2u + 1u];
+    if (p.l1 != 0u) {
+        // cuda_L1_local_search16/32: centre = round(flow) (half-even), window
+        // ZERO-padded out of frame, SAD reduced in CUDA warp order, first minimum,
+        // result = round(flow) + shift (fraction dropped).
+        const float cx = rint(fx), cy = rint(fy);
+        if (ts == 64) {   // cuda_L1_local_search64 never applies the shift -> first wins
+            flow[gid * 2u + 0u] = cx - float(R);
+            flow[gid * 2u + 1u] = cy - float(R);
+            return;
+        }
+        const int oy = oy0 + int(cy) - R, ox = ox0 + int(cx) - R;
+        const int n = ts * ts;
+        float best = INFINITY;
+        int bsx = -R, bsy = -R;
+        for (int sy = -R; sy <= R; ++sy)
+            for (int sx = -R; sx <= R; ++sx) {
+                float total = 0.f;
+                for (int g = 0; g < n / 32; ++g) {
+                    float lane[32];
+                    for (int k = 0; k < 32; ++k) {
+                        const int t = g * 32 + k, u = t / ts, w = t - (t / ts) * ts;
+                        const int yy = oy + u + sy + R, xx = ox + w + sx + R;
+                        const float m = (yy >= 0 && yy < p.mov_h && xx >= 0 && xx < p.mov_w)
+                                            ? mov[uint(yy) * uint(p.mov_w) + uint(xx)] : 0.f;
+                        lane[k] = fabs(ref[uint(oy0 + u) * uint(p.ref_w) + uint(ox0 + w)] - m);
+                    }
+                    for (int off = 16; off > 0; off >>= 1)
+                        for (int i = 0; i < 32; ++i)
+                            lane[i] = lane[i] + ((i + off < 32) ? lane[i + off] : lane[i]);
+                    total = (g == 0) ? lane[0] : total + lane[0];
+                }
+                if (total < best) { best = total; bsx = sx; bsy = sy; }
+            }
+        flow[gid * 2u + 0u] = cx + float(bsx);
+        flow[gid * 2u + 1u] = cy + float(bsy);
+    } else {
+        // align_lvl_block_matching_L2: round(flow) (torch half-even), search area
+        // clamped to the frame, first argmin, flow += shift (fraction kept).
+        const int dx = int(rint(fx)), dy = int(rint(fy));
+        const int C = 2 * R + 1;
+        float best = INFINITY;
+        int bi = 0, bj = 0;
+        for (int i = 0; i < C; ++i)
+            for (int j = 0; j < C; ++j) {
+                float e = 0.f;
+                for (int u = 0; u < ts; ++u) {
+                    const int yy = clamp(oy0 + dy + i - R + u, 0, p.mov_h - 1);
+                    for (int w = 0; w < ts; ++w) {
+                        const int xx = clamp(ox0 + dx + j - R + w, 0, p.mov_w - 1);
+                        const float d = mov[uint(yy) * uint(p.mov_w) + uint(xx)] -
+                                        ref[uint(oy0 + u) * uint(p.ref_w) + uint(ox0 + w)];
+                        e += d * d;
+                    }
+                }
+                if (e < best) { best = e; bi = i; bj = j; }
+            }
+        flow[gid * 2u + 0u] = fx + float(bj - R);
+        flow[gid * 2u + 1u] = fy + float(bi - R);
+    }
+}
+
+// init_ica gradients: conv2d([-1,0,1], padding='same') -> zero padding.
+kernel void align14_grad(device const float* img [[buffer(0)]],
+                         device float* gx [[buffer(1)]],
+                         device float* gy [[buffer(2)]],
+                         constant Align14Params& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    const int x = int(gid.x), y = int(gid.y);
+    if (x >= p.ref_w || y >= p.ref_h) return;
+    const uint o = uint(y) * uint(p.ref_w) + uint(x);
+    const float xm = (x - 1 >= 0) ? img[o - 1u] : 0.f;
+    const float xp = (x + 1 < p.ref_w) ? img[o + 1u] : 0.f;
+    const float ym = (y - 1 >= 0) ? img[o - uint(p.ref_w)] : 0.f;
+    const float yp = (y + 1 < p.ref_h) ? img[o + uint(p.ref_w)] : 0.f;
+    gx[o] = -xm + xp;
+    gy[o] = -ym + yp;
+}
+
+// compute_hessian: per tile, row-major sequential float sums.
+kernel void align14_hessian(device const float* gx [[buffer(0)]],
+                            device const float* gy [[buffer(1)]],
+                            device float* H [[buffer(2)]],
+                            constant Align14Params& p [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.ny * p.nx) return;
+    const int ts = p.ts, ty = int(gid / p.nx), tx = int(gid % p.nx);
+    float h0 = 0.f, h1 = 0.f, h2 = 0.f, h3 = 0.f;
+    for (int i = 0; i < ts; ++i)
+        for (int j = 0; j < ts; ++j) {
+            const uint o = uint(ty * ts + i) * uint(p.ref_w) + uint(tx * ts + j);
+            const float a = gx[o], b = gy[o];
+            h0 += a * a; h1 += a * b; h2 += a * b; h3 += b * b;
+        }
+    H[gid * 4u + 0u] = h0; H[gid * 4u + 1u] = h1; H[gid * 4u + 2u] = h2; H[gid * 4u + 3u] = h3;
+}
+
+// ica_kernel_8/16/32: one threadgroup per tile, ts*ts threads (tid = ty*ts + tx).
+kernel void align14_ica(device const float* ref [[buffer(0)]],
+                        device const float* gx [[buffer(1)]],
+                        device const float* gy [[buffer(2)]],
+                        device const float* H [[buffer(3)]],
+                        device const float* mov [[buffer(4)]],
+                        device float* flow [[buffer(5)]],
+                        constant Align14Params& p [[buffer(6)]],
+                        threadgroup float* sB0 [[threadgroup(0)]],
+                        threadgroup float* sB1 [[threadgroup(1)]],
+                        uint tile [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float s_al[2];   // function-scope threadgroup storage
+    if (tile >= p.ny * p.nx) return;                 // uniform per threadgroup
+    const int ts = p.ts, n = ts * ts;
+    const float A00 = H[tile * 4u + 0u], A01 = H[tile * 4u + 1u];
+    const float A10 = H[tile * 4u + 2u], A11 = H[tile * 4u + 3u];
+    const float det = A00 * A11 - A01 * A10;
+    if (fabs(det) < 1e-10f) return;                  // whole block exits
+    const float det_inv = 1.f / det;
+    const float clip = float(p.R);
+    if (tid == 0u) { s_al[0] = flow[tile * 2u + 0u]; s_al[1] = flow[tile * 2u + 1u]; }
+    const int px = int(tile % p.nx), py = int(tile / p.nx);
+    if (ts == 64) {
+        // ica_kernel_64: 64x16 threads, each 4 vertically adjacent pixels with the kernel's
+        // sliding interpolation (it skips row floor_y + 1 -- sic), warp-shuffle tree, warp
+        // 0's sum kept by thread 0, other warp leaders' sums added in order, clip DISABLED.
+        const int tx64 = int(tid) % 64, ty64 = int(tid) / 64;
+        const int x = px * 64 + tx64, y = py * 64 + ty64 * 4;
+        float lg0[4], lg1[4], rc[4];
+        for (int i = 0; i < 4; ++i) {
+            const uint oi = uint(y + i) * uint(p.ref_w) + uint(x);
+            lg0[i] = gx[oi]; lg1[i] = gy[oi]; rc[i] = ref[oi];
+        }
+        for (uint it = 0u; it < p.n_iter; ++it) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float X = float(x) + s_al[0], Y = float(y) + s_al[1];
+            const int fx = int(floor(X));
+            int fy = int(floor(Y));
+            const float frx = X - float(fx), fry = Y - float(fy);
+            const bool inx0 = (fx >= 0 && fx < p.mov_w), inx1 = (fx + 1 >= 0 && fx + 1 < p.mov_w);
+            bool iny = (fy >= 0 && fy < p.mov_h);
+            float m10 = (iny && inx0) ? mov[uint(fy) * uint(p.mov_w) + uint(fx)] : 0.f;
+            float m11 = (iny && inx1) ? mov[uint(fy) * uint(p.mov_w) + uint(fx + 1)] : 0.f;
+            float lbot = m10 + (m11 - m10) * frx;
+            float v0 = 0.f, v1 = 0.f;
+            for (int i = 0; i < 4; ++i) {
+                fy += 1;
+                iny = (fy + 1 >= 0 && fy + 1 < p.mov_h);
+                m10 = (iny && inx0) ? mov[uint(fy + 1) * uint(p.mov_w) + uint(fx)] : 0.f;
+                m11 = (iny && inx1) ? mov[uint(fy + 1) * uint(p.mov_w) + uint(fx + 1)] : 0.f;
+                const float ltop = lbot;
+                lbot = m10 + (m11 - m10) * frx;
+                const float gt = (ltop + (lbot - ltop) * fry) - rc[i];
+                v0 += -lg0[i] * gt;
+                v1 += -lg1[i] * gt;
+            }
+            for (ushort off = 16; off > 0; off >>= 1) {
+                v0 += simd_shuffle_down(v0, off);
+                v1 += simd_shuffle_down(v1, off);
+            }
+            if (lane == 0u && sg > 0u) { sB0[sg] = v0; sB1[sg] = v1; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                float B0 = v0, B1 = v1;                       // warp 0's own sum
+                for (int i = 1; i < 32; ++i) { B0 += sB0[i]; B1 += sB1[i]; }
+                s_al[0] += det_inv * (A11 * B0 - A01 * B1);   // clip_radius = 32767 (off)
+                s_al[1] += det_inv * (-A10 * B0 + A00 * B1);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) { flow[tile * 2u + 0u] = s_al[0]; flow[tile * 2u + 1u] = s_al[1]; }
+        return;
+    }
+    const int tx = int(tid) % ts, ty = int(tid) / ts;
+    const int x = px * ts + tx, y = py * ts + ty;
+    const uint o = uint(y) * uint(p.ref_w) + uint(x);
+    const float lgx = gx[o], lgy = gy[o], refc = ref[o];
+    for (uint it = 0u; it < p.n_iter; ++it) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float X = float(x) + s_al[0], Y = float(y) + s_al[1];
+        int fx = int(floor(X)), fy = int(floor(Y));
+        const float frx = X - float(fx), fry = Y - float(fy);
+        float m00, m01, m10, m11;
+        if (ts == 8) {
+            fx = clamp(fx, 0, p.mov_w - 1);
+            fy = clamp(fy, 0, p.mov_h - 1);
+            const int cx = clamp(fx + 1, 0, p.mov_w - 1), cy = clamp(fy + 1, 0, p.mov_h - 1);
+            m00 = mov[uint(fy) * uint(p.mov_w) + uint(fx)];
+            m01 = mov[uint(fy) * uint(p.mov_w) + uint(cx)];
+            m10 = mov[uint(cy) * uint(p.mov_w) + uint(fx)];
+            m11 = mov[uint(cy) * uint(p.mov_w) + uint(cx)];
+        } else {
+            const bool iny0 = (fy >= 0 && fy < p.mov_h), iny1 = (fy + 1 >= 0 && fy + 1 < p.mov_h);
+            const bool inx0 = (fx >= 0 && fx < p.mov_w), inx1 = (fx + 1 >= 0 && fx + 1 < p.mov_w);
+            m00 = (iny0 && inx0) ? mov[uint(fy) * uint(p.mov_w) + uint(fx)] : 0.f;
+            m01 = (iny0 && inx1) ? mov[uint(fy) * uint(p.mov_w) + uint(fx + 1)] : 0.f;
+            m10 = (iny1 && inx0) ? mov[uint(fy + 1) * uint(p.mov_w) + uint(fx)] : 0.f;
+            m11 = (iny1 && inx1) ? mov[uint(fy + 1) * uint(p.mov_w) + uint(fx + 1)] : 0.f;
+        }
+        const float lt = m00 + (m01 - m00) * frx;
+        const float lb = m10 + (m11 - m10) * frx;
+        const float gt = (lt + (lb - lt) * fry) - refc;
+        const float b0 = -lgx * gt, b1 = -lgy * gt;
+        if (ts == 32) {
+            // warp shfl_down tree, warp leaders summed sequentially by thread 0
+            float v0 = b0, v1 = b1;
+            for (ushort off = 16; off > 0; off >>= 1) {
+                v0 += simd_shuffle_down(v0, off);
+                v1 += simd_shuffle_down(v1, off);
+            }
+            if (lane == 0u) { sB0[sg] = v0; sB1[sg] = v1; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0u) {
+                float B0 = sB0[0], B1 = sB1[0];
+                for (int i = 1; i < n / 32; ++i) { B0 += sB0[i]; B1 += sB1[i]; }
+                s_al[0] += clamp(det_inv * (A11 * B0 - A01 * B1), -clip, clip);
+                s_al[1] += clamp(det_inv * (-A10 * B0 + A00 * B1), -clip, clip);
+            }
+        } else {
+            sB0[tid] = b0; sB1[tid] = b1;
+            for (int N = n / 2; N > 0; N /= 2) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (int(tid) < N) {
+                    const float q0 = sB0[tid + uint(N)], q1 = sB1[tid + uint(N)];
+                    // ica_kernel_8 clips the PARTNER value inside the tree (sic)
+                    sB0[tid] += (ts == 8) ? clamp(q0, -clip, clip) : q0;
+                    sB1[tid] += (ts == 8) ? clamp(q1, -clip, clip) : q1;
+                }
+            }
+            if (tid == 0u) {
+                const float B0 = sB0[0], B1 = sB1[0];
+                const float s0 = det_inv * (A11 * B0 - A01 * B1);
+                const float s1 = det_inv * (-A10 * B0 + A00 * B1);
+                s_al[0] += (ts == 8) ? s0 : clamp(s0, -clip, clip);   // kernel_8: step unclipped
+                s_al[1] += (ts == 8) ? s1 : clamp(s1, -clip, clip);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) { flow[tile * 2u + 0u] = s_al[0]; flow[tile * 2u + 1u] = s_al[1]; }
 }

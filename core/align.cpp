@@ -521,21 +521,17 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             const int ox = tx * ts;
             const f32 local_fx = flow.dx(ty, tx);
             const f32 local_fy = flow.dy(ty, tx);
-            // Round the search centre, do not truncate. The reference rounds
-            // (extract_flow_patches does flow.round(); the L1 kernels do
-            // round(alignment)), and truncation displaces the centre by up to a
-            // full pixel where rounding caps it at half. Level 0 searches with
-            // radius 1, so a whole-pixel offset can put the true optimum outside
-            // the window entirely, leaving ICA to recover a full pixel from the
-            // edge of its basin.
-            //
-            // Only fractional input flow is affected, so this is inert on the
-            // FFT path -- every level there receives integer flow -- and live on
-            // the decimate path, where per-level ICA hands each level a
-            // fractional estimate. Hoisted out of the inner loops; it was being
-            // recomputed per sampled pixel.
-            const int base_fx = cuda_round_to_int(local_fx);
-            const int base_fy = cuda_round_to_int(local_fy);
+            // 460-main block_matching.py cuda_L1/L2_local_search, verbatim:
+            //   new_idx = patch_pos_x + j + int(local_flow[0]) + search_shift_x
+            // int() TRUNCATES toward zero (it does not round). With 460's own
+            // inputs the flow entering a search is always integral (zeros at the
+            // coarsest level, integer BM results x integer upsample factor after),
+            // so this only differs from rounding when an opt-in stage (per-level
+            // ICA / LK / sub-pixel BM / a fractional global seed) hands the search
+            // a fractional centre -- and then 460's truncation is what we do.
+            // Hoisted out of the inner loops.
+            const int base_fx = (int)local_fx;
+            const int base_fy = (int)local_fy;
             f32 min_dist = std::numeric_limits<f32>::infinity();
             f32 second_dist = std::numeric_limits<f32>::infinity();
             int min_shift_x = 0, min_shift_y = 0;
@@ -1077,8 +1073,17 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             if (fallback_on_ambiguous && best_i != 0 &&
                 match_is_ambiguous(best_dist, second_dist, ambiguity_ratio) != 0u)
                 best_i = 0;
-            out.dx(ty, tx) = cand[best_i][0];
-            out.dy(ty, tx) = cand[best_i][1];
+            // 460-main cuda_upsample_alignments: optimal_flow starts at (0, 0) and
+            // a candidate is taken only on dist_ < dist (dist = +inf initially), so
+            // when EVERY candidate leaves the alternate level the tile gets ZERO
+            // motion -- not the parent's vector.
+            if (std::isfinite(best_dist)) {
+                out.dx(ty, tx) = cand[best_i][0];
+                out.dy(ty, tx) = cand[best_i][1];
+            } else {
+                out.dx(ty, tx) = 0.f;
+                out.dy(ty, tx) = 0.f;
+            }
             if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
                 int ap_y = prev_y;
                 int ap_x = prev_x;
@@ -2133,10 +2138,334 @@ static void maybe_fb_correct(FlowField& flow, const Image& ref_grey,
     apply_fb_consistency(flow, bwd, gts, cfg);
 }
 
+// ============================================================================
+// Handheld-Multi-Frame-Super-Resolution-1.4 alignment, EXACT (Config::align_match_14).
+//
+// Line-for-line port of 1.4 handheld_super_resolution/alignment.py align() with the
+// functions it calls (block_matching.py align_lvl_block_matching_L1/L2 +
+// extract_flow_patches, ICA.py init_ica / align_lvl_ica / ica_kernel_8/16/32,
+// utils_image.cuda_downsample) and the config defaults (factors [1,2,4,4], tile sizes
+// [Ts,Ts,Ts,Ts/2], radii [1,4,4,4], metrics [L1,L2,L2,L2], flow_upscale_mode bilinear,
+// ica n_iter 3, sigma_blur 0, clip true, preprocessing None):
+//
+//   ref pyramid  : circular-pad to Ts, then valid-conv gaussian pyramid (built by the
+//                  caller exactly so -- pipeline pad_image_circular + build_pyramid).
+//   moving pyr.  : the SAME pyramid of the UNPADDED moving grey (1.4 align() does not
+//                  pad the moving frame).
+//   per level, coarse -> fine:
+//     tiles      : floor(level / ts) (ref_lvl.unfold), flow zeros at the coarsest,
+//                  else upscale_lvl = F.interpolate(bilinear, align_corners=False)
+//                  x factor, zero-padded bottom/right (upscale_flow_bilinear_14).
+//     block match: L2 -> round(flow) (torch, half-even), search area clamped to the
+//                  frame, error = sum(S^2) - 2 sum(ref*S) over the (2R+1)^2 shifts
+//                  (== the rfft2 correlation + box filter, written directly), first
+//                  argmin, flow += shift (the FRACTION IS KEPT).
+//                  L1 -> centre = round(flow), search window ZERO-padded out of
+//                  frame, SAD summed in CUDA warp order, first minimum, flow =
+//                  round(flow) + shift (the FRACTION IS DROPPED).
+//     ICA        : at EVERY level. Prewitt [-1,0,1] gradients of the ref level with
+//                  zero 'same' padding, Hessian per tile (floor grid), det < 1e-10 ->
+//                  tile skipped; n_iter Gauss-Newton steps with the 1.4 kernels:
+//                    ts 8 : floor/ceil CLAMPED to the frame, each partner value
+//                           clipped to +-R inside the tree reduction (sic), det_inv
+//                           in double, step not clipped;
+//                    ts 16: out-of-frame samples = 0, tree reduction, step clipped
+//                           to +-R per component;
+//                    ts 32: as 16, but the per-pixel term, the warp-shuffle tree and the
+//                           step stay float64 (Numba's B0 variable); f32 only per warp;
+//                    ts 64: 64x16 threads x 4 rows each, the kernel's sliding interpolation
+//                           (skips row floor_y+1, sic), f64 as ts 32, clip DISABLED.
+//                  Per-pixel arithmetic in DOUBLE where Numba promotes (int pixel
+//                  coordinate + float32 flow -> float64), stored back to float32 as
+//                  the kernels' float32 shared arrays do.
+// The initial flow is zero (1.4 has no global pre-alignment seed).
+// ============================================================================
+static void bm_l1_14(const Image& ref, const Image& mov, int ts, int R, FlowField& flow,
+                     int num_threads) {
+    if (ts == 64) {
+        // cuda_L1_local_search64, verbatim behaviour: its SAD reads
+        // s_mov[ty*4 + k + R, tx + R] for EVERY shift (the shift is never applied), so
+        // all (2R+1)^2 errors are equal, the first (shift -R,-R) wins, and the result is
+        // round(flow) + (-R, -R). A 1.4 bug, reproduced because this port is exact.
+        for (size_t i = 0; i < flow.flow.size(); ++i)
+            flow.flow[i] = std::nearbyint(flow.flow[i]) - (f32)R;
+        return;
+    }
+    const int P = ts + 2 * R, n = ts * ts;
+    parallel_rows(flow.ny, num_threads, [&](int ty) {
+        std::vector<f32> S((size_t)P * P), v((size_t)std::max(n, 32));
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            // s_flow = round(alignment): Python round() on a float = half-to-even.
+            const f32 cx = std::nearbyint(flow.dx(ty, tx));
+            const f32 cy = std::nearbyint(flow.dy(ty, tx));
+            const int oy = ty * ts + (int)cy - R, ox = tx * ts + (int)cx - R;
+            for (int a = 0; a < P; ++a)
+                for (int b = 0; b < P; ++b) {
+                    const int yy = oy + a, xx = ox + b;
+                    S[(size_t)a * P + b] = (yy >= 0 && yy < mov.h && xx >= 0 && xx < mov.w)
+                                               ? mov.at(yy, xx) : 0.f;
+                }
+            f32 best = std::numeric_limits<f32>::infinity();
+            int bsx = -R, bsy = -R;
+            for (int sy = -R; sy <= R; ++sy)
+                for (int sx = -R; sx <= R; ++sx) {
+                    for (int u = 0; u < ts; ++u)
+                        for (int w = 0; w < ts; ++w)
+                            v[(size_t)u * ts + w] = std::fabs(
+                                ref.at(ty * ts + u, tx * ts + w) -
+                                S[(size_t)(u + sy + R) * P + (w + sx + R)]);
+                    // warp shfl_down tree per 32 threads, warp leaders summed in order
+                    const f32 e = (n >= 32) ? warp_then_block_reduce_sum(v, n)
+                                            : [&] { f32 s = 0.f; for (int i = 0; i < n; ++i) s += v[i]; return s; }();
+                    if (e < best) { best = e; bsx = sx; bsy = sy; }
+                }
+            flow.dx(ty, tx) = cx + (f32)bsx;
+            flow.dy(ty, tx) = cy + (f32)bsy;
+        }
+    });
+}
+
+static void bm_l2_14(const Image& ref, const Image& mov, int ts, int R, FlowField& flow,
+                     int num_threads) {
+    const int P = ts + 2 * R, C = 2 * R + 1;
+    parallel_rows(flow.ny, num_threads, [&](int ty) {
+        std::vector<f32> S((size_t)P * P);
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            // extract_flow_patches: flow.round() (torch, half-even), coords clamped.
+            const int dx = (int)std::nearbyint(flow.dx(ty, tx));
+            const int dy = (int)std::nearbyint(flow.dy(ty, tx));
+            for (int a = 0; a < P; ++a) {
+                const int yy = std::min(std::max(ty * ts + dy + a - R, 0), mov.h - 1);
+                for (int b = 0; b < P; ++b) {
+                    const int xx = std::min(std::max(tx * ts + dx + b - R, 0), mov.w - 1);
+                    S[(size_t)a * P + b] = mov.at(yy, xx);
+                }
+            }
+            // Accumulated in DOUBLE: e = sum(S^2) - 2 sum(ref S) is a difference of two
+            // nearly equal large sums on low-contrast tiles, and float32 cancellation there
+            // flips the argmin by several % of the true SSD. 1.4 evaluates the same formula
+            // with a float32 cuFFT whose rounding cannot be reproduced, so the faithful,
+            // reproducible choice is the formula's exact (double) argmin.
+            double best = std::numeric_limits<double>::infinity();
+            int bi = 0, bj = 0;
+            for (int i = 0; i < C; ++i)
+                for (int j = 0; j < C; ++j) {
+                    double l2 = 0.0, corr = 0.0;
+                    for (int u = 0; u < ts; ++u)
+                        for (int w = 0; w < ts; ++w) {
+                            const double s = (double)S[(size_t)(u + i) * P + (w + j)];
+                            l2 += s * s;
+                            corr += (double)ref.at(ty * ts + u, tx * ts + w) * s;
+                        }
+                    const double e = l2 - 2.0 * corr;   // L2_search - 2 * corrs
+                    if (e < best) { best = e; bi = i; bj = j; }   // torch.argmin: first
+                }
+            flow.dx(ty, tx) += (f32)(bj - C / 2);
+            flow.dy(ty, tx) += (f32)(bi - C / 2);
+        }
+    });
+}
+
+static void ica_14(const Image& ref, const Image& gx, const Image& gy, const HessianField& H,
+                   const Image& mov, FlowField& flow, int ts, int n_iter, int clip_radius,
+                   int num_threads) {
+    const int n = ts * ts;
+    const f32 clip = (f32)clip_radius;
+    auto clampf_ = [](f32 v, f32 c) { return std::max(std::min(v, c), -c); };
+    parallel_rows(flow.ny, num_threads, [&](int py) {
+        std::vector<f32> sB0((size_t)n), sB1((size_t)n);
+        for (int px = 0; px < flow.nx; ++px) {
+            const f32* h = H.at(py, px);
+            const f32 A00 = h[0], A01 = h[1], A10 = h[2], A11 = h[3];
+            const f32 det = A00 * A11 - A01 * A10;
+            if (std::fabs(det) < 1e-10f) continue;          // whole block returns
+            const double det_inv8 = 1.0 / (double)det;       // ica_kernel_8: 1.0 / det (f64)
+            const f32 det_inv = 1.f / det;                   // 16/32: FLOAT(1.0) / det
+            f32 a0 = flow.dx(py, px), a1 = flow.dy(py, px);
+            if (ts == 32 || ts == 64) {
+                // ica_kernel_32 / ica_kernel_64. Under Numba's typing B0 = -l_gradx * gradt is
+                // a FLOAT64 variable (gradt is f64): it stays f64 through the per-thread sum
+                // (64: 4 pixels) and the warp shfl_down tree, is rounded to f32 only when a
+                // warp leader stores it in the f32 shared array, and thread 0 sums the warp
+                // values -- and computes the step -- in f64. ts 32: thread 0 starts from
+                // s_B0[0] (warp 0, f32-rounded); ts 64: thread 0 keeps its own f64 warp-0 sum
+                // (warp 0 never writes s_B0). ts 64 disables the clip (32767) and interpolates
+                // with the kernel's sliding scheme, which skips row floor_y + 1 (sic).
+                const bool k64 = (ts == 64);
+                const int nthr = k64 ? 1024 : n;                     // 64x16 threads for ts 64
+                const double clip_d = k64 ? 32767.0 : (double)clip_radius;
+                std::vector<double> v0((size_t)nthr), v1((size_t)nthr);
+                auto smp = [&](int yy, int xx) -> f32 {
+                    return (yy >= 0 && yy < mov.h && xx >= 0 && xx < mov.w) ? mov.at(yy, xx) : 0.f;
+                };
+                auto warp_d = [](const double* v) {                // shfl_down tree, lane 0
+                    double l[32];
+                    for (int i = 0; i < 32; ++i) l[i] = v[i];
+                    for (int off = 16; off > 0; off /= 2)
+                        for (int i = 0; i < 32; ++i) l[i] = l[i] + ((i + off < 32) ? l[i + off] : l[i]);
+                    return l[0];
+                };
+                for (int it = 0; it < n_iter; ++it) {
+                    for (int ti = 0; ti < nthr; ++ti) {
+                        const int tx = k64 ? (ti % 64) : (ti % ts);
+                        const int ty = k64 ? (ti / 64) : (ti / ts);
+                        const int x = px * ts + tx;
+                        const int y = k64 ? (py * ts + ty * 4) : (py * ts + ty);
+                        const double X = (double)x + (double)a0, Y = (double)y + (double)a1;
+                        const int fx = (int)std::floor(X);
+                        int fy = (int)std::floor(Y);
+                        const double frx = X - (double)fx, fry = Y - (double)fy;
+                        if (!k64) {
+                            const f32 m00 = smp(fy, fx), m01 = smp(fy, fx + 1);
+                            const f32 m10 = smp(fy + 1, fx), m11 = smp(fy + 1, fx + 1);
+                            const double lt = (double)m00 + (double)(m01 - m00) * frx;
+                            const double lb = (double)m10 + (double)(m11 - m10) * frx;
+                            const double gt = (lt + (lb - lt) * fry) - (double)ref.at(y, x);
+                            v0[(size_t)ti] = (double)(-gx.at(y, x)) * gt;
+                            v1[(size_t)ti] = (double)(-gy.at(y, x)) * gt;
+                        } else {
+                            f32 m10 = smp(fy, fx), m11 = smp(fy, fx + 1);
+                            double lbot = (double)m10 + (double)(m11 - m10) * frx;
+                            double b0 = 0.0, b1 = 0.0;
+                            for (int i = 0; i < 4; ++i) {
+                                fy += 1;
+                                m10 = smp(fy + 1, fx); m11 = smp(fy + 1, fx + 1);
+                                const double ltop = lbot;
+                                lbot = (double)m10 + (double)(m11 - m10) * frx;
+                                const double gt = (ltop + (lbot - ltop) * fry) - (double)ref.at(y + i, x);
+                                b0 += (double)(-gx.at(y + i, x)) * gt;
+                                b1 += (double)(-gy.at(y + i, x)) * gt;
+                            }
+                            v0[(size_t)ti] = b0; v1[(size_t)ti] = b1;
+                        }
+                    }
+                    double B0 = 0.0, B1 = 0.0;
+                    for (int w = 0; w < nthr / 32; ++w) {
+                        const double s0 = warp_d(&v0[(size_t)w * 32]), s1 = warp_d(&v1[(size_t)w * 32]);
+                        if (w == 0) {
+                            B0 = k64 ? s0 : (double)(f32)s0;
+                            B1 = k64 ? s1 : (double)(f32)s1;
+                        } else {
+                            B0 += (double)(f32)s0;
+                            B1 += (double)(f32)s1;
+                        }
+                    }
+                    const double st0 = (double)det_inv * ((double)A11 * B0 - (double)A01 * B1);
+                    const double st1 = (double)det_inv * ((double)(-A10) * B0 + (double)A00 * B1);
+                    a0 = (f32)((double)a0 + std::max(std::min(st0, clip_d), -clip_d));
+                    a1 = (f32)((double)a1 + std::max(std::min(st1, clip_d), -clip_d));
+                }
+                flow.dx(py, px) = a0;
+                flow.dy(py, px) = a1;
+                continue;
+            }
+            for (int it = 0; it < n_iter; ++it) {
+                for (int ty = 0; ty < ts; ++ty)
+                    for (int tx = 0; tx < ts; ++tx) {
+                        const int x = px * ts + tx, y = py * ts + ty, tid = ty * ts + tx;
+                        const double X = (double)x + (double)a0, Y = (double)y + (double)a1;
+                        int fx = (int)std::floor(X), fy = (int)std::floor(Y);
+                        const double frx = X - (double)fx, fry = Y - (double)fy;
+                        f32 m00, m01, m10, m11;
+                        if (ts == 8) {
+                            fx = std::min(std::max(fx, 0), mov.w - 1);
+                            fy = std::min(std::max(fy, 0), mov.h - 1);
+                            const int cx = std::min(std::max(fx + 1, 0), mov.w - 1);
+                            const int cy = std::min(std::max(fy + 1, 0), mov.h - 1);
+                            m00 = mov.at(fy, fx); m01 = mov.at(fy, cx);
+                            m10 = mov.at(cy, fx); m11 = mov.at(cy, cx);
+                        } else {
+                            auto s = [&](int yy, int xx) {
+                                return (yy >= 0 && yy < mov.h && xx >= 0 && xx < mov.w) ? mov.at(yy, xx) : 0.f;
+                            };
+                            m00 = s(fy, fx); m01 = s(fy, fx + 1); m10 = s(fy + 1, fx); m11 = s(fy + 1, fx + 1);
+                        }
+                        // (m01 - m00) is float32; * frac (f64) promotes to f64.
+                        const double lt = (double)m00 + (double)(m01 - m00) * frx;
+                        const double lb = (double)m10 + (double)(m11 - m10) * frx;
+                        const double mi = lt + (lb - lt) * fry;
+                        const double gt = mi - (double)ref.at(y, x);
+                        sB0[(size_t)tid] = (f32)((double)(-gx.at(y, x)) * gt);
+                        sB1[(size_t)tid] = (f32)((double)(-gy.at(y, x)) * gt);
+                    }
+                f32 B0, B1;
+                if (ts == 8) {            // tree; the PARTNER value is clipped (1.4 kernel_8)
+                    for (int N = n / 2; N > 0; N /= 2)
+                        for (int t = 0; t < N; ++t) {
+                            sB0[(size_t)t] += clampf_(sB0[(size_t)t + N], clip);
+                            sB1[(size_t)t] += clampf_(sB1[(size_t)t + N], clip);
+                        }
+                    B0 = sB0[0]; B1 = sB1[0];
+                    a0 = (f32)((double)a0 + det_inv8 * (double)(A11 * B0 - A01 * B1));
+                    a1 = (f32)((double)a1 + det_inv8 * (double)(-A10 * B0 + A00 * B1));
+                } else {                  // ts 16: f32 tree, step clipped to +-R
+                    B0 = butterfly_reduce_sum(sB0, n); B1 = butterfly_reduce_sum(sB1, n);
+                    a0 += clampf_(det_inv * (A11 * B0 - A01 * B1), clip);
+                    a1 += clampf_(det_inv * (-A10 * B0 + A00 * B1), clip);
+                }
+            }
+            flow.dx(py, px) = a0;
+            flow.dy(py, px) = a1;
+        }
+    });
+}
+
+static FlowField align_14(const Pyramid& ref_pyr, const Image& moving_grey, const Config& cfg,
+                          int tile_size) {
+    const int nlev = (int)ref_pyr.levels.size();
+    // 1.4 align(): moving_pyramid = build_gaussian_pyramid(th_img, factors) -- unpadded.
+    Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
+    FlowField flow;
+    for (int lvl = nlev - 1; lvl >= 0; --lvl) {
+        const Image& r = ref_pyr.levels[(size_t)lvl];
+        const Image& m = mov_pyr.levels[(size_t)lvl];
+        const int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                                              ? cfg.bm_tile_sizes[lvl] : tile_size);
+        const int R = cfg.search_radius_for_level(lvl);
+        const int ny = r.h / ts, nx = r.w / ts;          // ref_lvl.unfold(ts, ts)
+        if (flow.nx == 0) {
+            flow = FlowField(ny, nx);                    // torch.zeros
+        } else {
+            const int up = ((lvl + 1) < (int)cfg.bm_factors.size()) ? cfg.bm_factors[lvl + 1] : 1;
+            const int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                                    ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
+            flow = upscale_flow_bilinear_14(flow, ny, nx, up, ts, prev_ts);
+        }
+        const std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
+        if (metric == "L1") bm_l1_14(r, m, ts, R, flow, cfg.num_threads);
+        else                bm_l2_14(r, m, ts, R, flow, cfg.num_threads);
+        // init_ica(lvl, ts): Prewitt gradients of the (padded) ref level + Hessian.
+        const Image gx = compute_sobel_gradx(r), gy = compute_sobel_grady(r);
+        const HessianField H = compute_hessian(gx, gy, ts);
+        ica_14(r, gx, gy, H, m, flow, ts, cfg.ica_n_iter, R, cfg.num_threads);
+    }
+    return flow;
+}
+
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size,
                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     int nlev = (int)ref_pyr.levels.size();
+
+    // Config::align_match_14: Handheld-Multi-Frame-Super-Resolution-1.4 alignment.py,
+    // exactly (see align_14 above). Replaces the whole port path below, including
+    // its opt-in extras and the global pre-alignment seed, which 1.4 does not have.
+    if (cfg.align_match_14) {
+#ifdef __APPLE__
+        if (!env_flag_on("HHSR_ALIGN_CPU")) {
+            FlowField fg;
+            if (align_metal_14(ref_pyr, moving_grey, cfg, tile_size, fg)) {
+                mark_aperture_limited_tiles(fg, nullptr, cfg);
+                mark_motion_irregular_tiles(fg, cfg);
+                return fg;
+            }
+        }
+#endif
+        FlowField f14 = align_14(ref_pyr, moving_grey, cfg, tile_size);
+        mark_aperture_limited_tiles(f14, nullptr, cfg);
+        mark_motion_irregular_tiles(f14, cfg);
+        return f14;
+    }
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.

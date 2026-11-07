@@ -94,6 +94,9 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
     var k_detail: Float = 0.17
+    /// Override the merge kernel scale k_detail (applied after SNR auto-tune). Off by default.
+    var k_detail_override: Bool = false
+    var k_detail_override_value: Float = 0.25
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
@@ -147,7 +150,7 @@ struct TuningParams: Equatable, Codable {
     /// the 460-derived behaviour. Algorithm parity, not bit parity.
     /// Default false: run the 460-main alignment (single finest-level ICA +
     /// three-candidate flow upscale), not 1.4's per-level ICA + bilinear upscale.
-    var align_match_14: Bool = false
+    var align_match_14: Bool = true
     /// Per-tile affine motion model. Fits a local affine (translation + flow
     /// Jacobian) per tile so rotation/yaw/pitch/smooth-parallax warp correctly
     /// within the tile instead of by one constant vector. Experimental, off by
@@ -558,6 +561,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
+        case k_detail_override, k_detail_override_value
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -633,6 +637,8 @@ struct TuningParams: Equatable, Codable {
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
         flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
         k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
+        k_detail_override = try c.decodeIfPresent(Bool.self, forKey: .k_detail_override) ?? k_detail_override
+        k_detail_override_value = try c.decodeIfPresent(Float.self, forKey: .k_detail_override_value) ?? k_detail_override_value
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
@@ -854,6 +860,18 @@ final class CameraModel: NSObject, ObservableObject {
             // written by a build that already had the bug holds the 0 directly,
             // with no legacy key left to recognise it by, so this cannot be a
             // migration keyed off the old field; it just sets the default once.
+            // Alignment = Handheld-Multi-Frame-Super-Resolution-1.4, exactly (Config::
+            // align_match_14). The new default only reaches fresh installs, because a saved
+            // preset beats defaults; switch existing installs over once, leaving the
+            // toggle free to be turned off again afterwards.
+            let align14Key = "TuningParamsAlign14Default"
+            if !UserDefaults.standard.bool(forKey: align14Key) {
+                UserDefaults.standard.set(true, forKey: align14Key)
+                params.align_match_14 = true
+                if let migrated = try? JSONEncoder().encode(params) {
+                    UserDefaults.standard.set(migrated, forKey: "TuningParams")
+                }
+            }
             let codecRepairKey = "TuningParamsCodecRepaired"
             if !UserDefaults.standard.bool(forKey: codecRepairKey) {
                 UserDefaults.standard.set(true, forKey: codecRepairKey)
@@ -2504,6 +2522,8 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
             "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
             "k_detail": NSNumber(value: tuningParams.k_detail),
+            "k_detail_override": NSNumber(value: tuningParams.k_detail_override),
+            "k_detail_override_value": NSNumber(value: tuningParams.k_detail_override_value),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),

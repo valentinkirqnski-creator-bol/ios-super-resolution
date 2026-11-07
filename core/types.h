@@ -742,9 +742,16 @@ struct Config {
     // decimate grey, so roughly +120MB at 12MP. It saves compute, since those
     // gradients are currently rebuilt per frame.
 
-    // Match the alignment stage to Handheld-Multi-Frame-Super-Resolution-1.4
-    // exactly, in the three places the port (a 460-main derivative) diverges
-    // from 1.4:
+    // TRUE (default): the alignment IS Handheld-Multi-Frame-Super-Resolution-1.4
+    // alignment.py, exactly -- align() hands the whole job to align_14 (CPU) /
+    // align_metal_14 (Metal): 1.4's L1/L2 block matching, bilinear upscale_lvl,
+    // ICA at every level with the 1.4 ica_kernel_8/16/32 semantics (clip, border
+    // and reduction order), unpadded moving pyramid, zero initial flow. Verified
+    // against an independent numpy port of 1.4 on burst12 (every stage <= 6e-5 px
+    // from identical inputs). FALSE: the 460-main-derived path below.
+    //
+    // History -- before the dedicated path, this flag only switched the three places
+    // the port (a 460-main derivative) diverges from 1.4:
     //   1. finest-level block-match search radius -> 1 (1.4 ships [1,4,4,4];
     //      the port defaults the finest to 3). See search_radius_for_level().
     //   2. inter-level flow upscaling -> a plain bilinear resize of the flow
@@ -759,7 +766,7 @@ struct Config {
     // regression is one flag flip away from being ruled out. Bit-identity with
     // 1.4 is still not reachable (different FFT + GPU/CPU float order upstream);
     // this makes the ALGORITHM identical, which is what the flow diff was.
-    bool align_match_14 = false;
+    bool align_match_14 = true;
 
     // How a coarse level's flow seeds the next finer one.
     //
@@ -2046,6 +2053,12 @@ struct Config {
     SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
+    // User override of the merge kernel's base scale k_detail (Alg. 5: k1, k2 =
+    // k_detail * (...)). When on, k_detail = k_detail_override_value, applied AFTER
+    // the SNR auto-tune (tune_config_snr) so it wins either way. Smaller = narrower
+    // kernels (sharper, noisier); larger = wider (smoother). Off by default.
+    bool  k_detail_override = false;
+    float k_detail_override_value = 0.25f;
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]

@@ -45,6 +45,7 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     if (!cfg.snr_auto_tune || ref_raw.data.empty()) {
         if (manual_tile_size > 0)
             set_alignment_tile_sizes(cfg, manual_tile_size);
+        if (cfg.k_detail_override) cfg.k_detail = cfg.k_detail_override_value;   // user override
         return;
     }
 
@@ -58,7 +59,8 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     snr = clampf(snr, 6.f, 30.f);
 
     // params.update_snr_config
-    cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
+    cfg.k_detail = cfg.k_detail_override ? cfg.k_detail_override_value     // user override wins
+                                         : lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
     cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
     cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);

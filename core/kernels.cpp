@@ -21,14 +21,30 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     if (gpu.h > 0 && gpu.w > 0) return gpu;
     return CovField();
 #else
-    // Generalized Anscombe VST — matches utils_image.GAT / cuda_GAT.
-    auto apply_gat = [](const Image& img, f32 alpha, f32 beta) {
+    // 1.4 kernels.py estimate_kernels: preprocessing "gat" is applied to the RAW MOSAIC,
+    // per CFA site with that site's colour alpha/beta (utils_image.cuda_GAT), and only
+    // THEN decimated to grey -- the GAT is a square root, so the order changes the
+    // gradients. VST = alpha*v + 3/8*alpha^2 + beta (1.4's evaluation order), clamped at
+    // 0, out = 2/alpha * sqrt(VST). alpha/beta per colour = the DNG profile scaled to
+    // the raw's white balance (Config::noise_wb_gain), float32.
+    auto apply_gat_raw = [](const Image& img, const Config& cfg) {
         Image out(img.h, img.w, 1);
-        f32 c = 0.375f * alpha * alpha + beta; // 3/8 * alpha^2 + beta
-        for (size_t i = 0; i < img.data.size(); ++i) {
-            f32 v = alpha * img.data[i] + c;
-            out.data[i] = (2.f / alpha) * std::sqrt(std::max(0.f, v));
+        f32 ac[3], bc[3];
+        for (int c = 0; c < 3; ++c) {
+            const f32 g = cfg.noise_wb_gain(c);
+            ac[c] = cfg.alpha_dng[c] * g;
+            bc[c] = cfg.beta_dng[c] * g * g;
         }
+        const f32 a1 = cfg.noise_alpha(), b1 = cfg.noise_beta();   // grey (non-Bayer) input
+        parallel_rows(img.h, cfg.num_threads, [&](int y) {
+            for (int x = 0; x < img.w; ++x) {
+                const int c = cfg.cfa.p[y & 1][x & 1];
+                const f32 alpha = cfg.bayer_mode ? ac[c] : a1;
+                const f32 beta  = cfg.bayer_mode ? bc[c] : b1;
+                const f32 vst = std::max(0.f, alpha * img.at(y, x) + 0.375f * alpha * alpha + beta);
+                out.at(y, x) = 2.f / alpha * std::sqrt(vst);
+            }
+        });
         return out;
     };
     // Matches 460-main kernels.py compute_k.
@@ -58,15 +74,20 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };
 
-    Image grey = compute_grey_decimate(raw, cfg.bayer_mode);
-    Image vst = apply_gat(grey, cfg.noise_alpha(), cfg.noise_beta());
+    Image vst = compute_grey_decimate(apply_gat_raw(raw, cfg), cfg.bayer_mode);  // GAT, then decimate
     Image grad = compute_gradients(vst); // [gh-1, gw-1, 2]
+    const bool is_iso = (cfg.kernel == KernelShape::Iso);
 
     int H = vst.h, W = vst.w;
     CovField covs(H, W);
 
     parallel_rows(H, cfg.num_threads, [&](int y) {
         for (int x = 0; x < W; ++x) {
+            if (is_iso) {   // cuda_estimate_kernel: iso -> diag(k_detail), done
+                f32* c = covs.at(y, x);
+                c[0] = cfg.k_detail; c[1] = 0.f; c[2] = 0.f; c[3] = cfg.k_detail;
+                continue;
+            }
             // Structure tensor over 2x2 gradient neighborhood (cuda_estimate_kernel)
             f32 s00 = 0, s01 = 0, s11 = 0;
             for (int i = 0; i < 2; ++i) {
@@ -82,7 +103,6 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
             f32 l[2], e1[2], e2[2];
             eigen_elmts_2x2(s00, s01, s01, s11, l, e1, e2);
 
-            // Python always runs compute_k (iso only affects merge, not estimate)
             f32 k1, k2;
             compute_k(l[0], l[1], k1, k2, cfg);
 

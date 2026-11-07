@@ -212,7 +212,7 @@ static MetalCtx& ctx() {
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref", "merge_band_fused",
-            "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
+            "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
@@ -1512,9 +1512,13 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         // host CovField expects; the resident path asks for 3 (yx was a
         // duplicate of xy that nothing read).
         uint32_t cov_stride = 4;
-        uint32_t _pad1 = 0;
+        uint32_t cfa_codes = 0;
+        float alpha_c0 = 0.f, alpha_c1 = 0.f, alpha_c2 = 0.f;
+        float beta_c0 = 0.f, beta_c1 = 0.f, beta_c2 = 0.f;
+        uint32_t iso = 0;
+        uint32_t _pad2 = 0;
     };
-    static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
+    static_assert(sizeof(KernelEstParamsCPU) == 96, "KernelEstParamsCPU layout");
 
     const bool bayer = cfg.bayer_mode;
     const int grey_h = bayer ? raw.h / 2 : raw.h;
@@ -1537,6 +1541,20 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.D_tr = cfg.D_tr;
     p.k_stretch = cfg.k_stretch;
     p.k_shrink = cfg.k_shrink;
+    // 1.4 GAT per CFA colour on the raw (see kernel_gat_raw / kernels.cpp apply_gat_raw).
+    {
+        float ac[3], bc[3];
+        for (int ch = 0; ch < 3; ++ch) {
+            const float g = cfg.noise_wb_gain(ch);
+            ac[ch] = cfg.alpha_dng[ch] * g;
+            bc[ch] = cfg.beta_dng[ch] * g * g;
+        }
+        p.alpha_c0 = ac[0]; p.alpha_c1 = ac[1]; p.alpha_c2 = ac[2];
+        p.beta_c0 = bc[0];  p.beta_c1 = bc[1];  p.beta_c2 = bc[2];
+        p.cfa_codes = (uint32_t)cfg.cfa.p[0][0] | ((uint32_t)cfg.cfa.p[0][1] << 8) |
+                      ((uint32_t)cfg.cfa.p[1][0] << 16) | ((uint32_t)cfg.cfa.p[1][1] << 24);
+    }
+    p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
 
     const size_t raw_b = raw.data.size() * sizeof(float);
     const size_t grey_b = (size_t)grey_h * (size_t)grey_w * sizeof(float);
@@ -1561,7 +1579,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
 
     id<MTLBuffer> b_raw = resident_raw ? resident_raw
                                        : c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
-    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
+    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);   // VST of the RAW mosaic
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
     id<MTLBuffer> b_cov = cov_resident
@@ -1582,18 +1600,19 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
-    [enc setBuffer:b_grey offset:0 atIndex:0];
+    // 1.4 order: GAT on the raw mosaic (per CFA colour), THEN decimate to grey.
+    [enc setBuffer:b_vst offset:0 atIndex:0];
     [enc setBuffer:b_raw offset:raw_off_bytes atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
+
+    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
-    [enc setBuffer:b_vst offset:0 atIndex:0];
-    [enc setBuffer:b_grey offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
-
     [enc setBuffer:b_grad offset:0 atIndex:0];
-    [enc setBuffer:b_vst offset:0 atIndex:1];
+    [enc setBuffer:b_grey offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 
@@ -6127,6 +6146,160 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
     @autoreleasepool {
         return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
                                 flow_out, initial_dx, initial_dy, initial_rotation_rad);
+    }
+}
+
+// Handheld-Multi-Frame-Super-Resolution-1.4 alignment on Metal (Config::align_match_14).
+// Twin of align_14 in align.cpp: per level coarse -> fine, bilinear upscale_lvl (reuses
+// align_upscale_flow_bilinear), L1/L2 block matching (align14_bm), Prewitt gradients +
+// Hessian of the ref level (align14_grad / align14_hessian), ICA (align14_ica). Moving
+// pyramid from the UNPADDED moving grey. Returns false (CPU align_14 runs) when a pipeline
+// is missing or a tile size has no 1.4 kernel.
+struct Align14ParamsCPU {
+    uint32_t ny, nx;
+    int32_t ts, R;
+    int32_t ref_h, ref_w, mov_h, mov_w;
+    uint32_t l1, n_iter;
+    uint32_t _pad0 = 0, _pad1 = 0;
+};
+static_assert(sizeof(Align14ParamsCPU) == 48, "Align14ParamsCPU layout");
+
+static bool align_metal_14_impl(const Pyramid& ref_pyr, const Image& moving_grey,
+                                const Config& cfg, int tile_size, FlowField& flow_out) {
+    if (!metal_gpu_init()) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> p_bm = c.pipe("align14_bm");
+    id<MTLComputePipelineState> p_gr = c.pipe("align14_grad");
+    id<MTLComputePipelineState> p_he = c.pipe("align14_hessian");
+    id<MTLComputePipelineState> p_ica = c.pipe("align14_ica");
+    if (!p_bm || !p_gr || !p_he || !p_ica) return false;
+    const int nlev = (int)ref_pyr.levels.size();
+    if (nlev <= 0 || moving_grey.h <= 0 || moving_grey.w <= 0) return false;
+    for (int lvl = 0; lvl < nlev; ++lvl) {
+        const int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                                              ? cfg.bm_tile_sizes[lvl] : tile_size);
+        const std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
+        if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;   // 1.4 ICA kernels
+        if (metric == "L1" && ts == 8) return false;                  // 1.4: not implemented
+        const NSUInteger thr = (ts == 64) ? 1024u : (NSUInteger)(ts * ts);   // kernel_64: 64x16
+        if (thr > p_ica.maxTotalThreadsPerThreadgroup) return false;
+    }
+    (void)align_drain();
+
+    // Moving level 0 = the unpadded moving grey (resident FFT output, or an upload).
+    id<MTLBuffer> mov0 = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h && c.sticky_grey_w == moving_grey.w)
+        mov0 = c.sticky_grey;
+    else if (!moving_grey.data.empty())
+        mov0 = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
+    if (!mov0) return false;
+    struct Lev { id<MTLBuffer> img = nil; int h = 0, w = 0; };
+    std::vector<Lev> mp((size_t)nlev);
+    {
+        id<MTLBuffer> cur = mov0;
+        int ch = moving_grey.h, cw = moving_grey.w;
+        for (int i = 0; i < nlev; ++i) {
+            const int f = (i < (int)cfg.bm_factors.size()) ? cfg.bm_factors[i] : 1;
+            id<MTLBuffer> dst = nil;
+            int dh = 0, dw = 0;
+            if (!gpu_downsample_buf(cur, ch, cw, f, dst, dh, dw) || !dst) return false;
+            mp[(size_t)i] = {dst, dh, dw};
+            cur = dst; ch = dh; cw = dw;
+        }
+    }
+
+    id<MTLBuffer> b_flow = nil;
+    int fny = 0, fnx = 0;
+    for (int lvl = nlev - 1; lvl >= 0; --lvl) {
+        const Image& r = ref_pyr.levels[(size_t)lvl];
+        const Lev& m = mp[(size_t)lvl];
+        const int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                                              ? cfg.bm_tile_sizes[lvl] : tile_size);
+        const int R = cfg.search_radius_for_level(lvl);
+        const int ny = r.h / ts, nx = r.w / ts;
+        if (ny <= 0 || nx <= 0) return false;
+        id<MTLBuffer> b_ref = ref_level_buffer(r);
+        if (!b_ref) return false;
+        if (!b_flow) {
+            std::vector<float> z((size_t)ny * (size_t)nx * 2u, 0.f);
+            b_flow = buf(z.data(), z.size() * sizeof(float));
+        } else {
+            const int up = ((lvl + 1) < (int)cfg.bm_factors.size()) ? cfg.bm_factors[lvl + 1] : 1;
+            const int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                                    ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
+            id<MTLBuffer> b_up = nil;
+            if (!upscale_flow_bilinear_bufs(b_flow, fny, fnx, b_up, ny, nx, up, ts, prev_ts) || !b_up)
+                return false;
+            b_flow = b_up;
+        }
+        fny = ny; fnx = nx;
+        if (!b_flow) return false;
+        const std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
+        Align14ParamsCPU p{};
+        p.ny = (uint32_t)ny; p.nx = (uint32_t)nx; p.ts = ts; p.R = R;
+        p.ref_h = r.h; p.ref_w = r.w; p.mov_h = m.h; p.mov_w = m.w;
+        p.l1 = (metric == "L1") ? 1u : 0u;
+        p.n_iter = (uint32_t)std::max(0, cfg.ica_n_iter);
+        id<MTLBuffer> b_gx = buf(nullptr, (size_t)r.h * (size_t)r.w * sizeof(float));
+        id<MTLBuffer> b_gy = buf(nullptr, (size_t)r.h * (size_t)r.w * sizeof(float));
+        id<MTLBuffer> b_h = buf(nullptr, (size_t)ny * (size_t)nx * 4u * sizeof(float));
+        if (!b_gx || !b_gy || !b_h) return false;
+
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        if (!cmd) return false;
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        // block matching (one thread per tile)
+        [enc setBuffer:b_ref offset:0 atIndex:0];
+        [enc setBuffer:m.img offset:0 atIndex:1];
+        [enc setBuffer:b_flow offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch1(enc, p_bm, (NSUInteger)ny * (NSUInteger)nx);
+        // init_ica: gradients + Hessian of this ref level
+        [enc setBuffer:b_ref offset:0 atIndex:0];
+        [enc setBuffer:b_gx offset:0 atIndex:1];
+        [enc setBuffer:b_gy offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch2(enc, p_gr, (NSUInteger)r.w, (NSUInteger)r.h);
+        [enc setBuffer:b_gx offset:0 atIndex:0];
+        [enc setBuffer:b_gy offset:0 atIndex:1];
+        [enc setBuffer:b_h offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch1(enc, p_he, (NSUInteger)ny * (NSUInteger)nx);
+        // ICA (one threadgroup of ts*ts threads per tile)
+        if (p.n_iter > 0u) {
+            [enc setComputePipelineState:p_ica];
+            [enc setBuffer:b_ref offset:0 atIndex:0];
+            [enc setBuffer:b_gx offset:0 atIndex:1];
+            [enc setBuffer:b_gy offset:0 atIndex:2];
+            [enc setBuffer:b_h offset:0 atIndex:3];
+            [enc setBuffer:m.img offset:0 atIndex:4];
+            [enc setBuffer:b_flow offset:0 atIndex:5];
+            [enc setBytes:&p length:sizeof(p) atIndex:6];
+            // threads: ts*ts (kernel 8/16/32) or 64x16 (kernel 64). Reduction scratch: one
+            // float per thread for the 8/16 trees, one per warp (32) for 32/64.
+            const NSUInteger n = (ts == 64) ? 1024u : (NSUInteger)(ts * ts);
+            const NSUInteger red = (ts >= 32) ? 32u : n;
+            const NSUInteger sh = ((red * sizeof(float)) + 15u) & ~(NSUInteger)15u;
+            [enc setThreadgroupMemoryLength:sh atIndex:0];
+            [enc setThreadgroupMemoryLength:sh atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(n, 1, 1)];
+        }
+        [enc endEncoding];
+        prof_tag_gpu(cmd, "align14:level");
+        align_commit(cmd);
+    }
+    if (!align_drain()) return false;
+    flow_out = FlowField(fny, fnx);
+    memcpy(flow_out.flow.data(), [b_flow contents], flow_out.flow.size() * sizeof(float));
+    return true;
+}
+
+bool align_metal_14(const Pyramid& ref_pyr, const Image& moving_grey, const Config& cfg,
+                    int tile_size, FlowField& flow_out) {
+    @autoreleasepool {
+        return align_metal_14_impl(ref_pyr, moving_grey, cfg, tile_size, flow_out);
     }
 }
 

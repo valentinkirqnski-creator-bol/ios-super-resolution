@@ -1144,6 +1144,14 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Steerable Kernels")) {
+                    Toggle("Override k_detail", isOn: $cam.tuningParams.k_detail_override)
+                    if cam.tuningParams.k_detail_override {
+                        ispRow("k_detail", $cam.tuningParams.k_detail_override_value, 0.05...1.0, "%.3f")
+                    }
+                    Text("""
+                         k_detail is the base size of the merge kernels (Alg. 5: k1, k2 = k_detail × …). Smaller = narrower kernels: sharper, but noisier and more prone to holes; larger = wider kernels: smoother, softer. OFF (default): k_detail comes from the SNR auto-tune (1.4 ramps 0.33 → 0.25 with SNR) or the stored preset value. ON: the slider value is used for every shot, overriding the auto-tune.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     ispRow("k_stretch", $cam.tuningParams.k_stretch, 1.0...8.0, "%.1f")
                     ispRow("k_shrink", $cam.tuningParams.k_shrink, 0.25...4.0, "%.2f")
                     Text("Shape of the merge kernels along/across edges. 460-main: k_stretch 4, k_shrink 2. Higher stretch elongates kernels along edges; higher shrink narrows them across edges (sharper, noisier).")
@@ -1214,6 +1222,11 @@ struct CameraView: View {
                     Toggle("Half-Res Decimate + Per-Pixel Flow", isOn: $cam.tuningParams.decimate_dense_align_enabled)
                     Text("""
                          Runs alignment on the half-resolution Bayer-decimate grey (block matching + tile ICA) and then refines the plain block-match tile vectors — no affine model — to one vector per grey pixel with 3 Lucas-Kanade iterations (windowed, noise-aware conditioning, each pixel bounded to its seed and kept only where it beats the seed). The per-pixel field is stored at half resolution and sampled back to full res by the merge and the mask. This is an alternative to the default full-resolution FFT aligner: it is cheaper (half-res), but because it starts from a lower-resolution base the per-pixel refinement has to recover the precision decimation gave up — so compare it against the default on your own bursts rather than assuming it's sharper. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Match 1.4 Alignment (exact)", isOn: $cam.tuningParams.align_match_14)
+                    Text("""
+                         ON (default): the alignment is exactly Handheld-Multi-Frame-Super-Resolution-1.4's alignment.py — Gaussian pyramid of the circular-padded reference and the unpadded frame, L2 block matching on the coarse levels (fraction kept) and L1 on the finest (round + shift), a bilinear flow upscale between levels, and Lucas-Kanade (ICA) refinement on EVERY level with 1.4's 8/16/32-pixel kernels (step clipped to the search radius). The other alignment options below (pre-alignment, affine, dense, half-tile, sub-pixel BM, ambiguity fallback) are bypassed while this is on. OFF: the 460-main-derived aligner.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)

@@ -142,6 +142,10 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
                  f32 initial_dx = 0.f, f32 initial_dy = 0.f,
                  f32 initial_rotation_rad = 0.f);
+// Config::align_match_14: Handheld-Multi-Frame-Super-Resolution-1.4 alignment.py on
+// Metal (twin of align_14 in align.cpp). false -> caller runs the CPU align_14.
+bool align_metal_14(const Pyramid& ref_pyr, const Image& moving_grey, const Config& cfg,
+                    int tile_size, FlowField& flow_out);
 
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
