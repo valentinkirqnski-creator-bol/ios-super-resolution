@@ -267,6 +267,13 @@ static bool g_jpeg_match_14 = false;
 // reason as g_isp: the export entry points are handed a path and nothing else.
 static hhsr::FinishHdrParams g_hdr;
 
+// HDR+ mode tone-map knobs (core/hdrplus finish). Distinct from g_hdr, which is
+// the normal pipeline's finish_hdr. Defaults match the HDR+ CLI, but the app
+// overrides them from the "HDR Look" settings with lower values suited to a
+// normally-exposed burst (HDR+'s defaults assume an under-exposed one).
+static float g_hdrplus_gain = 1.1f;
+static float g_hdrplus_compression = 3.8f;
+
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
 // receive a path, not a Config -- this session cache is how the JPEG gets the
@@ -525,6 +532,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         g_hdr.display_black_percentile =
             std::min(0.05f, std::max(0.f, tuning[@"hdr_black_percentile"].floatValue));
     if (tuning[@"hdr_exposure_ev"])       g_hdr.exposure_ev       = tuning[@"hdr_exposure_ev"].floatValue;
+    if (tuning[@"hdrplus_gain"])          g_hdrplus_gain          = tuning[@"hdrplus_gain"].floatValue;
+    if (tuning[@"hdrplus_compression"])   g_hdrplus_compression   = tuning[@"hdrplus_compression"].floatValue;
     if (tuning[@"hdr_chroma_denoise"])    g_hdr.chroma_denoise    = tuning[@"hdr_chroma_denoise"].floatValue;
     if (tuning[@"isp_local_strength"]) cfg.isp.local_strength = tuning[@"isp_local_strength"].floatValue;
     if (tuning[@"isp_highlight"])      cfg.isp.highlight_rolloff = tuning[@"isp_highlight"].floatValue;
@@ -1112,7 +1121,13 @@ static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *fr
     p.wb_b = (std::isfinite(wb_b) && wb_b > 0.f) ? wb_b : 1.f;
     p.cfa_pattern = MapCfaToHdrPlus(cfg.cfa);
     BuildHdrCcm(cfg, p.wb_r, p.wb_b, p.ccm);
-    // p.compression / p.gain keep HDR+ defaults (3.8 / 1.1).
+    // Tone-map gain / compression from the "HDR Look" settings. HDR+'s CLI
+    // defaults (1.1 / 3.8) assume an under-exposed burst and render a normally
+    // exposed one too bright, so the app ships lower values; guard the ranges.
+    if (std::isfinite(g_hdrplus_gain) && g_hdrplus_gain > 0.f)
+        p.gain = std::min(4.f, g_hdrplus_gain);
+    if (std::isfinite(g_hdrplus_compression) && g_hdrplus_compression >= 1.f)
+        p.compression = std::min(6.f, g_hdrplus_compression);
 
     std::vector<uint16_t> merged;
     std::vector<uint8_t> finished;

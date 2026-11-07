@@ -1202,6 +1202,23 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("HDR Look")) {
+                    ispRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...1.4, "%.2f")
+                    ispRow("Tone Compression", $cam.tuningParams.hdrplus_compression, 1.0...4.0, "%.1f")
+                    Button("Reset HDR Look") {
+                        cam.tuningParams.hdrplus_gain = TuningParams.appDefaults.hdrplus_gain
+                        cam.tuningParams.hdrplus_compression = TuningParams.appDefaults.hdrplus_compression
+                    }
+                    Text("""
+                         Applies only in HDR mode. Brightness is the overall exposure of the \
+                         tone-mapped JPG \u{2014} lower it if HDR shots look too bright. Tone \
+                         Compression sets how hard highlights and shadows are pulled together: \
+                         lower is more natural, higher is a stronger HDR look. The DNG, which \
+                         stays raw, is unaffected.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

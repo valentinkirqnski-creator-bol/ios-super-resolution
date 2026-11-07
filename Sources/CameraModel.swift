@@ -270,6 +270,16 @@ struct TuningParams: Equatable, Codable {
     // highlight.
     var hdr_vibrance: Float = 0.50
 
+    // HDR+ mode tone map (core/hdrplus finish). Separate from the hdr_* params
+    // above, which drive the NORMAL pipeline's finish_hdr; these reach only the
+    // HDR+ JPG. HDR+'s own CLI defaults (gain 1.1 / compression 3.8) are tuned
+    // for deliberately UNDER-exposed bursts; this app captures at normal
+    // exposure, so those defaults render too bright. Lowered here so the HDR JPG
+    // is correctly exposed out of the box; the C++ Params still default to the
+    // true HDR+ values so the ported twin stays faithful.
+    var hdrplus_gain: Float = 0.85
+    var hdrplus_compression: Float = 3.0
+
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -325,6 +335,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
+        case hdrplus_gain, hdrplus_compression
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -422,6 +433,8 @@ struct TuningParams: Equatable, Codable {
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
         hdr_vibrance = try c.decodeIfPresent(Float.self, forKey: .hdr_vibrance) ?? hdr_vibrance
+        hdrplus_gain = try c.decodeIfPresent(Float.self, forKey: .hdrplus_gain) ?? hdrplus_gain
+        hdrplus_compression = try c.decodeIfPresent(Float.self, forKey: .hdrplus_compression) ?? hdrplus_compression
     }
 }
 
@@ -2254,6 +2267,8 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),
             "hdr_vibrance": NSNumber(value: tuningParams.hdr_vibrance),
+            "hdrplus_gain": NSNumber(value: tuningParams.hdrplus_gain),
+            "hdrplus_compression": NSNumber(value: tuningParams.hdrplus_compression),
             "hdr_mode": NSNumber(value: hdrMode),
         ]
 
