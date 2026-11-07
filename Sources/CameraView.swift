@@ -1204,18 +1204,31 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("HDR Look")) {
-                    ispRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...1.4, "%.2f")
+                    HStack {
+                        Text("Underexposure")
+                        Spacer()
+                        Text(cam.hdrUnderexposureEV <= 0.001
+                             ? "Off"
+                             : String(format: "-%.1f EV", cam.hdrUnderexposureEV))
+                            .foregroundColor(.secondary)
+                    }
+                    Slider(value: $cam.hdrUnderexposureEV, in: 0...2, step: 0.5)
+                    ispRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...2.2, "%.2f")
                     ispRow("Tone Compression", $cam.tuningParams.hdrplus_compression, 1.0...4.0, "%.1f")
                     Button("Reset HDR Look") {
+                        cam.hdrUnderexposureEV = 1.0
                         cam.tuningParams.hdrplus_gain = TuningParams.appDefaults.hdrplus_gain
                         cam.tuningParams.hdrplus_compression = TuningParams.appDefaults.hdrplus_compression
                     }
                     Text("""
-                         Applies only in HDR mode. Brightness is the overall exposure of the \
-                         tone-mapped JPG \u{2014} lower it if HDR shots look too bright. Tone \
-                         Compression sets how hard highlights and shadows are pulled together: \
-                         lower is more natural, higher is a stronger HDR look. The DNG, which \
-                         stays raw, is unaffected.
+                         Applies only in HDR mode. Underexposure shortens the burst exposure \
+                         (ISO held) so highlights are protected and the DNG keeps more latitude; \
+                         the HDR+ tone map lifts it back on the merged, denoised frames \u{2014} \
+                         exactly what HDR+ is built for. Brightness and Tone Compression are that \
+                         lift: raise Brightness if shots come out dark, lower it if too bright; \
+                         Tone Compression sets how hard highlights and shadows are pulled together \
+                         (higher = stronger HDR look). More underexposure protects highlights but \
+                         needs more Brightness and adds noise for the merge to clean up.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }

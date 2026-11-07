@@ -272,13 +272,15 @@ struct TuningParams: Equatable, Codable {
 
     // HDR+ mode tone map (core/hdrplus finish). Separate from the hdr_* params
     // above, which drive the NORMAL pipeline's finish_hdr; these reach only the
-    // HDR+ JPG. HDR+'s own CLI defaults (gain 1.1 / compression 3.8) are tuned
-    // for deliberately UNDER-exposed bursts; this app captures at normal
-    // exposure, so those defaults render too bright. Lowered here so the HDR JPG
-    // is correctly exposed out of the box; the C++ Params still default to the
-    // true HDR+ values so the ported twin stays faithful.
-    var hdrplus_gain: Float = 0.85
-    var hdrplus_compression: Float = 3.0
+    // HDR+ JPG. These are HDR+'s own CLI defaults (gain 1.1 / compression 3.8),
+    // which are tuned for a deliberately UNDER-exposed burst. HDR mode now
+    // underexposes the capture (CameraModel.hdrUnderexposureEV drives the burst
+    // shutter speed-up), so the native gains lift it back to a correct exposure
+    // while keeping the highlight headroom -- rather than dimming a normally
+    // exposed shot, which is what lowering the gains did. Adjustable via the
+    // "HDR Look" settings; the C++ Params default to the same values.
+    var hdrplus_gain: Float = 1.1
+    var hdrplus_compression: Float = 3.8
 
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -510,6 +512,27 @@ final class CameraModel: NSObject, ObservableObject {
     /// JPG = HDR+ tone-mapped render. Persisted; default off.
     @Published var hdrMode: Bool = UserDefaults.standard.bool(forKey: "HDRMode") {
         didSet { UserDefaults.standard.set(hdrMode, forKey: "HDRMode") }
+    }
+    /// Deliberate underexposure (in stops) applied to the burst ONLY in HDR
+    /// mode. The capture shutter is shortened by 2^EV with ISO held, so every
+    /// frame -- and the merged DNG -- lands darker, protecting highlights; the
+    /// HDR+ tone map then lifts it back on merged (denoised) data. This is how
+    /// HDR+ is meant to work and why its gain/compression defaults assume an
+    /// under-exposed input. 0 = shoot what metering chose. Persisted; default
+    /// 1 stop. Bounded [0,2] when applied. See burstShutterSpeedUp / lockForBurst.
+    @Published var hdrUnderexposureEV: Double = {
+        UserDefaults.standard.object(forKey: "HDRUnderexposureEV") == nil
+            ? 1.0 : UserDefaults.standard.double(forKey: "HDRUnderexposureEV")
+    }() {
+        didSet { UserDefaults.standard.set(hdrUnderexposureEV, forKey: "HDRUnderexposureEV") }
+    }
+    /// Burst shutter speed-up actually used: the HDR-mode underexposure when HDR
+    /// is on, else the global constant (1.0 = off). A factor > 1 shortens the
+    /// exposure; lockForBurst skips the custom-exposure branch at exactly 1.0.
+    var effectiveBurstSpeedUp: Double {
+        guard hdrMode else { return Self.burstShutterSpeedUp }
+        let ev = min(2.0, max(0.0, hdrUnderexposureEV))
+        return pow(2.0, ev)
     }
 
     @Published var zslBufferReady = 0
@@ -1940,7 +1963,7 @@ final class CameraModel: NSObject, ObservableObject {
         // Only when metering chose the exposure. A manual shutter is the user's own
         // number and applyShutterOnSessionQueue has already put the device in custom
         // mode with it; overriding that here would fight them.
-        let speedUp = Self.burstShutterSpeedUp
+        let speedUp = effectiveBurstSpeedUp
         guard shutterIsAuto, speedUp > 1.0, d.isExposureModeSupported(.custom) else {
             if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
             d.unlockForConfiguration()
