@@ -22,55 +22,31 @@ struct GalleryView: View {
     }
     @State private var selected: Pick?
 
-    private let columns = [GridItem(.adaptive(minimum: 104), spacing: 3)]
+    private let columns = [GridItem(.adaptive(minimum: 112), spacing: 8)]
     private let manager = PHImageManager.default()
 
     var body: some View {
         NavigationView {
             Group {
                 if denied {
-                    VStack(spacing: 12) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.system(size: 40, weight: .light))
-                            .foregroundColor(.secondary)
-                        Text("Photo library access is off")
-                            .font(.headline)
-                        Text("Enable it in Settings to browse your captures here.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 40)
-                    }
+                    emptyState(icon: "lock.fill",
+                               title: "Photo Access Is Off",
+                               message: "Enable photo library access in Settings to browse your captures here.")
                 } else if assets.isEmpty {
-                    Text("No captures yet")
-                        .foregroundColor(.secondary)
+                    emptyState(icon: "photo.on.rectangle.angled",
+                               title: "No Captures Yet",
+                               message: "Photos you take with the app will appear here.")
                 } else {
-                    ScrollView {
-                        LazyVGrid(columns: columns, spacing: 3) {
-                            ForEach(assets, id: \.localIdentifier) { asset in
-                                Button { selected = Pick(asset: asset) } label: {
-                                    ZStack {
-                                        Color.secondary.opacity(0.15)
-                                        if let img = thumbs[asset.localIdentifier] {
-                                            Image(uiImage: img).resizable().scaledToFill()
-                                        }
-                                    }
-                                    .frame(height: 104)
-                                    .clipped()
-                                }
-                                .buttonStyle(.plain)
-                                .onAppear { loadThumb(asset) }
-                            }
-                        }
-                        .padding(3)
-                    }
+                    grid
                 }
             }
             .navigationTitle("Gallery")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { presentationMode.wrappedValue.dismiss() }
+                    Button { presentationMode.wrappedValue.dismiss() } label: {
+                        Text("Done").fontWeight(.semibold)
+                    }
                 }
             }
         }
@@ -81,6 +57,57 @@ struct GalleryView: View {
             })
         }
         .onAppear(perform: load)
+    }
+
+    private var grid: some View {
+        ScrollView {
+            HStack {
+                Text("\(assets.count) \(assets.count == 1 ? "capture" : "captures")")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 2)
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(assets, id: \.localIdentifier) { asset in
+                    Button { selected = Pick(asset: asset) } label: {
+                        GalleryCell(image: thumbs[asset.localIdentifier],
+                                    megapixels: megapixels(asset))
+                    }
+                    .buttonStyle(PressableCard())
+                    .onAppear { loadThumb(asset) }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func emptyState(icon: String, title: String, message: String) -> some View {
+        VStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(Color.secondary.opacity(0.12))
+                    .frame(width: 84, height: 84)
+                Image(systemName: icon)
+                    .font(.system(size: 34, weight: .regular))
+                    .foregroundColor(.secondary)
+            }
+            Text(title)
+                .font(.title3.weight(.semibold))
+            Text(message)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 48)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func megapixels(_ asset: PHAsset) -> Double {
+        Double(asset.pixelWidth) * Double(asset.pixelHeight) / 1_000_000.0
     }
 
     private func load() {
@@ -105,11 +132,69 @@ struct GalleryView: View {
         opts.deliveryMode = .opportunistic
         opts.isNetworkAccessAllowed = true
         manager.requestImage(for: asset,
-                             targetSize: CGSize(width: 312, height: 312),
+                             targetSize: CGSize(width: 320, height: 320),
                              contentMode: .aspectFill,
                              options: opts) { img, _ in
-            if let img { thumbs[asset.localIdentifier] = img }
+            if let img {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    thumbs[asset.localIdentifier] = img
+                }
+            }
         }
+    }
+}
+
+/// One square thumbnail: rounded, with a gradient placeholder while loading and
+/// a subtle megapixel badge that flags high-resolution super-res results.
+private struct GalleryCell: View {
+    let image: UIImage?
+    let megapixels: Double
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color.secondary.opacity(0.18),
+                                    Color.secondary.opacity(0.08)],
+                           startPoint: .top, endPoint: .bottom)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundColor(.secondary.opacity(0.5))
+            }
+        }
+        .aspectRatio(1, contentMode: .fill)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(alignment: .bottomTrailing) {
+            if megapixels >= 20 {
+                Text("\(Int(megapixels.rounded())) MP")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .environment(\.colorScheme, .dark)
+                    .padding(6)
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+/// Press feedback for grid cells: a gentle scale-and-dim.
+private struct PressableCard: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
     }
 }
 
@@ -123,6 +208,8 @@ private struct GalleryDetail: View {
     @Environment(\.presentationMode) private var presentationMode
     @State private var image: UIImage?
     @State private var zoom: CGFloat = 1
+    /// Zoom level when the current pinch began, so gestures accumulate.
+    @State private var baseZoom: CGFloat = 1
     @State private var shareURL: URL?
     @State private var showShare = false
     @State private var showInfo = false
@@ -130,18 +217,36 @@ private struct GalleryDetail: View {
 
     var body: some View {
         NavigationView {
-            Group {
+            ZStack {
+                Color.black.ignoresSafeArea()
                 if let image {
-                    ScrollView([.horizontal, .vertical]) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .scaleEffect(zoom)
-                            .gesture(MagnificationGesture()
-                                .onChanged { zoom = max(1, min(8, $0)) })
+                    GeometryReader { geo in
+                        ScrollView([.horizontal, .vertical]) {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                // Fit the image to the view at zoom 1, then grow
+                                // the frame so the ScrollView provides panning once
+                                // zoomed. Without an explicit frame the image lays
+                                // out at its native pixel size (huge for a
+                                // super-res capture) and opens zoomed-in.
+                                .frame(width: geo.size.width * zoom,
+                                       height: geo.size.height * zoom)
+                        }
+                        .gesture(MagnificationGesture()
+                            .onChanged { zoom = max(1, min(8, baseZoom * $0)) }
+                            .onEnded { _ in baseZoom = zoom })
+                        // Double-tap toggles between fit and a 2.5x inspect view.
+                        .onTapGesture(count: 2) {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                zoom = zoom > 1 ? 1 : 2.5
+                                baseZoom = zoom
+                            }
+                        }
                     }
                 } else {
                     ProgressView()
+                        .tint(.white)
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -156,15 +261,21 @@ private struct GalleryDetail: View {
                     Button { showInfo = true } label: { Image(systemName: "info.circle") }
                     Button { shareAsset() } label: { Image(systemName: "square.and.arrow.up") }
                         .disabled(busy)
-                    Button("Done") { presentationMode.wrappedValue.dismiss() }
+                    Button { presentationMode.wrappedValue.dismiss() } label: {
+                        Text("Done").fontWeight(.semibold)
+                    }
                 }
             }
+            .immersivePhotoBar()
         }
         .onAppear(perform: loadImage)
         .sheet(isPresented: $showShare) {
             if let shareURL { ShareSheet(items: [shareURL]) }
         }
-        .sheet(isPresented: $showInfo) { GalleryInfo(asset: asset) }
+        .sheet(isPresented: $showInfo) {
+            GalleryInfo(asset: asset)
+                .mediumLargeDetents()
+        }
     }
 
     private func loadImage() {
@@ -220,6 +331,28 @@ private struct GalleryDetail: View {
     }
 }
 
+/// iOS 16-only cosmetic modifiers, no-ops on iOS 15 (the deployment target).
+private extension View {
+    /// Transparent nav bar with light controls, for the black photo viewer.
+    @ViewBuilder func immersivePhotoBar() -> some View {
+        if #available(iOS 16.0, *) {
+            self.toolbarBackground(.hidden, for: .navigationBar)
+                .toolbarColorScheme(.dark, for: .navigationBar)
+                .tint(.white)
+        } else {
+            self
+        }
+    }
+    /// Resizable info sheet; full-height by default on iOS 15.
+    @ViewBuilder func mediumLargeDetents() -> some View {
+        if #available(iOS 16.0, *) {
+            self.presentationDetents([.medium, .large])
+        } else {
+            self
+        }
+    }
+}
+
 /// System share sheet (UIActivityViewController) for a file URL.
 private struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
@@ -240,33 +373,56 @@ private struct GalleryInfo: View {
     @State private var model: String?
     @State private var lens: String?
 
+    private var megapixels: Double {
+        Double(asset.pixelWidth) * Double(asset.pixelHeight) / 1_000_000.0
+    }
+
     var body: some View {
         NavigationView {
             List {
-                infoRow("Dimensions", "\(asset.pixelWidth) × \(asset.pixelHeight)")
-                infoRow("Megapixels", String(format: "%.1f MP",
-                    Double(asset.pixelWidth) * Double(asset.pixelHeight) / 1_000_000.0))
-                if let d = asset.creationDate { infoRow("Captured", dateString(d)) }
-                if let fileSize { infoRow("File size", ByteCountFormatter.string(
-                    fromByteCount: Int64(fileSize), countStyle: .file)) }
-                if let iso { infoRow("ISO", "\(iso)") }
-                if let exposure { infoRow("Shutter", shutterString(exposure)) }
-                if let model { infoRow("Camera", model) }
-                if let lens { infoRow("Lens", lens) }
+                Section("Image") {
+                    infoRow("ruler", "Dimensions", "\(asset.pixelWidth) × \(asset.pixelHeight)")
+                    infoRow("squares.below.rectangle", "Resolution",
+                            String(format: "%.1f MP", megapixels))
+                    if let fileSize {
+                        infoRow("doc", "File Size", ByteCountFormatter.string(
+                            fromByteCount: Int64(fileSize), countStyle: .file))
+                    }
+                    if let d = asset.creationDate {
+                        infoRow("calendar", "Captured", dateString(d))
+                    }
+                }
+                Section("Exposure") {
+                    if let iso { infoRow("camera.aperture", "ISO", "\(iso)") }
+                    if let exposure { infoRow("timer", "Shutter", shutterString(exposure)) }
+                    if let model { infoRow("camera", "Camera", model) }
+                    if let lens { infoRow("camera.metering.center.weighted", "Lens", lens) }
+                }
             }
+            .listStyle(.insetGrouped)
             .navigationTitle("Info")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { presentationMode.wrappedValue.dismiss() }
+                    Button { presentationMode.wrappedValue.dismiss() } label: {
+                        Text("Done").fontWeight(.semibold)
+                    }
                 }
             }
         }
         .onAppear(perform: load)
     }
 
-    private func infoRow(_ k: String, _ v: String) -> some View {
-        HStack { Text(k); Spacer(); Text(v).foregroundColor(.secondary) }
+    private func infoRow(_ icon: String, _ k: String, _ v: String) -> some View {
+        HStack {
+            Label(k, systemImage: icon)
+                .labelStyle(.titleAndIcon)
+                .foregroundColor(.primary)
+            Spacer()
+            Text(v)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
     }
     private func dateString(_ d: Date) -> String {
         let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
