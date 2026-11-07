@@ -22,7 +22,8 @@ struct GalleryView: View {
     }
     @State private var selected: Pick?
 
-    private let columns = [GridItem(.adaptive(minimum: 112), spacing: 8)]
+    /// Apple Photos-style tight 3-up grid, 2pt gutters, edge to edge.
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
     private let manager = PHImageManager.default()
 
     var body: some View {
@@ -61,27 +62,21 @@ struct GalleryView: View {
 
     private var grid: some View {
         ScrollView {
-            HStack {
-                Text("\(assets.count) \(assets.count == 1 ? "capture" : "captures")")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 2)
-
-            LazyVGrid(columns: columns, spacing: 8) {
+            LazyVGrid(columns: columns, spacing: 2) {
                 ForEach(assets, id: \.localIdentifier) { asset in
                     Button { selected = Pick(asset: asset) } label: {
-                        GalleryCell(image: thumbs[asset.localIdentifier],
-                                    megapixels: megapixels(asset))
+                        GalleryCell(image: thumbs[asset.localIdentifier])
                     }
-                    .buttonStyle(PressableCard())
+                    .buttonStyle(.plain)
                     .onAppear { loadThumb(asset) }
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 12)
+
+            Text("\(assets.count) \(assets.count == 1 ? "Photo" : "Photos")")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
         }
     }
 
@@ -104,10 +99,6 @@ struct GalleryView: View {
                 .padding(.horizontal, 48)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func megapixels(_ asset: PHAsset) -> Double {
-        Double(asset.pixelWidth) * Double(asset.pixelHeight) / 1_000_000.0
     }
 
     private func load() {
@@ -144,57 +135,24 @@ struct GalleryView: View {
     }
 }
 
-/// One square thumbnail: rounded, with a gradient placeholder while loading and
-/// a subtle megapixel badge that flags high-resolution super-res results.
+/// One uniform square thumbnail, Apple Photos-style: a flat neutral placeholder
+/// with the image clipped to a perfect square so the grid stays aligned.
 private struct GalleryCell: View {
     let image: UIImage?
-    let megapixels: Double
 
     var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color.secondary.opacity(0.18),
-                                    Color.secondary.opacity(0.08)],
-                           startPoint: .top, endPoint: .bottom)
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .transition(.opacity)
-            } else {
-                Image(systemName: "photo")
-                    .font(.system(size: 22, weight: .light))
-                    .foregroundColor(.secondary.opacity(0.5))
+        Color(.secondarySystemBackground)
+            .aspectRatio(1, contentMode: .fit)
+            .overlay {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .transition(.opacity)
+                }
             }
-        }
-        .aspectRatio(1, contentMode: .fill)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(alignment: .bottomTrailing) {
-            if megapixels >= 20 {
-                Text("\(Int(megapixels.rounded())) MP")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .environment(\.colorScheme, .dark)
-                    .padding(6)
-            }
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-/// Press feedback for grid cells: a gentle scale-and-dim.
-private struct PressableCard: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.95 : 1)
-            .opacity(configuration.isPressed ? 0.85 : 1)
-            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
+            .clipped()
+            .contentShape(Rectangle())
     }
 }
 
