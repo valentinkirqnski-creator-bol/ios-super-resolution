@@ -1187,12 +1187,24 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Viewfinder")) {
-                    Toggle("Viewfinder Grid", isOn: $cam.gridEnabled)
+                    Toggle(isOn: $cam.gridEnabled) {
+                        settingsRowLabel("Viewfinder Grid") {
+                            Image(systemName: "square.grid.3x3")
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 }
 
                 Section {
-                    NavigationLink(destination: JPGLookView(cam: cam)) { Text("JPG Look") }
-                    NavigationLink(destination: HDRLookView(cam: cam)) { Text("HDR Look") }
+                    NavigationLink(destination: JPGLookView(cam: cam)) {
+                        settingsRowLabel("JPG Look") {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    NavigationLink(destination: HDRLookView(cam: cam)) {
+                        settingsRowLabel("HDR Look") { HDRBadge() }
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -1208,6 +1220,34 @@ struct CameraView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Settings rows
+
+/// A settings row with a fixed-width leading glyph so titles line up, matching
+/// the iconed rows in the Settings design.
+private func settingsRowLabel<Icon: View>(_ title: String,
+                                          @ViewBuilder icon: () -> Icon) -> some View {
+    HStack(spacing: 12) {
+        icon().frame(width: 26, height: 22)
+        Text(title)
+    }
+}
+
+/// Small outlined "HDR" badge used as the HDR Look row's leading glyph.
+private struct HDRBadge: View {
+    var body: some View {
+        Text("HDR")
+            .font(.system(size: 8, weight: .heavy))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 2.5)
+            .padding(.vertical, 1.5)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .stroke(Color.secondary, lineWidth: 1.2)
+            )
+            .fixedSize()
     }
 }
 
