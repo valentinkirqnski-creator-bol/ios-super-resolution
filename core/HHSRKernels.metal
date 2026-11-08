@@ -34,8 +34,8 @@ kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
     float v = (float(rawv) - p.black[site]) / p.denom[site];
     v *= p.wb[site];
     if (!isfinite(v)) v = 0.f;
-    // No upper clip -- see load_raw_dng in raw_io.cpp.
-    out[gid.y * p.w + gid.x] = max(v, 0.f);
+    // 460 load_dng_burst: np.clip(white-balanced raw, 0, 1) -- see raw_io.cpp.
+    out[gid.y * p.w + gid.x] = clamp(v, 0.f, 1.f);
 }
 
 inline float2 cmul(float2 a, float2 b) {
@@ -1125,8 +1125,9 @@ static inline void merge_comp_contrib(device const float* img,
     if (p.rob_bilinear != 0u) {
         local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
     } else {
-        int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
-        int ix = clamp(int(floor(rob_x + 0.5f)), 0, int(p.rob_w) - 1);
+        // merge.py round((pos - 0.5) / 2): CUDA round = half to even (rint)
+        int iy = clamp(int(rint(rob_y)), 0, int(p.rob_h) - 1);
+        int ix = clamp(int(rint(rob_x)), 0, int(p.rob_w) - 1);
         local_r = robustness[uint(iy) * p.rob_w + uint(ix)];
     }
     // Nothing to accumulate where the frame is fully rejected. Every
@@ -1162,8 +1163,8 @@ static inline void merge_comp_contrib(device const float* img,
                        kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
-    int center_j = lround_away(lr_mov_x);
-    int center_i = lround_away(lr_mov_y);
+    int center_j = int(rint(lr_mov_x));   // merge.py round(): half to even
+    int center_i = int(rint(lr_mov_y));
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1360,8 +1361,8 @@ static inline void merge_ref_contrib(device const float* img,
                        kmap_i, kmap_j, ixx, ixy, iyy, false);
     }
 
-    int center_j = int(round(coarse_x));
-    int center_i = int(round(coarse_y));
+    int center_j = int(rint(coarse_x));   // merge.py round(): half to even
+    int center_i = int(rint(coarse_y));
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1641,7 +1642,7 @@ struct RobDogsonParams {
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad0)
-    uint _pad1;
+    uint std_mode;       // 1 = input is a variance: resample sqrt(var), square back (was _pad1)
 };
 
 struct RobMaskParams {
@@ -1742,15 +1743,14 @@ inline float rob_sample_bilinear_or_inf(device const float* img,
 
 // 460-parity robustness color-distance sampling: 460 takes the comp local-mean
 // at round(idx+flow) (nearest), with an inbound test on the rounded index; out
-// of bounds -> +inf so R = 0. 460's round() is numba-CUDA device round, which
-// rounds halfway away from zero (same as CPU sample_dogson's std::lround note),
-// and Metal round() matches that tie rule. See cuda_compute_patch_dist in
+// of bounds -> +inf so R = 0. 460's round() is numba-CUDA device round =
+// __nv_llrint, round half to EVEN -- Metal rint. See cuda_compute_patch_dist in
 // robustness.py.
 inline float rob_sample_nearest_or_inf(device const float* img,
                                        uint h, uint w, uint nch,
                                        float y, float x, uint ch) {
-    int yi = int(round(y));
-    int xi = int(round(x));
+    int yi = int(rint(y));
+    int xi = int(rint(x));
     if (!(yi >= 0 && yi < int(h) && xi >= 0 && xi < int(w))) return INFINITY;
     return img[(uint(yi) * w + uint(xi)) * nch + ch];
 }
@@ -1932,8 +1932,8 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
         if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
             val = INFINITY;
         } else {
-            int center_y = lround_away(LR_y);
-            int center_x = lround_away(LR_x);
+            int center_y = int(rint(LR_y));   // CUDA round: half to even
+            int center_x = int(rint(LR_x));
             float w_acc = 0.f, buf = 0.f;
             for (int i = -1; i <= 1; ++i) {
                 int y_ = clamp_edge(center_y + i, int(p.in_h) - 1);
@@ -1943,11 +1943,15 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
                     int x_ = clamp_edge(center_x + j, int(p.in_w) - 1);
                     float dx = float(x_) - LR_x;
                     float w = wy * dogson_quadratic(dx);
-                    buf += stats[(uint(y_) * p.in_w + uint(x_)) * p.nch + ch] * w;
+                    float sv = stats[(uint(y_) * p.in_w + uint(x_)) * p.nch + ch];
+                    // IPOL Algorithm 6 line 25: sigma (not the variance) is resampled.
+                    if (p.std_mode != 0u) sv = sqrt(max(sv, 0.f));
+                    buf += sv * w;
                     w_acc += w;
                 }
             }
             val = buf / w_acc;
+            if (p.std_mode != 0u) val = val * val;
         }
         out[(gid.y * p.out_w + gid.x) * p.nch + ch] = val;
     }
@@ -1997,7 +2001,7 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
                 uint o = (uint(y) * p.w + uint(x)) * p.nch + ch;
                 float brightness = ref_means[o];
                 float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
-                int id_noise = lround_away(1000.f * bidx);
+                int id_noise = int(rint(1000.f * bidx));   // CUDA round: half to even
                 if (!isfinite(brightness))
                     id_noise = 0;
                 else if (id_noise < 0)
@@ -2112,7 +2116,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
         float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
-        int id_noise = lround_away(1000.f * bidx);
+        int id_noise = int(rint(1000.f * bidx));   // CUDA round: half to even
         // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
         // Finite brightness in [0,1] -> id in [0,1000] unchanged (same as Python).
         if (!isfinite(brightness))
@@ -2424,11 +2428,16 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // apply_noise_model (robustness.cpp).
     float sigma_sq_ = 0.f;
     float d_sq_ = 0.f;
+    // Out-of-frame Dodgson sample (+inf in comp_means, and in a warped sigma): R = 0,
+    // decided by an explicit compare rather than by inf/NaN arithmetic, which fast
+    // math does not preserve.
+    bool oob = false;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
+        if (!(comp_means[o] < 1e30f) || !(ref_vars[o] < 1e30f)) oob = true;
         float brightness = ref_means[o];
         float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
-        int id_noise = lround_away(1000.f * bidx);
+        int id_noise = int(rint(1000.f * bidx));   // CUDA round: half to even
         if (!isfinite(brightness))
             id_noise = 0;
         else if (id_noise < 0)
@@ -2477,7 +2486,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint gx = min(gid.x / 2u, p.hf_w - 1u);
         hf_reject = ref_hf_loss[gy * p.hf_w + gx] > p.hf_variance_loss_threshold;
     }
-    float r_val = (hf_reject || motion_magnitude_reject_tile)
+    float r_val = (oob || hf_reject || motion_magnitude_reject_tile)
         ? 0.f
         : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
     // An OOB Dodgson sample arrives as +inf in comp_means -> d_sq_ = +inf ->
@@ -2916,7 +2925,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         if (lam > 0.f) { h00 += lam; h11 += lam; }
     }
     float det = h00 * h11 - h01 * h10;
-    if (fabs(det) < 1e-10f) return; // leave flow unchanged; pure divide-by-zero preflight
+    if (fabs(det) < 1e-5f) return; // ICA.py: abs(det) < 1e-5 -> not solvable, keep BM flow
     float det_inv = 1.f / det;
 
     float fx = flow[tid * 2u + 0u];
@@ -2928,9 +2937,9 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // configuration ever selects these sizes.
         if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
-            // 460-parity: trunc toward zero -- see ica_refine_level in align.cpp.
-            float floor_fx = trunc(fx);
-            float floor_fy = trunc(fy);
+            // ICA.py modf of the absolute (>= 0) position = floor -- see align.cpp.
+            float floor_fx = floor(fx);
+            float floor_fy = floor(fy);
             float frac_x = fx - floor_fx;
             float frac_y = fy - floor_fy;
             int floor_off_x = int(floor_fx);
@@ -2997,11 +3006,10 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
-        // 460-parity: trunc toward zero, matching ICA.py (math.modf + int()).
-        // For negative displacements this makes the bilinear sample an
-        // extrapolation; see ica_refine_level in align.cpp.
-        float floor_fx = trunc(fx);
-        float floor_fy = trunc(fy);
+        // ICA.py modf of the absolute (>= 0) position = floor, so the sample
+        // interpolates between the straddling pair; see align.cpp.
+        float floor_fx = floor(fx);
+        float floor_fy = floor(fy);
         float frac_x = fx - floor_fx;
         float frac_y = fy - floor_fy;
         int floor_off_x = int(floor_fx);

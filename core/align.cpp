@@ -770,23 +770,21 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                 if (lam > 0.f) { h00 += lam; h11 += lam; }
             }
             f32 det = h00 * h11 - h01 * h10;
-            if (std::fabs(det) < 1e-10f) continue;
+            // ICA.py: if abs(det) < 1e-5: return  (system not solvable -> keep BM flow)
+            if (std::fabs(det) < 1e-5f) continue;
             f32 det_inv = 1.f / det;
 
             f32 fx = flow.dx(ty, tx);
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // 460-parity: truncation toward zero, not floor. ICA.py uses
-                // math.modf + int(), which truncates toward zero, so a negative
-                // displacement such as -0.25 yields offset 0 and fraction -0.25.
-                // bilinear_ica then evaluates m00 + (m01 - m00) * (-0.25): the
-                // right position, but reached by extrapolating from the pair to
-                // the RIGHT of it rather than interpolating from the straddling
-                // pair. (floor would make +/- displacements symmetric but does
-                // not match 460, so parity requires trunc.)
-                const f32 base_x = std::trunc(fx);
-                const f32 base_y = std::trunc(fy);
+                // ICA.py: math.modf(new_idx) on the ABSOLUTE position new_idx =
+                // flow + pixel index, which the in-bounds test keeps >= 0 -- so
+                // modf's integer part is the floor and the sample is a true
+                // bilinear interpolation between the straddling pair. pixel is an
+                // integer, so floor(pixel + flow) = pixel + floor(flow).
+                const f32 base_x = std::floor(fx);
+                const f32 base_y = std::floor(fy);
                 f32 frac_x = fx - base_x;
                 int floor_off_x = (int)base_x;
                 f32 frac_y = fy - base_y;

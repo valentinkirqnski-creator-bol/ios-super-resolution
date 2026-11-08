@@ -39,8 +39,10 @@ static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
     iyy *= s;
 }
 
+// 460's round() in a Numba CUDA kernel lowers to __nv_llrint: round half to EVEN
+// (numba/cuda/cudaimpl.py ptx_round). std::nearbyint in the default rounding mode.
 static inline int cuda_round_to_int(f32 x) {
-    return (int)std::lround(x);
+    return (int)std::nearbyint(x);
 }
 
 static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32 x) {
@@ -157,10 +159,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             if (cfg.merge_robustness_bilinear) {
                 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
             } else {
+                // merge.py: clamp(round((pos - 0.5) / 2), ...) -- half to even.
                 const int iy = std::min(robustness.h - 1,
-                                        std::max(0, (int)std::floor(rob_y + 0.5f)));
+                                        std::max(0, cuda_round_to_int(rob_y)));
                 const int ix = std::min(robustness.w - 1,
-                                        std::max(0, (int)std::floor(rob_x + 0.5f)));
+                                        std::max(0, cuda_round_to_int(rob_x)));
                 local_r = robustness.at(iy, ix);
             }
 

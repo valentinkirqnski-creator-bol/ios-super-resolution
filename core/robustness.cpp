@@ -593,7 +593,7 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
 // read past the end.
 static inline size_t noise_curve_index(f32 brightness, size_t n) {
     if (!std::isfinite(brightness) || n == 0) return 0;
-    const long id = std::lround(1000.f * brightness);
+    const long id = (long)std::nearbyint(1000.f * brightness);   // CUDA round: half to even
     if (id < 0) return 0;
     return (size_t)std::min<long>(id, (long)n - 1);
 }
@@ -748,7 +748,8 @@ Image compute_guide(const Image& raw, const Config& cfg) {
         const int n = cfg.cfa.count((uint8_t)c);
         inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
     }
-    // 1.4 parity: 1.4 builds the guide from the UN-prewhitened raw. The port's
+    // guide_white_balance (default true) = 460-main: the guide keeps the loader's
+    // white balance. Otherwise (1.4): 1.4 builds the guide from the UN-prewhitened raw. The port's
     // loader prewhitens (site *= white_balance[c]/white_balance[1]) and the
     // rest of the pipeline depends on that, so undo it HERE, in the guide
     // only, to recover sqrt(raw) exactly as 1.4's cuda_compute_guide_image
@@ -962,11 +963,11 @@ static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
 
 // 460-parity robustness color-distance sampling: 460 fetches the comp local-mean
 // at round(idx+flow) (nearest), inbound-tested on the rounded index, else +inf
-// so R = 0. 460's round() is numba-CUDA device round (halfway away from zero),
-// which std::lround matches. See cuda_compute_patch_dist in robustness.py.
+// so R = 0. 460's round() is numba-CUDA device round = __nv_llrint, i.e. round
+// half to EVEN (numba/cuda/cudaimpl.py ptx_round) -- std::nearbyint.
 static f32 sample_nearest_or_inf(const Image& img, f32 y, f32 x, int ch) {
-    const int yi = (int)std::lround(y);
-    const int xi = (int)std::lround(x);
+    const int yi = (int)std::nearbyint(y);
+    const int xi = (int)std::nearbyint(x);
     if (!(yi >= 0 && yi < img.h && xi >= 0 && xi < img.w))
         return std::numeric_limits<f32>::infinity();
     return img.at(yi, xi, ch);
@@ -977,9 +978,9 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
         return std::numeric_limits<f32>::infinity();
 
-    // CUDA round / std::lround: half away from zero
-    int center_y = (int)std::lround(LR_y);
-    int center_x = (int)std::lround(LR_x);
+    // CUDA round = __nv_llrint: half to even
+    int center_y = (int)std::nearbyint(LR_y);
+    int center_x = (int)std::nearbyint(LR_x);
     f32 w_acc = 0.f, buf = 0.f;
     for (int i = -1; i <= 1; ++i) {
         int y_ = (int)clampf((f32)(center_y + i), 0.f, (f32)(stats.h - 1));
@@ -1035,6 +1036,20 @@ static Image upscale_warp_stats(const Image& guide_stats,
         }
     });
     return out;
+}
+
+// IPOL Algorithm 6 line 25: sigma <- DodgsonApproximateQuadratic(sigma, 2, V_n). The
+// statistics carry the 3x3 VARIANCE; the algorithm resamples the standard deviation,
+// so take sqrt, Dodgson-upscale (and warp unless is_ref), and square back. An
+// out-of-frame sample stays +inf (inf^2 = inf), as for the means.
+static Image upscale_warp_sigma_sq(const Image& var_guide, bool is_ref, const FlowField* flow,
+                                   int tile_size, int num_threads) {
+    Image sd(var_guide.h, var_guide.w, var_guide.c);
+    for (size_t i = 0; i < sd.data.size(); ++i)
+        sd.data[i] = std::sqrt(std::max(0.f, var_guide.data[i]));
+    Image up = upscale_warp_stats(sd, is_ref, flow, tile_size, num_threads, false);
+    for (f32& v : up.data) v = v * v;
+    return up;
 }
 
 // nc_ch: one curve pointer per guide channel (ref_means.c of them -- 3 for
@@ -1109,7 +1124,7 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 // sqrt guide (1.4): the curve is keyed by LATENT brightness,
                 // and the guide mean is sqrt(latent), so index by mean^2.
                 f32 bidx = sqrt_index ? brightness * brightness : brightness;
-                int id_noise = (int)std::lround(1000.f * bidx);
+                int id_noise = (int)std::nearbyint(1000.f * bidx);   // CUDA round: half to even
                 // Host: same bins as Python for finite brightness in range; avoid crash on +inf.
                 if (!std::isfinite(bidx))
                     id_noise = 0;
@@ -1159,7 +1174,7 @@ static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
             bright /= (f32)n_ch;
             if (!std::isfinite(bright)) bright = 0.f;
             bright = bright < 0.f ? 0.f : (bright > 1.f ? 1.f : bright);
-            int idx = (int)std::lround((f32)(bins - 1) * bright);
+            int idx = (int)std::nearbyint((f32)(bins - 1) * bright);   // CUDA round: half to even
             if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             // dq stays +inf for an out-of-bounds sample -> exp(-inf)=0 -> R=0.
@@ -1200,7 +1215,7 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                 f32 brightness = ref_means.at(y, x, ch);
                 // sqrt guide (1.4): index by mean^2 -- see apply_noise_model.
                 f32 bidx = sqrt_index ? brightness * brightness : brightness;
-                int id_noise = (int)std::lround(1000.f * bidx);
+                int id_noise = (int)std::nearbyint(1000.f * bidx);   // CUDA round: half to even
                 if (!std::isfinite(bidx))
                     id_noise = 0;
                 else if (id_noise < 0)
@@ -1250,7 +1265,7 @@ static void apply_noise_model_fused_1p4(const Image& ref_means, const Image& com
             bright /= (f32)n_ch;
             if (!std::isfinite(bright)) bright = 0.f;
             bright = bright < 0.f ? 0.f : (bright > 1.f ? 1.f : bright);
-            int idx = (int)std::lround((f32)(bins - 1) * bright);
+            int idx = (int)std::nearbyint((f32)(bins - 1) * bright);   // CUDA round: half to even
             if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             if (std::isfinite(dq) && dq > 0.f) {
@@ -1432,8 +1447,11 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
                                             0, cfg.num_threads, false);
-        st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
-                                           0, cfg.num_threads, false);
+        // Algorithm 6 resamples sigma (sqrt of the variance), not the variance.
+        st.stds_hires = cfg.robustness_ipol_alg6
+            ? upscale_warp_sigma_sq(st.stds, /*is_ref=*/true, nullptr, 0, cfg.num_threads)
+            : upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
+                                 0, cfg.num_threads, false);
     }
     return st;
 #endif
@@ -1490,20 +1508,27 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // never materialised at all (folded into apply_noise_model_fused), so the
     // peak is the upscaled comp_means plus the two scalar outputs rather than
     // the whole chain at once.
-    Image comp_means;
+    // IPOL Algorithm 6 (Config::robustness_ipol_alg6, unless robustness_alg6_sigma_ref):
+    // line 25 also upscales + warps the n-th frame's sigma, which the noise correction
+    // then uses in place of the reference's.
+    const bool moving_sigma = cfg.robustness_ipol_alg6 && !cfg.robustness_alg6_sigma_ref;
+    Image comp_means, comp_sigma_sq;
     {
         Image comp_means_guide;
+        Image comp_vars_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
-            Image comp_vars_guide; // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false);
+        if (moving_sigma)
+            comp_sigma_sq = upscale_warp_sigma_sq(comp_vars_guide, /*is_ref=*/false, &flow,
+                                                  tile_size, cfg.num_threads);
     }
 
     const Image& ref_means = ref_stats.means_hires;
-    const Image& ref_vars = ref_stats.stds_hires;
+    const Image& ref_vars = moving_sigma ? comp_sigma_sq : ref_stats.stds_hires;
     const int h = ref_means.h, w = ref_means.w;
     const int nch = ref_means.c;
     if (comp_means.h != h || comp_means.w != w || comp_means.c != nch)
@@ -1553,10 +1578,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
+    // IPOL Algorithm 6 lines 33-35: r = 5x5 min of the raw-resolution R itself.
+    if (cfg.robustness_ipol_alg6) return local_min_5x5(R);
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
     // there (= the paper's 10x10-raw footprint), nearest-upsample back.
     // See local_min_5x5_on_guide.
     return local_min_5x5_on_guide(R);
+}
+
+Image robustness_local_min_5x5(const Image& R) {
+    return local_min_5x5(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {

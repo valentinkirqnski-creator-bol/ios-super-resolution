@@ -864,7 +864,10 @@ struct Config {
     // the per-channel noise the sigma_ms_sq sum assumes is independent. Run this
     // with the noise model off, or treat r_t as needing its own tuning.
     bool real_rgb_guide = false;
-    bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
+    // true (460-main): the guide is built from the white-balanced, [0,1]-clipped raw,
+    // as 460's init_robustness sees it (utils_dng applies wb[c]/wb[G] then clips).
+    // false = un-prewhiten to camera-native (the 1.4 guide).
+    bool guide_white_balance = true;   // keep WB in the guide (skip un-prewhiten)
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
     int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
 
@@ -947,6 +950,21 @@ struct Config {
     float robustness_fft_guide_noise_energy = 0.25f;
 
     bool robustness_raw_resolution_enabled = false;
+    // IPOL "Implementing Handheld Burst Super-resolution" (2023, art. 460) Algorithm 6,
+    // literally: the local statistics are Dodgson x2 upscaled AND warped by V_n to the
+    // resolution and pose of the LR reference frame (lines 25-26, p. 242), R is
+    // computed per RAW pixel (R <- Zeros(H, W), lines 24-32), and r is the 5x5 minimum
+    // of that raw-resolution R (lines 33-35, Eq. 21). Works with either grey method.
+    //   line 25  sigma <- DodgsonApproximateQuadratic(sigma, 2, V_n): the standard
+    //            deviation itself is resampled (sqrt of the 3x3 variance, upscaled,
+    //            squared back) and, per the text, it is the n-th frame's (G_n), warped
+    //            with its mean; robustness_alg6_sigma_ref instead takes the reference's
+    //            sigma, upscaled without a warp (the 460 / 1.4 / Wronski reading).
+    //   line 26  mu^ <- DodgsonApproximateQuadratic(mu^, 2, V_n): moving-frame mean,
+    //            upscaled + warped; the reference mean mu_p is upscaled (no warp) and
+    //            indexes the noise curves (lines 28-29).
+    bool robustness_ipol_alg6 = true;
+    bool robustness_alg6_sigma_ref = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
@@ -966,7 +984,7 @@ struct Config {
     // with no upscale anywhere. That is strictly more information than the
     // Dodgson route, which only ever bought positions.
     bool robustness_fft_guide_active() const {
-        return bayer_mode && grey_method == GreyMethod::FFT &&
+        return bayer_mode && grey_method == GreyMethod::FFT && !robustness_ipol_alg6 &&
                (robustness_fft_guide || robustness_raw_resolution_enabled);
     }
     // The Dodgson-upscale route specifically. Every consumer of this means "the
@@ -976,6 +994,7 @@ struct Config {
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
+        if (robustness_ipol_alg6 && bayer_mode) return true;   // IPOL Algorithm 6
         return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
                grey_method == GreyMethod::Decimate;
     }

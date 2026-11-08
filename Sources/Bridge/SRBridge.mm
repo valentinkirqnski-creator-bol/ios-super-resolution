@@ -574,6 +574,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
             ? hhsr::SelectionLaw::Linear : hhsr::SelectionLaw::HardThreshold;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
+    if (tuning[@"robustness_ipol_alg6"])
+        cfg.robustness_ipol_alg6 = tuning[@"robustness_ipol_alg6"].boolValue;
+    if (tuning[@"robustness_alg6_sigma_ref"])
+        cfg.robustness_alg6_sigma_ref = tuning[@"robustness_alg6_sigma_ref"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])
@@ -929,8 +933,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 float v = ((float)rawv - site_black[fi][fj]) / site_denom[fi][fj];
                 v *= site_wb[fi][fj];
                 if (!std::isfinite(v)) v = 0.f;
-                // No upper clip -- see load_raw_dng in raw_io.cpp.
-                img.at(y, x) = std::max(v, 0.f);
+                // Clipped to [0, 1] after white balance, as 460 -- see raw_io.cpp.
+                img.at(y, x) = std::min(std::max(v, 0.f), 1.f);   // 460: np.clip(raw, 0, 1)
             }
         });
     }

@@ -1119,6 +1119,14 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_enabled {
+                        Toggle("IPOL Algorithm 6 (raw-res)", isOn: $cam.tuningParams.robustness_ipol_alg6)
+                        Text("ON (default): the local statistics are Dodgson ×2 upscaled and warped to the raw frame, R is computed per raw pixel and the 5×5 minimum runs at raw resolution — IPOL Algorithm 6 as written. OFF: 460-main's guide-resolution mask.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.robustness_ipol_alg6 {
+                            Toggle("σ from Reference", isOn: $cam.tuningParams.robustness_alg6_sigma_ref)
+                            Text("OFF (default): line 25 as written — the moving frame's σ, upscaled and warped with its mean. ON: the reference's σ, upscaled without a warp (the 460/1.4 code's choice).")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
                         ispRow("Threshold t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
                         ispRow("s1 (irregular flow)", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
                         ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")

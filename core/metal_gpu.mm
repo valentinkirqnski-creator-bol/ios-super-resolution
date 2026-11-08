@@ -1582,7 +1582,7 @@ struct RobDogsonParamsCPU {
     // the GPU twin of upscale_warp_stats, so it must match the CPU setting or
     // the two paths warp the comparison statistics differently.
     uint32_t flow_bilinear = 0;
-    uint32_t _pad1 = 0;
+    uint32_t std_mode = 0;   // 1 = resample sqrt(variance), square back (IPOL Alg. 6 line 25)
 };
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
@@ -1826,7 +1826,8 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1) so
+        // guide_white_balance (default true) = 460-main: keep the white balance.
+        // Otherwise 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1) so
         // it is sqrt(raw), matching 1.4's cuda_compute_guide_image -- the CPU
         // compute_guide twin does the same. Skipped when guide_white_balance is
         // on (a real-RGB guide keeps WB) or the raw was not prewhitened.
@@ -1913,7 +1914,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       bool flow_bilinear) {
+                       bool flow_bilinear, bool std_mode = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1933,6 +1934,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
     dp.flow_bilinear = flow_bilinear ? 1u : 0u;
+    dp.std_mode = std_mode ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -2039,7 +2041,8 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
                         nullptr, 0, mh, mw, cmd, false) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, false) ||
+                       nullptr, 0, vh, vw, cmd, false,
+                       /*std_mode: Alg. 6 resamples sigma*/ cfg.robustness_ipol_alg6) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -2178,6 +2181,18 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
+    // IPOL Algorithm 6 line 25: the n-th frame's sigma, upscaled + warped like its mean,
+    // replaces the reference's in the noise correction (unless robustness_alg6_sigma_ref).
+    id<MTLBuffer> b_sigma_hires = g_rob_ref_v_hires;
+    if (cfg.robustness_ipol_alg6 && !cfg.robustness_alg6_sigma_ref) {
+        id<MTLBuffer> b_comp_sigma_hires = nil;
+        int vh = 0, vw = 0;
+        if (!rob_dogson(b_gvars, b_comp_sigma_hires, gh, gw, nch, /*is_ref=*/false,
+                        &flow, tile_size, vh, vw, cmd, false, /*std_mode*/ true) ||
+            vh != ch_h || vw != ch_w)
+            return Image();
+        b_sigma_hires = b_comp_sigma_hires;
+    }
 
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
@@ -2287,7 +2302,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_comp_means_hires offset:0 atIndex:1];
     [enc setBuffer:g_rob_ref_m_hires offset:0 atIndex:2];
-    [enc setBuffer:g_rob_ref_v_hires offset:0 atIndex:3];
+    [enc setBuffer:b_sigma_hires offset:0 atIndex:3];
     [enc setBuffer:g_rob_std_curve offset:0 atIndex:4];
     [enc setBuffer:g_rob_diff_curve offset:0 atIndex:5];
     [enc setBuffer:b_S offset:0 atIndex:6];
@@ -2314,7 +2329,9 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    Image r = robustness_local_min_on_guide(R_pre);
+    // IPOL Algorithm 6 lines 33-35: 5x5 min on the raw-resolution R itself.
+    Image r = cfg.robustness_ipol_alg6 ? robustness_local_min_5x5(R_pre)
+                                       : robustness_local_min_on_guide(R_pre);
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
