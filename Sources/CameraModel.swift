@@ -509,7 +509,11 @@ final class CameraModel: NSObject, ObservableObject {
     /// the 12MP/48MP choice (always native 12MP). DNG = merged linear Bayer,
     /// JPG = HDR+ tone-mapped render. Persisted; default off.
     @Published var hdrMode: Bool = UserDefaults.standard.bool(forKey: "HDRMode") {
-        didSet { UserDefaults.standard.set(hdrMode, forKey: "HDRMode") }
+        didSet {
+            UserDefaults.standard.set(hdrMode, forKey: "HDRMode")
+            // Leaving HDR+ drops the longer-stack allowance back to the SR cap.
+            if frameCount > effectiveMaxFrameCount { frameCount = effectiveMaxFrameCount }
+        }
     }
 
     @Published var zslBufferReady = 0
@@ -560,7 +564,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var telephotoLensLabel = "Tele"
     @Published var frameCount: Int = CameraModel.persistedFrameCount() {
         didSet {
-            let clamped = min(Self.maxFrameCount, max(Self.minFrameCount, frameCount))
+            let clamped = min(effectiveMaxFrameCount, max(Self.minFrameCount, frameCount))
             if frameCount != clamped {
                 frameCount = clamped
                 return
@@ -569,6 +573,10 @@ final class CameraModel: NSObject, ObservableObject {
             sessionQueue.async { self.activeFrameCount = clamped }
         }
     }
+
+    /// Upper bound on the burst length for the current mode: HDR+ allows a longer
+    /// stack (15) than the super-resolution path (10).
+    var effectiveMaxFrameCount: Int { hdrMode ? Self.maxFrameCountHDR : Self.maxFrameCount }
 
     // Shutter: Auto (A), or manual via log-scaled slider (0…1).
     //
@@ -642,6 +650,9 @@ final class CameraModel: NSObject, ObservableObject {
     /// 15 did not once the full-size accumulator was removed in favour of frame
     /// residency.
     static let maxFrameCount = 10
+    // HDR+ runs at native 12MP with its own frame-residency pipeline, so it can
+    // take a longer stack than the super-resolution path's memory budget allows.
+    static let maxFrameCountHDR = 15
     private static let frameCountDefaultsKey = "FrameCount"
     private static let shutterSliderDefaultsKey = "ShutterSlider"
 
@@ -2149,7 +2160,7 @@ final class CameraModel: NSObject, ObservableObject {
             finish(success: false, message: "Pick at least 2 DNG files")
             return false
         }
-        importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
+        importedDNGs = Array(dngs.prefix(effectiveMaxFrameCount))
         // Honour the user's 12MP/48MP selection (the resolution control) for
         // imports too, instead of forcing 48MP and silently overwriting it.
         isBusy = true

@@ -18,6 +18,7 @@
 #include "core/finish_hdr.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
+#include "core/raw_io.h"
 #include "core/hdrplus/hdrplus.h"
 
 using namespace hhsr;
@@ -1067,41 +1068,15 @@ static bool GatherRawU16(NSDictionary* frame, int w0, int h0,
     return true;
 }
 
-static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *frames,
-                                     Config& cfg, const std::string& outPath) {
-    if (frames.count < 2) return Image();
-    NSDictionary* ref = frames[0];
-    if (![ref isKindOfClass:NSDictionary.class]) return Image();
-    FillReferenceMetadataFromRawFrame(ref, cfg);
-
-    NSNumber* wn=ref[@"width"]; NSNumber* hn=ref[@"height"];
-    if (![wn isKindOfClass:NSNumber.class] || ![hn isKindOfClass:NSNumber.class]) return Image();
-    const int w0 = wn.intValue, h0 = hn.intValue;
-    if (w0 < 32 || h0 < 32) return Image();
-
-    // Centred, even-aligned crop (zoom), matching DecodeRawFrameDictionary.
-    int OW = w0, OH = h0, ox0 = 0, oy0 = 0;
-    if (cfg.input_crop_zoom > 1.f) {
-        const float z = cfg.input_crop_zoom;
-        const int cw = (int)((float)w0 / z + 1e-4f) & ~1;
-        const int ch = (int)((float)h0 / z + 1e-4f) & ~1;
-        if (cw > 0 && ch > 0) { ox0=((w0-cw)/2)&~1; oy0=((h0-ch)/2)&~1; OW=cw; OH=ch; }
-    }
-
-    std::vector<std::vector<uint16_t>> bufs;
-    bufs.reserve(frames.count);
-    std::vector<const uint16_t*> ptrs;
-    for (NSUInteger n = 0; n < frames.count; ++n) {
-        if (![frames[n] isKindOfClass:NSDictionary.class]) continue;
-        std::vector<uint16_t> b;
-        if (!GatherRawU16(frames[n], w0, h0, ox0, oy0, OW, OH, b)) {
-            if (n == 0) return Image();   // reference must decode
-            continue;                     // skip an odd comp frame
-        }
-        bufs.push_back(std::move(b));
-        ptrs.push_back(bufs.back().data());
-    }
-    if (ptrs.size() < 2) return Image();
+// Shared HDR+ merge tail: build Params from cfg, run the HDR+ pipeline on the
+// given raw-u16 Bayer frames, write the merged Bayer DNG, stash the finished
+// render for JPEG/preview, and return a small sRGB preview. Used by both the
+// capture path (RunHdrPlusFromRawFrames) and the import path
+// (RunHdrPlusFromDNGPaths), so the two produce identical output.
+static Image FinishHdrPlusMerge(const std::vector<const uint16_t*>& ptrs,
+                                int OW, int OH, Config& cfg,
+                                const std::string& outPath) {
+    if (ptrs.size() < 2 || OW < 32 || OH < 32) return Image();
 
     hhsr::hdrplus::Params p;
     float black4[4];
@@ -1166,6 +1141,97 @@ static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *fr
     return preview;
 }
 
+static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *frames,
+                                     Config& cfg, const std::string& outPath) {
+    if (frames.count < 2) return Image();
+    NSDictionary* ref = frames[0];
+    if (![ref isKindOfClass:NSDictionary.class]) return Image();
+    FillReferenceMetadataFromRawFrame(ref, cfg);
+
+    NSNumber* wn=ref[@"width"]; NSNumber* hn=ref[@"height"];
+    if (![wn isKindOfClass:NSNumber.class] || ![hn isKindOfClass:NSNumber.class]) return Image();
+    const int w0 = wn.intValue, h0 = hn.intValue;
+    if (w0 < 32 || h0 < 32) return Image();
+
+    // Centred, even-aligned crop (zoom), matching DecodeRawFrameDictionary.
+    int OW = w0, OH = h0, ox0 = 0, oy0 = 0;
+    if (cfg.input_crop_zoom > 1.f) {
+        const float z = cfg.input_crop_zoom;
+        const int cw = (int)((float)w0 / z + 1e-4f) & ~1;
+        const int ch = (int)((float)h0 / z + 1e-4f) & ~1;
+        if (cw > 0 && ch > 0) { ox0=((w0-cw)/2)&~1; oy0=((h0-ch)/2)&~1; OW=cw; OH=ch; }
+    }
+
+    std::vector<std::vector<uint16_t>> bufs;
+    bufs.reserve(frames.count);
+    std::vector<const uint16_t*> ptrs;
+    for (NSUInteger n = 0; n < frames.count; ++n) {
+        if (![frames[n] isKindOfClass:NSDictionary.class]) continue;
+        std::vector<uint16_t> b;
+        if (!GatherRawU16(frames[n], w0, h0, ox0, oy0, OW, OH, b)) {
+            if (n == 0) return Image();   // reference must decode
+            continue;                     // skip an odd comp frame
+        }
+        bufs.push_back(std::move(b));
+        ptrs.push_back(bufs.back().data());
+    }
+    if (ptrs.size() < 2) return Image();
+    return FinishHdrPlusMerge(ptrs, OW, OH, cfg, outPath);
+}
+
+// HDR+ import path: decode the picked DNGs to raw u16 Bayer and run the HDR+
+// merge. Routed here from processDNGs when cfg.hdr_mode is set. Reuses the
+// tested MFSR loader (load_raw_burst, which also fills cfg from the reference)
+// and inverts its per-site normalization -- v = (raw-black)/(white-black) *
+// wb[c]/wb[1] -- to recover the sensor u16 the HDR+ pipeline expects.
+static Image RunHdrPlusFromDNGPaths(const std::vector<std::string>& paths,
+                                    Config& cfg, const std::string& outPath) {
+    if (paths.size() < 2) return Image();
+    std::vector<Image> imgs = hhsr::load_raw_burst(paths, cfg);
+    if (imgs.size() < 2) return Image();
+    const int OW = imgs[0].w, OH = imgs[0].h;
+    if (OW < 32 || OH < 32) return Image();
+
+    float site_black[2][2], site_denom[2][2], site_wb[2][2];
+    const float wb_g = (cfg.white_balance[1] > 1e-6f) ? cfg.white_balance[1] : 1.f;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            int c = std::max(0, std::min(2, (int)cfg.cfa.p[i][j]));
+            float bl = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+            float denom = (float)cfg.white_level - bl;
+            if (!(denom > 0.f) || !std::isfinite(denom) || !std::isfinite(bl)) {
+                bl = 0.f;
+                denom = (cfg.white_level > 0.f) ? (float)cfg.white_level : 65535.f;
+            }
+            float g = cfg.white_balance[c] / wb_g;
+            if (!(g > 0.f) || !std::isfinite(g)) g = 1.f;
+            site_black[i][j] = bl; site_denom[i][j] = denom; site_wb[i][j] = g;
+        }
+
+    std::vector<std::vector<uint16_t>> bufs;
+    bufs.reserve(imgs.size());
+    std::vector<const uint16_t*> ptrs;
+    for (const Image& im : imgs) {
+        if (im.w != OW || im.h != OH || im.c < 1) continue;
+        std::vector<uint16_t> b((size_t)OW * OH);
+        hhsr::parallel_rows(OH, 0, [&](int y) {
+            const int fi = y & 1;
+            for (int x = 0; x < OW; ++x) {
+                const int fj = x & 1;
+                float norm = im.at(y, x);
+                float raw = norm / site_wb[fi][fj] * site_denom[fi][fj] + site_black[fi][fj];
+                long iv = std::lround(raw);
+                if (iv < 0) iv = 0; else if (iv > 65535) iv = 65535;
+                b[(size_t)y * OW + x] = (uint16_t)iv;
+            }
+        });
+        bufs.push_back(std::move(b));
+        ptrs.push_back(bufs.back().data());
+    }
+    if (ptrs.size() < 2) return Image();
+    return FinishHdrPlusMerge(ptrs, OW, OH, cfg, outPath);
+}
+
 @implementation SRBridge
 
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
@@ -1203,6 +1269,22 @@ static Image RunHdrPlusFromRawFrames(NSArray<NSDictionary<NSString *, id> *> *fr
     cfg.stream_comp_raw_from_loader = true;
 
     ApplyTuningParams(tuning, cfg);
+
+    // HDR mode: stack the imported DNGs with the HDR+ pipeline instead of the
+    // super-resolution path, matching what the shutter does in HDR mode. Native
+    // 12 MP (HDR+ ignores the 12/48 choice); DNG = merged Bayer, JPG = HDR+
+    // render stashed for the exporter.
+    if (cfg.hdr_mode) {
+        cfg.scale = 1.f;
+        if (progress) progress(@"HDR+ merge", 0.2f);
+        Image hp;
+        @autoreleasepool { hp = RunHdrPlusFromDNGPaths(vpaths, cfg, std::string(outPath.UTF8String)); }
+        if (hp.w <= 0) return NO;
+        g_capture_meta_path = outPath.UTF8String;
+        if (progress) progress(@"HDR+ done", 1.0f);
+        if (previewOut) *previewOut = UIImageFromPreview(hp);
+        return YES;
+    }
 
     ProgressFn cb = nullptr;
     if (progress) {

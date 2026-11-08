@@ -371,7 +371,7 @@ struct CameraView: View {
             Text("frames")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.white.opacity(0.45))
-            miniStepper("plus", enabled: cam.frameCount < CameraModel.maxFrameCount && !cam.isBusy) {
+            miniStepper("plus", enabled: cam.frameCount < cam.effectiveMaxFrameCount && !cam.isBusy) {
                 cam.frameCount += 1
             }
         }
@@ -825,17 +825,7 @@ struct CameraView: View {
                 .frame(width: 46, height: 46)
                 .clipShape(Circle())
                 .overlay(Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: 1.5))
-
-                if cam.isBusy {
-                    Circle()
-                        .stroke(Color.white.opacity(0.25), lineWidth: 2)
-                        .frame(width: 54, height: 54)
-                    Circle()
-                        .trim(from: 0, to: CGFloat(max(0.02, Double(cam.progress))))
-                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: 54, height: 54)
-                        .rotationEffect(.degrees(-90))
-                }
+                // Processing progress is shown only on the shutter button.
             }
         }
         .disabled(cam.isBusy && cam.lastThumbnail == nil)
