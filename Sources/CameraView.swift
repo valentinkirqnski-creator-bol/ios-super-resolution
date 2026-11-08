@@ -1192,9 +1192,6 @@ struct CameraView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    NavigationLink(destination: HDRLookView(cam: cam)) {
-                        settingsRowLabel("HDR Look") { HDRBadge() }
-                    }
                 }
             }
             .navigationTitle("Settings")
@@ -1222,22 +1219,6 @@ private func settingsRowLabel<Icon: View>(_ title: String,
     HStack(spacing: 12) {
         icon().frame(width: 26, height: 22)
         Text(title)
-    }
-}
-
-/// Small outlined "HDR" badge used as the HDR Look row's leading glyph.
-private struct HDRBadge: View {
-    var body: some View {
-        Text("HDR")
-            .font(.system(size: 8, weight: .heavy))
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 2.5)
-            .padding(.vertical, 1.5)
-            .overlay(
-                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .stroke(Color.secondary, lineWidth: 1.2)
-            )
-            .fixedSize()
     }
 }
 
@@ -1285,39 +1266,6 @@ private struct JPGLookView: View {
             }
         }
         .navigationTitle("JPG Look")
-        .navigationBarTitleDisplayMode(.inline)
-        .md3FormChrome()
-    }
-}
-
-/// HDR Look controls, pushed from Settings (system back button returns).
-private struct HDRLookView: View {
-    @ObservedObject var cam: CameraModel
-
-    var body: some View {
-        Form {
-            Section {
-                lookSliderRow("Brightness", $cam.tuningParams.hdrplus_gain, 0.4...1.4, "%.2f")
-                lookSliderRow("Tone Compression", $cam.tuningParams.hdrplus_compression, 1.0...4.0, "%.1f")
-            }
-            Section {
-                Button("Reset HDR Look") {
-                    cam.tuningParams.hdrplus_gain = TuningParams.appDefaults.hdrplus_gain
-                    cam.tuningParams.hdrplus_compression = TuningParams.appDefaults.hdrplus_compression
-                }
-            }
-            Section {
-                Text("""
-                     Applies only in HDR mode. Brightness is the overall exposure of the \
-                     tone-mapped JPG \u{2014} lower it if HDR shots look too bright. Tone \
-                     Compression sets how hard highlights and shadows are pulled together: \
-                     lower is more natural, higher is a stronger HDR look. The DNG, which \
-                     stays raw, is unaffected.
-                     """)
-                    .font(.footnote).foregroundColor(.secondary)
-            }
-        }
-        .navigationTitle("HDR Look")
         .navigationBarTitleDisplayMode(.inline)
         .md3FormChrome()
     }
