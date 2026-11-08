@@ -293,7 +293,14 @@ struct TuningParams: Equatable, Codable {
     var ms_tau_flow: Float = 3.0
     var ms_tau_u: Float = 3.0
     var ms_flat_k: Float = 4.0
-    var ms_min_window: Int = 5
+    var ms_min_window: Int = 3
+    var ms_z_floor: Float = 2.5
+    var ms_z_radius: Int = 2
+    var ms_shift_enabled: Bool = true
+    var ms_shift_tol: Float = 0.2
+    var ms_tau_shift: Float = 2.0
+    var ms_shift_radius: Int = 5
+    var ms_geo_deadzone: Float = 1.0
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -361,7 +368,8 @@ struct TuningParams: Equatable, Codable {
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case robustness_ipol_alg6, robustness_alg6_sigma_ref
-        case robustness_multisignal, ms_fb_enabled, ms_lowpass_sigma, ms_tau_p, ms_tau_fb, ms_tau_flow, ms_tau_u, ms_flat_k, ms_min_window
+        case robustness_multisignal, ms_fb_enabled, ms_lowpass_sigma, ms_tau_p, ms_tau_fb, ms_tau_flow, ms_tau_u, ms_flat_k, ms_min_window,
+             ms_z_floor, ms_z_radius, ms_shift_enabled, ms_shift_tol, ms_tau_shift, ms_shift_radius, ms_geo_deadzone
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
@@ -475,6 +483,13 @@ struct TuningParams: Equatable, Codable {
         ms_tau_u = try c.decodeIfPresent(Float.self, forKey: .ms_tau_u) ?? ms_tau_u
         ms_flat_k = try c.decodeIfPresent(Float.self, forKey: .ms_flat_k) ?? ms_flat_k
         ms_min_window = try c.decodeIfPresent(Int.self, forKey: .ms_min_window) ?? ms_min_window
+        ms_z_floor = try c.decodeIfPresent(Float.self, forKey: .ms_z_floor) ?? ms_z_floor
+        ms_z_radius = try c.decodeIfPresent(Int.self, forKey: .ms_z_radius) ?? ms_z_radius
+        ms_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .ms_shift_enabled) ?? ms_shift_enabled
+        ms_shift_tol = try c.decodeIfPresent(Float.self, forKey: .ms_shift_tol) ?? ms_shift_tol
+        ms_tau_shift = try c.decodeIfPresent(Float.self, forKey: .ms_tau_shift) ?? ms_tau_shift
+        ms_shift_radius = try c.decodeIfPresent(Int.self, forKey: .ms_shift_radius) ?? ms_shift_radius
+        ms_geo_deadzone = try c.decodeIfPresent(Float.self, forKey: .ms_geo_deadzone) ?? ms_geo_deadzone
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -570,6 +585,18 @@ final class CameraModel: NSObject, ObservableObject {
                 params.guide_white_balance = true
                 if let migrated = try? JSONEncoder().encode(params) {
                     UserDefaults.standard.set(migrated, forKey: "TuningParams")
+                }
+            }
+            // Multi-signal local-min window: the first release defaulted to 5 at guide
+            // resolution (4x Alg. 6's footprint); move presets still on that default to 3.
+            let msMinKey = "TuningParamsMsMinWindow3"
+            if !UserDefaults.standard.bool(forKey: msMinKey) {
+                UserDefaults.standard.set(true, forKey: msMinKey)
+                if params.ms_min_window == 5 {
+                    params.ms_min_window = 3
+                    if let migrated = try? JSONEncoder().encode(params) {
+                        UserDefaults.standard.set(migrated, forKey: "TuningParams")
+                    }
                 }
             }
             let codecRepairKey = "TuningParamsCodecRepaired"
@@ -2277,6 +2304,13 @@ final class CameraModel: NSObject, ObservableObject {
             "ms_tau_u": NSNumber(value: tuningParams.ms_tau_u),
             "ms_flat_k": NSNumber(value: tuningParams.ms_flat_k),
             "ms_min_window": NSNumber(value: tuningParams.ms_min_window),
+            "ms_z_floor": NSNumber(value: tuningParams.ms_z_floor),
+            "ms_z_radius": NSNumber(value: tuningParams.ms_z_radius),
+            "ms_shift_enabled": NSNumber(value: tuningParams.ms_shift_enabled),
+            "ms_shift_tol": NSNumber(value: tuningParams.ms_shift_tol),
+            "ms_tau_shift": NSNumber(value: tuningParams.ms_tau_shift),
+            "ms_shift_radius": NSNumber(value: tuningParams.ms_shift_radius),
+            "ms_geo_deadzone": NSNumber(value: tuningParams.ms_geo_deadzone),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),

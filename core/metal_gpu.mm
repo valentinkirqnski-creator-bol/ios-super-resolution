@@ -5006,12 +5006,14 @@ struct MsParamsCPU {
     uint32_t gh, gw, w, fny;
     uint32_t fnx, ts, ntaps, win_r;
     uint32_t cfa00, cfa01, cfa10, cfa11;
-    uint32_t cnt0, cnt1, cnt2, p0;
+    uint32_t cnt0, cnt1, cnt2, srad;
     float itp2, ku, exp_p, sfl;
-    float kfb, kfl, g0, p3;
+    float kfb, kfl, g0, e2;
     float taps[16];
+    float z0, stolg, kshift, shift_on;
+    uint32_t zrad, q0, q1, q2;
 };
-static_assert(sizeof(MsParamsCPU) == 160, "MsParamsCPU layout");
+static_assert(sizeof(MsParamsCPU) == 192, "MsParamsCPU layout");
 
 struct MsRefGpu {
     const float* key = nullptr;
@@ -5029,8 +5031,9 @@ static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefSt
     auto& c = ctx();
     id<MTLComputePipelineState> pg = c.pipe("ms_guide"), pbh = c.pipe("ms_blur_h"),
         pbv = c.pipe("ms_blur_v"), pr = c.pipe("ms_robust"), pmh = c.pipe("ms_min_h"),
-        pmv = c.pipe("ms_min_v"), pc = c.pipe("ms_combine");
-    if (!pg || !pbh || !pbv || !pr || !pmh || !pmv || !pc) return Image();
+        pmv = c.pipe("ms_min_v"), pc = c.pipe("ms_combine"), psh = c.pipe("ms_shift_h"),
+        psv = c.pipe("ms_shift_v");
+    if (!pg || !pbh || !pbv || !pr || !pmh || !pmv || !pc || !psh || !psv) return Image();
     const size_t plane = (size_t)m.gh * m.gw;
     // Reference maps: uploaded once per burst.
     if (g_ms_ref.key != m.L.data() || g_ms_ref.n != plane) {
@@ -5045,8 +5048,8 @@ static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefSt
     }
     if (!g_ms_ref.L || !g_ms_ref.gx || !g_ms_ref.gy || !g_ms_ref.vn || !g_ms_ref.sig || !g_ms_ref.flat)
         return Image();
-    std::vector<float> t_fb, t_flow;   // per-tile E_fb^2 and E_flow (raw px^2)
-    ms_tile_errors(flow, t_fb, t_flow);
+    std::vector<float> t_fb, t_flow;   // per-tile error tensors e e^T (3 per tile, raw px^2)
+    ms_tile_errors(flow, t_fb, t_flow, cfg.ms_geo_deadzone);
 
     MsParamsCPU p{};
     p.gh = (uint32_t)m.gh; p.gw = (uint32_t)m.gw; p.w = (uint32_t)comp_raw.w;
@@ -5066,10 +5069,21 @@ static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefSt
     p.exp_p = cfg.ms_exp_p;
     p.sfl = 0.25f * cfg.ms_shift_floor * cfg.ms_shift_floor;
     for (size_t i = 0; i < m.blur.size(); ++i) p.taps[i] = m.blur[i];
+    {
+        float e1 = 0.f;
+        for (size_t i = 0; i < m.blur.size(); ++i) e1 += (i == 0 ? 1.f : 2.f) * m.blur[i] * m.blur[i];
+        p.e2 = e1 * e1;
+    }
+    p.srad = (uint32_t)std::max(0, cfg.ms_shift_radius);
+    p.z0 = std::max(0.f, cfg.ms_z_floor);
+    p.stolg = 0.5f * std::max(0.f, cfg.ms_shift_tol);
+    p.kshift = 1.f / (2.f * std::max(1e-6f, cfg.ms_tau_shift * cfg.ms_tau_shift));
+    p.shift_on = cfg.ms_shift_enabled ? 1.f : 0.f;
+    p.zrad = (uint32_t)std::max(0, cfg.ms_z_radius);
 
     id<MTLBuffer> b_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
     id<MTLBuffer> b_g = buf(nullptr, 3 * plane * sizeof(float));
-    id<MTLBuffer> b_t = buf(nullptr, 3 * plane * sizeof(float));
+    id<MTLBuffer> b_t = buf(nullptr, 5 * plane * sizeof(float));   // blur temp, then shift moments
     id<MTLBuffer> b_Lc = buf(nullptr, 3 * plane * sizeof(float));
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_tfb = buf(t_fb.data(), t_fb.size() * sizeof(float));
@@ -5100,7 +5114,23 @@ static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefSt
     [enc setBuffer:b_tfl offset:0 atIndex:9];
     [enc setBuffer:b_R2 offset:0 atIndex:10];          // pass 1: z
     [enc setBytes:&p length:sizeof(p) atIndex:11];
+    [enc setBuffer:b_g offset:0 atIndex:12];           // pass 1: residual E (b_g is free now)
     dispatch2(enc, pr, W, Hh);
+    if (cfg.ms_shift_enabled) {
+        // pass 1b: shift moments (b_t is free after the blur) -> R_shift into b_Lc
+        [enc setBuffer:b_R2 offset:0 atIndex:0];
+        [enc setBuffer:b_g offset:0 atIndex:1];
+        [enc setBuffer:g_ms_ref.gx offset:0 atIndex:2];
+        [enc setBuffer:g_ms_ref.gy offset:0 atIndex:3];
+        [enc setBuffer:g_ms_ref.vn offset:0 atIndex:4];
+        [enc setBuffer:b_t offset:0 atIndex:5];
+        [enc setBytes:&p length:sizeof(p) atIndex:6];
+        dispatch2(enc, psh, W, Hh);
+        [enc setBuffer:b_t offset:0 atIndex:0];
+        [enc setBuffer:b_Lc offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, psv, W, Hh);
+    }
     [enc setBuffer:b_R2 offset:0 atIndex:0];
     [enc setBuffer:g_ms_ref.sig offset:0 atIndex:1];
     [enc setBuffer:g_ms_ref.flat offset:0 atIndex:2];
@@ -5111,6 +5141,7 @@ static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefSt
     [enc setBuffer:g_ms_ref.gx offset:0 atIndex:7];
     [enc setBuffer:g_ms_ref.gy offset:0 atIndex:8];
     [enc setBuffer:g_ms_ref.vn offset:0 atIndex:9];
+    [enc setBuffer:b_Lc offset:0 atIndex:10];           // R_shift (ignored when shift_on = 0)
     dispatch2(enc, pc, W, Hh);
     if (p.win_r > 0u) {
         [enc setBuffer:b_R offset:0 atIndex:0]; [enc setBuffer:b_R2 offset:0 atIndex:1];

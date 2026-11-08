@@ -121,7 +121,7 @@ struct FlowField {
     // Multi-signal robustness (Config::robustness_multisignal): forward-backward error
     // per tile, || u_0->i(c) + u_i->0(c + u_0->i(c)) || in raw pixels at the tile centre c.
     // Empty = not measured (R_fb = 1).
-    std::vector<float> fb_error;
+    std::vector<float> fb_error;   // multi-signal: per-tile forward-backward error VECTOR (dx, dy), raw px
 
     // True when motion_irregular carries a measurement for this grid.
     inline bool has_motion_prior() const {
@@ -1004,7 +1004,34 @@ struct Config {
     float ms_shift_floor = 0.1f;
     float ms_flat_k = 4.f;            // detail SNR at which flatness = 1/e
     float ms_exp_p = 1.f, ms_exp_fb = 1.f, ms_exp_flow = 1.f;   // a, b, c
-    int   ms_min_window = 5;          // final local-min window (1 = off)
+    // Final local-min window at GUIDE resolution (1 = off). Alg. 6's 5x5 runs on the raw
+    // grid = 2.5 guide px; 3 here is the equivalent footprint (5 was 4x the area and turned
+    // every isolated low pixel into a 10x10 raw-px square).
+    int   ms_min_window = 3;
+    // Photometric noise floor: the 3x3 mean of z (expectation 1 for two aligned frames)
+    // only counts above this. The low pass correlates neighbouring residuals, so the 3x3
+    // mean holds only a few independent samples and its noise tail reaches ~2.4 (p99.9,
+    // burst12 sky); without a floor the final local min turned that tail into a uniform
+    // ~0.6 weight on perfectly aligned flat areas.
+    float ms_z_floor = 2.5f;
+    // Radius (guide px) of the box mean of z. The photometric test now only has to catch
+    // gross disagreement (moving / appearing objects; sub-pixel slips are the shift test's
+    // job), which is spatially extended, while aliasing on fine texture gives isolated
+    // z peaks; a wider mean keeps the former and dilutes the latter.
+    int   ms_z_radius = 2;
+    // Coherent residual-shift test: a windowed multi-channel Lucas-Kanade solve on the
+    // low-passed residual left after the tile warp estimates the local displacement the
+    // tile vector missed (the sub-pixel edge slip of a within-tile flow error). Shifts
+    // below ms_shift_tol (raw px; the incoherent aliasing floor measured ~0.2 px) are
+    // free; the excess is judged by its significance in noise std (tau_shift).
+    bool  ms_shift_enabled = true;
+    float ms_shift_tol = 0.2f;        // raw px
+    float ms_tau_shift = 2.f;         // noise std
+    int   ms_shift_radius = 5;        // guide px: (2r+1)^2 LK window
+    // Forward-backward and flow-model errors below this (raw px) are legitimate flow
+    // variation (perspective, parallax, estimator noise) and cost nothing: those two
+    // signals only flag blunders; sub-pixel slips are the shift test's job.
+    float ms_geo_deadzone = 1.f;
     bool robustness_alg6_sigma_ref = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

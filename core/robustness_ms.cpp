@@ -13,9 +13,10 @@
 //              z = mean_c e_c^2 / (tau_p^2 V_c),   R_p = exp(-z / 2).
 //   R_fb   forward-backward consistency of the flow: E = || u_0->i + u_i->0(x + u_0->i) ||
 //          (needs the backward alignment, pipeline).
-//   R_flow local motion-field consistency: residual of a least-squares affine fit
-//          u(x + d) = u(x) + J d over the 3x3 neighbouring tiles, so rotation / zoom /
-//          perspective (smooth flow) costs nothing and only unexplained deviations do.
+//   R_flow local motion-field consistency: deviation of the tile vector from the median
+//          of its 8 neighbours, so rotation / zoom / perspective (locally linear flow)
+//          costs nothing, only unexplained deviations do, and a blundered neighbour
+//          does not spread to the tiles around it.
 //   R_unc  alignment uncertainty from the Lucas-Kanade Hessian of the reference,
 //          Sigma_u = sigma_n^2 (H + lambda I)^-1.
 //   The three geometric signals are judged by the RECONSTRUCTION DAMAGE their displacement
@@ -26,7 +27,16 @@
 //   does no harm; a pixel threshold rejected most of the frame, the damage test only where
 //   structure would be doubled.
 //
-//   R_denoise = R_p^a R_fb^b                      (safe to average for noise)
+//   R_shift coherent residual displacement: a windowed multi-channel LK solve on the
+//          low-passed residual e = L_ref - warp(L_comp) estimates the local shift delta the
+//          tile vector missed; shifts below ms_shift_tol are free (aliasing floor), the
+//          excess is judged by its precision h_u (Fisher information along delta, corrected
+//          for the low pass's noise correlation): S = h_u (|delta| - tol)^2,
+//          R_shift = exp(-S / 2 tau_shift^2). This is what catches the sub-pixel edge slips
+//          the photometric z dilutes and the per-tile signals cannot see.
+//   R_fb / R_flow only count error beyond ms_geo_deadzone (blunders).
+//
+//   R_denoise = R_p^a R_fb^b R_shift              (safe to average for noise)
 //   R_SR      = R_denoise R_flow^c R_unc          (safe to contribute fine detail)
 //
 // The merge consumes one weight per guide pixel, so the two are blended by the
@@ -225,83 +235,82 @@ void ms_init_reference(const Image& ref_raw, const Config& cfg, RefStats& st) {
     });
 }
 
+// Median of n values (n <= 9), in place.
+static float ms_median(float* v, int n) {
+    std::sort(v, v + n);
+    return (n & 1) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+}
+
+// Forward-backward error per forward tile: E = | u_fwd + u_bwd(x + u_fwd) |, with the
+// backward flow at the landing point taken as the per-component MEDIAN of the 3x3
+// backward tiles around it (not a bilinear blend): a single blundered backward vector
+// -- common on repeated structure -- must not condemn a correct forward vector. A
+// forward blunder still lands far from where the backward field points back.
 void ms_fill_fb_error(FlowField& fwd, const FlowField& bwd, int ts) {
-    fwd.fb_error.assign((size_t)fwd.ny * fwd.nx, 0.f);
+    fwd.fb_error.assign((size_t)2 * fwd.ny * fwd.nx, 0.f);
     if (bwd.ny <= 0 || bwd.nx <= 0 || ts <= 0) return;
-    auto bwd_at = [&](float ry, float rx, float& by, float& bx) {
-        // bilinear over tile centres, clamped
-        float ty = ry / ts - 0.5f, tx = rx / ts - 0.5f;
-        ty = std::min((float)bwd.ny - 1, std::max(0.f, ty));
-        tx = std::min((float)bwd.nx - 1, std::max(0.f, tx));
-        const int y0 = (int)ty, x0 = (int)tx;
-        const int y1 = std::min(bwd.ny - 1, y0 + 1), x1 = std::min(bwd.nx - 1, x0 + 1);
-        const float fy = ty - y0, fx = tx - x0;
-        auto lerp2 = [&](bool dy_) {
-            auto v = [&](int yy, int xx) { return dy_ ? bwd.dy(yy, xx) : bwd.dx(yy, xx); };
-            const float top = v(y0, x0) + (v(y0, x1) - v(y0, x0)) * fx;
-            const float bot = v(y1, x0) + (v(y1, x1) - v(y1, x0)) * fx;
-            return top + (bot - top) * fy;
-        };
-        by = lerp2(true);
-        bx = lerp2(false);
-    };
     for (int ty = 0; ty < fwd.ny; ++ty)
         for (int tx = 0; tx < fwd.nx; ++tx) {
             const float cy = (ty + 0.5f) * ts, cx = (tx + 0.5f) * ts;
             const float fy = fwd.dy(ty, tx), fx = fwd.dx(ty, tx);
-            float by = 0.f, bx = 0.f;
-            bwd_at(cy + fy, cx + fx, by, bx);
-            fwd.fb_error[(size_t)ty * fwd.nx + tx] = std::sqrt((fx + bx) * (fx + bx) + (fy + by) * (fy + by));
+            const int by = std::min(bwd.ny - 1, std::max(0, (int)std::floor((cy + fy) / ts)));
+            const int bx = std::min(bwd.nx - 1, std::max(0, (int)std::floor((cx + fx) / ts)));
+            float vy[9], vx[9];
+            int n = 0;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = by + i, xx = bx + j;
+                    if (yy < 0 || yy >= bwd.ny || xx < 0 || xx >= bwd.nx) continue;
+                    vy[n] = bwd.dy(yy, xx); vx[n] = bwd.dx(yy, xx); ++n;
+                }
+            const float my = ms_median(vy, n), mx = ms_median(vx, n);
+            fwd.fb_error[2 * ((size_t)ty * fwd.nx + tx)] = fx + mx;
+            fwd.fb_error[2 * ((size_t)ty * fwd.nx + tx) + 1] = fy + my;
         }
 }
 
-// Least-squares affine fit of one flow component over the in-grid 3x3 neighbourhood:
-// u(d) = a0 + a1 dx + a2 dy. Returns the sum of squared residuals; falls back to a
-// constant fit when the design is singular (fewer than 3 non-collinear tiles).
-static double affine_residual(const double* u, const int* dx, const int* dy, int n) {
-    double m00 = n, m01 = 0, m02 = 0, m11 = 0, m12 = 0, m22 = 0, r0 = 0, r1 = 0, r2 = 0;
-    for (int i = 0; i < n; ++i) {
-        m01 += dx[i]; m02 += dy[i]; m11 += dx[i] * dx[i]; m12 += dx[i] * dy[i]; m22 += dy[i] * dy[i];
-        r0 += u[i]; r1 += u[i] * dx[i]; r2 += u[i] * dy[i];
-    }
-    const double det = m00 * (m11 * m22 - m12 * m12) - m01 * (m01 * m22 - m12 * m02) +
-                       m02 * (m01 * m12 - m11 * m02);
-    double a0, a1 = 0, a2 = 0;
-    if (std::fabs(det) > 1e-9) {
-        a0 = (r0 * (m11 * m22 - m12 * m12) - m01 * (r1 * m22 - m12 * r2) + m02 * (r1 * m12 - m11 * r2)) / det;
-        a1 = (m00 * (r1 * m22 - m12 * r2) - r0 * (m01 * m22 - m12 * m02) + m02 * (m01 * r2 - r1 * m02)) / det;
-        a2 = (m00 * (m11 * r2 - r1 * m12) - m01 * (m01 * r2 - r1 * m02) + r0 * (m01 * m12 - m11 * m02)) / det;
-    } else {
-        a0 = r0 / n;
-    }
-    double ss = 0;
-    for (int i = 0; i < n; ++i) {
-        const double e = u[i] - (a0 + a1 * dx[i] + a2 * dy[i]);
-        ss += e * e;
-    }
-    return ss;
-}
-
-void ms_tile_errors(const FlowField& flow, std::vector<float>& efb2, std::vector<float>& eflow) {
+// Flow-model error per tile: squared deviation of the tile's vector from the
+// per-component median of its (up to 8) neighbours. For a locally linear field
+// (rotation, zoom, perspective) the neighbour ring is symmetric about the centre value,
+// so smooth motion costs ~nothing; unlike a least-squares affine fit over the 3x3, a
+// blundered NEIGHBOUR does not inflate this tile's error.
+void ms_tile_errors(const FlowField& flow, std::vector<float>& efb, std::vector<float>& eflow,
+                    float deadzone) {
     const int ny = flow.ny, nx = flow.nx;
-    efb2.assign((size_t)ny * nx, 0.f);
-    eflow.assign((size_t)ny * nx, 0.f);
-    const bool have_fb = flow.fb_error.size() == (size_t)ny * nx;
+    efb.assign((size_t)3 * ny * nx, 0.f);
+    eflow.assign((size_t)3 * ny * nx, 0.f);
+    const bool have_fb = flow.fb_error.size() == (size_t)2 * ny * nx;
+    // Shrink the vector's length by the dead zone, store its outer product.
+    auto put = [&](std::vector<float>& t, size_t o, float ex, float ey) {
+        const float m = std::sqrt(ex * ex + ey * ey);
+        const float k = (m > deadzone && m > 0.f) ? (m - deadzone) / m : 0.f;
+        ex *= k; ey *= k;
+        t[3 * o] = ex * ex; t[3 * o + 1] = ex * ey; t[3 * o + 2] = ey * ey;
+    };
     for (int ty = 0; ty < ny; ++ty)
         for (int tx = 0; tx < nx; ++tx) {
             const size_t o = (size_t)ty * nx + tx;
-            if (have_fb) efb2[o] = flow.fb_error[o] * flow.fb_error[o];
-            double ux[9], uy[9];
-            int dxs[9], dys[9], n = 0;
+            if (have_fb) put(efb, o, flow.fb_error[2 * o], flow.fb_error[2 * o + 1]);
+            float ux[8], uy[8];
+            int n = 0;
             for (int i = -1; i <= 1; ++i)
                 for (int j = -1; j <= 1; ++j) {
+                    if (i == 0 && j == 0) continue;
                     const int yy = ty + i, xx = tx + j;
                     if (yy < 0 || yy >= ny || xx < 0 || xx >= nx) continue;
-                    ux[n] = flow.dx(yy, xx); uy[n] = flow.dy(yy, xx);
-                    dxs[n] = j; dys[n] = i; ++n;
+                    ux[n] = flow.dx(yy, xx); uy[n] = flow.dy(yy, xx); ++n;
                 }
-            eflow[o] = (float)((affine_residual(ux, dxs, dys, n) + affine_residual(uy, dxs, dys, n)) / n);
+            if (n > 0) put(eflow, o, flow.dx(ty, tx) - ms_median(ux, n), flow.dy(ty, tx) - ms_median(uy, n));
         }
+}
+
+// Variance gain of the separable 2-D low pass (sum of squared taps, squared): the
+// residual's noise is correlated over ~1/e2 pixels, so a window sum of N pixels carries
+// the information of about N * e2 independent ones.
+static float ms_e2(const std::vector<float>& k) {
+    float e1 = 0.f;
+    for (size_t i = 0; i < k.size(); ++i) e1 += (i == 0 ? 1.f : 2.f) * k[i] * k[i];
+    return e1 * e1;
 }
 
 Image ms_local_min(const Image& R, int window) {
@@ -335,10 +344,11 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     if (gh != m.gh || gw != m.gw) return Image();
     ms_blur(g, gh, gw, m.blur, Lc, cfg.num_threads);
     std::vector<float>().swap(g);
-    std::vector<float> efb2, eflow;
-    ms_tile_errors(flow, efb2, eflow);
+    std::vector<float> efb, eflow;   // per-tile error tensors (3 per tile)
+    ms_tile_errors(flow, efb, eflow, cfg.ms_geo_deadzone);
 
     const size_t plane = (size_t)gh * gw;
+    std::vector<float> E(3 * plane, 0.f);   // low-passed residual per channel
     const float itp2 = 1.f / std::max(1e-6f, cfg.ms_tau_p * cfg.ms_tau_p);
     const float sfl = 0.25f * cfg.ms_shift_floor * cfg.ms_shift_floor;   // guide px^2
     // damage exponents: -D / (2 tau^2) * exponent
@@ -346,7 +356,7 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     const float kfl = cfg.ms_exp_flow / (2.f * std::max(1e-6f, cfg.ms_tau_flow * cfg.ms_tau_flow));
     const float ku = 1.f / (2.f * std::max(1e-6f, cfg.ms_tau_u * cfg.ms_tau_u));
     // Pass 1: per-pixel normalised photometric energy z (mean over the 3 channels of
-    // e^2 / (tau_p^2 V)); -1 marks a correspondence that leaves the frame.
+    // e^2 / V); -1 marks a correspondence that leaves the frame.
     std::vector<float> Z(plane, -1.f);
     parallel_rows(gh, cfg.num_threads, [&](int y) {
         const int pty = std::min(flow.ny - 1, (int)((2.f * y + 0.5f) / ts));
@@ -373,6 +383,7 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const float top = L[q] + (L[q + 1] - L[q]) * fx;
                 const float bot = L[q + gw] + (L[q + gw + 1] - L[q + gw]) * fx;
                 const float e = Lr[o] - (top + (bot - top) * fy);
+                E[c * plane + o] = e;
                 const float gxv = m.gx[c * plane + o], gyv = m.gy[c * plane + o];
                 const float dxx = Lr[(size_t)y * gw + xp] + Lr[(size_t)y * gw + xm] - 2.f * Lr[o];
                 const float dyy = Lr[(size_t)yp * gw + x] + Lr[(size_t)ym * gw + x] - 2.f * Lr[o];
@@ -382,10 +393,65 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                                 ei * ei + 1e-10f;
                 z += e * e / V;
             }
-            Z[o] = z * itp2 / 3.f;
+            Z[o] = z / 3.f;
             (void)to;
         }
     });
+    // Pass 1b: coherent residual shift. Per-pixel LK moments (summed over channels, each
+    // weighted by its noise), boxed separably over the (2r+1)^2 window (in-frame samples
+    // only, no edge replication), then delta = H^-1 b and its excess significance.
+    std::vector<float> Rs(plane, 1.f);
+    if (cfg.ms_shift_enabled) {
+        const int sr = std::max(0, cfg.ms_shift_radius);
+        const float e2 = ms_e2(m.blur);
+        const float tolg = 0.5f * std::max(0.f, cfg.ms_shift_tol);          // guide px
+        const float ksh = 1.f / (2.f * std::max(1e-6f, cfg.ms_tau_shift * cfg.ms_tau_shift));
+        auto moments = [&](size_t q, float* M) {
+            for (int c = 0; c < 3; ++c) {
+                const float gxv = m.gx[c * plane + q], gyv = m.gy[c * plane + q];
+                const float iv = 1.f / (m.vn[c * plane + q] + 1e-10f);
+                const float e = E[c * plane + q];
+                M[0] += gxv * gxv * iv; M[1] += gxv * gyv * iv; M[2] += gyv * gyv * iv;
+                M[3] += gxv * e * iv;   M[4] += gyv * e * iv;
+            }
+        };
+        std::vector<float> T(5 * plane, 0.f);
+        parallel_rows(gh, cfg.num_threads, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                float M[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+                for (int j = -sr; j <= sr; ++j) {
+                    const int xx = x + j;
+                    if (xx < 0 || xx >= gw) continue;
+                    const size_t q = (size_t)y * gw + xx;
+                    if (Z[q] < 0.f) continue;
+                    moments(q, M);
+                }
+                for (int k = 0; k < 5; ++k) T[k * plane + (size_t)y * gw + x] = M[k];
+            }
+        });
+        parallel_rows(gh, cfg.num_threads, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                float M[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+                for (int i = -sr; i <= sr; ++i) {
+                    const int yy = y + i;
+                    if (yy < 0 || yy >= gh) continue;
+                    for (int k = 0; k < 5; ++k) M[k] += T[k * plane + (size_t)yy * gw + x];
+                }
+                const float lam = 1e-3f * (M[0] + M[2]) + 1e-20f;
+                const float a = M[0] + lam, b = M[1], d = M[2] + lam;
+                const float det = a * d - b * b;
+                if (!(det > 0.f)) continue;
+                const float dx = (d * M[3] - b * M[4]) / det, dy = (a * M[4] - b * M[3]) / det;
+                const float n = std::sqrt(dx * dx + dy * dy);
+                if (!(n > tolg)) continue;
+                const float ux = dx / n, uy = dy / n;
+                const float hu = e2 * (ux * ux * a + 2.f * ux * uy * b + uy * uy * d);
+                const float ex = n - tolg;
+                Rs[(size_t)y * gw + x] = std::exp(-hu * ex * ex * ksh);
+            }
+        });
+    }
+    const float z0 = std::max(0.f, cfg.ms_z_floor);
     // Pass 2: aggregate the photometric evidence over 3x3 (a per-pixel z is a noisy
     // chi-square statistic; its 3x3 mean is a 27-sample estimate, so the final local
     // minimum responds to misalignment rather than to the noise tail), then combine.
@@ -399,10 +465,11 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const size_t to = (size_t)pty * flow.nx + ptx;
             float zs = 0.f;
             int n = 0;
-            for (int i = -1; i <= 1; ++i) {
+            const int zr = std::max(0, cfg.ms_z_radius);
+            for (int i = -zr; i <= zr; ++i) {
                 const int yy = y + i;
                 if (yy < 0 || yy >= gh) continue;
-                for (int j = -1; j <= 1; ++j) {
+                for (int j = -zr; j <= zr; ++j) {
                     const int xx = x + j;
                     if (xx < 0 || xx >= gw) continue;
                     const float v = Z[(size_t)yy * gw + xx];
@@ -423,12 +490,46 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             }
             G /= 3.f;
             Du /= 3.f;
-            // Only SIGNAL gradient turns a displacement error into damage: remove the
-            // reference's own noise contribution (3x its expectation), so a flat sky with a
-            // blundered flow is still averaged for denoising.
-            const float Gs = std::max(0.f, G - 3.f * m.g0);
-            Du *= (G > 0.f) ? Gs / G : 0.f;
-            G = Gs;
+            // Damage of a displacement error e is (grad L . e)^2 per channel, so the
+            // geometric signals use the noise-normalised STRUCTURE TENSOR
+            //   S = mean_{3x3, c} grad grad^T / V_n,c
+            // against the per-tile error tensor: D = tr(S E). An error ALONG an edge (the
+            // aperture problem: a mullion's vertical flow is unconstrained) does no damage.
+            // 3x3 mean: a single pixel's tensor is a few-dof chi-square whose noise tail
+            // dotted the blundered-flow sky with rejections.
+            float s3xx = 0.f, s3xy = 0.f, s3yy = 0.f;
+            for (int i = -1; i <= 1; ++i) {
+                const int yy = std::min(gh - 1, std::max(0, y + i));
+                for (int j = -1; j <= 1; ++j) {
+                    const int xx = std::min(gw - 1, std::max(0, x + j));
+                    const size_t q = (size_t)yy * gw + xx;
+                    for (int c = 0; c < 3; ++c) {
+                        const float gxv = m.gx[c * plane + q], gyv = m.gy[c * plane + q];
+                        const float iv = 1.f / (m.vn[c * plane + q] + 1e-10f);
+                        s3xx += gxv * gxv * iv; s3xy += gxv * gyv * iv; s3yy += gyv * gyv * iv;
+                    }
+                }
+            }
+            s3xx /= 27.f; s3xy /= 27.f; s3yy /= 27.f;
+            // Only SIGNAL structure turns a displacement error into damage: subtract the
+            // reference's own noise (3x its expectation, g0/2 per axis) from the tensor's
+            // eigenvalues, so a flat sky with a blundered flow is still averaged.
+            {
+                const float tr = s3xx + s3yy, df = s3xx - s3yy;
+                const float rt = std::sqrt(0.25f * df * df + s3xy * s3xy);
+                const float l1 = std::max(0.f, 0.5f * tr + rt - 1.5f * m.g0);
+                const float l2 = std::max(0.f, 0.5f * tr - rt - 1.5f * m.g0);
+                // eigenvector of l1: (s3xy, l1_raw - s3xx) or axis-aligned when s3xy = 0
+                float vx = s3xy, vy = 0.5f * tr + rt - s3xx;
+                float nv = std::sqrt(vx * vx + vy * vy);
+                if (!(nv > 1e-20f)) { vx = (s3xx >= s3yy) ? 1.f : 0.f; vy = 1.f - vx; nv = 1.f; }
+                vx /= nv; vy /= nv;
+                s3xx = l1 * vx * vx + l2 * vy * vy;
+                s3xy = (l1 - l2) * vx * vy;
+                s3yy = l1 * vy * vy + l2 * vx * vx;
+            }
+            const float Gs = s3xx + s3yy;
+            Du *= (G > 0.f) ? std::min(1.f, Gs / G) : 0.f;
             // Per-tile errors interpolated bilinearly between tile centres (a nearest
             // fetch prints the 16 px tile grid into the mask).
             float tyf = (2.f * y + 0.5f) / ts - 0.5f, txf = (2.f * x + 0.5f) / ts - 0.5f;
@@ -437,20 +538,21 @@ Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const int ty0 = (int)tyf, tx0 = (int)txf;
             const int ty1 = std::min(flow.ny - 1, ty0 + 1), tx1 = std::min(flow.nx - 1, tx0 + 1);
             const float wy = tyf - ty0, wx = txf - tx0;
-            auto bil = [&](const std::vector<float>& v) {
-                const float a = v[(size_t)ty0 * flow.nx + tx0], b = v[(size_t)ty0 * flow.nx + tx1];
-                const float c = v[(size_t)ty1 * flow.nx + tx0], d = v[(size_t)ty1 * flow.nx + tx1];
+            auto bil = [&](const std::vector<float>& v, int k) {
+                const float a = v[3 * ((size_t)ty0 * flow.nx + tx0) + k], b = v[3 * ((size_t)ty0 * flow.nx + tx1) + k];
+                const float c = v[3 * ((size_t)ty1 * flow.nx + tx0) + k], d = v[3 * ((size_t)ty1 * flow.nx + tx1) + k];
                 const float top = a + (b - a) * wx, bot = c + (d - c) * wx;
                 return top + (bot - top) * wy;
             };
             (void)to;
-            const float Dfb = G * 0.25f * bil(efb2);     // raw px^2 -> guide px^2
-            const float Dfl = G * 0.25f * bil(eflow);
-            const float Rp = std::exp(-0.5f * z * cfg.ms_exp_p);   // R_p^a
+            // tr(S E), raw px^2 -> guide px^2
+            const float Dfb = 0.25f * (s3xx * bil(efb, 0) + 2.f * s3xy * bil(efb, 1) + s3yy * bil(efb, 2));
+            const float Dfl = 0.25f * (s3xx * bil(eflow, 0) + 2.f * s3xy * bil(eflow, 1) + s3yy * bil(eflow, 2));
+            const float Rp = std::exp(-0.5f * std::max(0.f, z - z0) * itp2 * cfg.ms_exp_p);   // R_p^a
             const float Rfb = std::exp(-Dfb * kfb);                 // R_fb^b
             const float Rfl = std::exp(-Dfl * kfl);                 // R_flow^c
             const float Run = std::exp(-Du * ku);
-            const float Rdn = Rp * Rfb;
+            const float Rdn = Rp * Rfb * Rs[o];
             const float Rsr = Rdn * Rfl * Run;
             const float f = m.flat[o];
             R.at(y, x) = std::min(1.f, std::max(0.f, Rsr + (Rdn - Rsr) * f));

@@ -3572,10 +3572,12 @@ struct MsParams {
     uint gh, gw, w, fny;
     uint fnx, ts, ntaps, win_r;
     uint cfa00, cfa01, cfa10, cfa11;
-    uint cnt0, cnt1, cnt2, _p0;
+    uint cnt0, cnt1, cnt2, srad;   // srad: shift-test LK window radius (guide px)
     float itp2, ku, exp_p, sfl;    // ku = 1/(2 tau_u^2); sfl: ms_shift_floor^2 / 4 (guide px^2)
-    float kfb, kfl, g0, _p3;       // exp_fb/(2 tau_fb^2), exp_flow/(2 tau_flow^2), noise G
+    float kfb, kfl, g0, e2;        // exp_fb/(2 tau_fb^2), exp_flow/(2 tau_flow^2), noise G, low-pass e2
     float taps[16];            // centre first, symmetric
+    float z0, stolg, kshift, shift_on;   // photometric floor; shift tol (guide px); 1/(2 tau_s^2); 0/1
+    uint zrad, _q0, _q1, _q2;            // box radius of the z mean
 };
 
 inline uint ms_cfa(constant MsParams& p, uint i, uint j) {
@@ -3644,6 +3646,7 @@ kernel void ms_robust(device const float* Lc [[buffer(0)]],
                       device const float* tflow [[buffer(9)]],
                       device float* R [[buffer(10)]],
                       constant MsParams& p [[buffer(11)]],
+                      device float* E [[buffer(12)]],
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.gw || gid.y >= p.gh) return;
     const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
@@ -3671,6 +3674,7 @@ kernel void ms_robust(device const float* Lc [[buffer(0)]],
         const float top = Lp[q] + (Lp[q + 1u] - Lp[q]) * fx;
         const float bot = Lp[q + p.gw] + (Lp[q + p.gw + 1u] - Lp[q + p.gw]) * fx;
         const float e = Lr[o] - (top + (bot - top) * fy);
+        E[c * plane + o] = e;
         const float gxv = gxm[c * plane + o], gyv = gym[c * plane + o];
         const float dxx = Lr[gid.y * p.gw + xp] + Lr[gid.y * p.gw + xm] - 2.f * Lr[o];
         const float dyy = Lr[yp * p.gw + gid.x] + Lr[ym * p.gw + gid.x] - 2.f * Lr[o];
@@ -3679,7 +3683,69 @@ kernel void ms_robust(device const float* Lc [[buffer(0)]],
                         gyv * gyv * (s11 + p.sfl) + ei * ei + 1e-10f;
         z += e * e / V;
     }
-    R[o] = z * p.itp2 / 3.f;   // pass 1 output: per-pixel z (see ms_combine)
+    R[o] = z / 3.f;   // pass 1 output: per-pixel z (see ms_combine)
+}
+
+// Pass 1b: coherent residual shift (see robustness_ms.cpp). Horizontal box of the
+// per-pixel LK moments, computed on the fly from the residual E and the reference maps.
+kernel void ms_shift_h(device const float* Z [[buffer(0)]],
+                       device const float* E [[buffer(1)]],
+                       device const float* gxm [[buffer(2)]],
+                       device const float* gym [[buffer(3)]],
+                       device const float* vn [[buffer(4)]],
+                       device float* M [[buffer(5)]],
+                       constant MsParams& p [[buffer(6)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    const int sr = int(p.srad), gw = int(p.gw);
+    float m0 = 0.f, m1 = 0.f, m2 = 0.f, m3 = 0.f, m4 = 0.f;
+    for (int j = -sr; j <= sr; ++j) {
+        const int xx = int(gid.x) + j;
+        if (xx < 0 || xx >= gw) continue;
+        const uint q = gid.y * p.gw + uint(xx);
+        if (Z[q] < 0.f) continue;
+        for (uint c = 0u; c < 3u; ++c) {
+            const float gxv = gxm[c * plane + q], gyv = gym[c * plane + q];
+            const float iv = 1.f / (vn[c * plane + q] + 1e-10f);
+            const float e = E[c * plane + q];
+            m0 += gxv * gxv * iv; m1 += gxv * gyv * iv; m2 += gyv * gyv * iv;
+            m3 += gxv * e * iv;   m4 += gyv * e * iv;
+        }
+    }
+    M[o] = m0; M[plane + o] = m1; M[2u * plane + o] = m2; M[3u * plane + o] = m3; M[4u * plane + o] = m4;
+}
+
+// Vertical box, LK solve, excess-shift significance -> R_shift.
+kernel void ms_shift_v(device const float* M [[buffer(0)]],
+                       device float* Rs [[buffer(1)]],
+                       constant MsParams& p [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    const int sr = int(p.srad), gh = int(p.gh);
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f, s4 = 0.f;
+    for (int i = -sr; i <= sr; ++i) {
+        const int yy = int(gid.y) + i;
+        if (yy < 0 || yy >= gh) continue;
+        const uint q = uint(yy) * p.gw + gid.x;
+        s0 += M[q]; s1 += M[plane + q]; s2 += M[2u * plane + q]; s3 += M[3u * plane + q]; s4 += M[4u * plane + q];
+    }
+    float r = 1.f;
+    const float lam = 1e-3f * (s0 + s2) + 1e-20f;
+    const float a = s0 + lam, b = s1, d = s2 + lam;
+    const float det = a * d - b * b;
+    if (det > 0.f) {
+        const float dx = (d * s3 - b * s4) / det, dy = (a * s4 - b * s3) / det;
+        const float n = sqrt(dx * dx + dy * dy);
+        if (n > p.stolg) {
+            const float ux = dx / n, uy = dy / n;
+            const float hu = p.e2 * (ux * ux * a + 2.f * ux * uy * b + uy * uy * d);
+            const float ex = n - p.stolg;
+            r = exp(-hu * ex * ex * p.kshift);
+        }
+    }
+    Rs[o] = r;
 }
 
 // Pass 2: 3x3 mean of z (in-frame samples only), then the confidence combination.
@@ -3693,6 +3759,7 @@ kernel void ms_combine(device const float* Z [[buffer(0)]],
                        device const float* gxm [[buffer(7)]],
                        device const float* gym [[buffer(8)]],
                        device const float* vn [[buffer(9)]],
+                       device const float* Rs [[buffer(10)]],
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.gw || gid.y >= p.gh) return;
     const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
@@ -3702,10 +3769,11 @@ kernel void ms_combine(device const float* Z [[buffer(0)]],
     const uint to = pty * p.fnx + ptx;
     float zs = 0.f;
     float n = 0.f;
-    for (int i = -1; i <= 1; ++i) {
+    const int zr = int(p.zrad);
+    for (int i = -zr; i <= zr; ++i) {
         const int yy = int(gid.y) + i;
         if (yy < 0 || yy >= int(p.gh)) continue;
-        for (int j = -1; j <= 1; ++j) {
+        for (int j = -zr; j <= zr; ++j) {
             const int xx = int(gid.x) + j;
             if (xx < 0 || xx >= int(p.gw)) continue;
             const float v = Z[uint(yy) * p.gw + uint(xx)];
@@ -3723,24 +3791,61 @@ kernel void ms_combine(device const float* Z [[buffer(0)]],
     }
     G /= 3.f;
     Du /= 3.f;
-    const float Gs = max(0.f, G - 3.f * p.g0);   // signal gradient only (see robustness_ms.cpp)
-    Du *= (G > 0.f) ? Gs / G : 0.f;
-    G = Gs;
-    const float Rp = exp(-0.5f * z * p.exp_p);
+    // 3x3 noise-normalised structure tensor, noise removed from its eigenvalues
+    // (see robustness_ms.cpp): the geometric damage is tr(S E).
+    float s3xx = 0.f, s3xy = 0.f, s3yy = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        const uint yy = uint(clamp(int(gid.y) + i, 0, int(p.gh) - 1));
+        for (int j = -1; j <= 1; ++j) {
+            const uint xx = uint(clamp(int(gid.x) + j, 0, int(p.gw) - 1));
+            const uint q = yy * p.gw + xx;
+            for (uint c = 0u; c < 3u; ++c) {
+                const float gxv = gxm[c * plane + q], gyv = gym[c * plane + q];
+                const float iv = 1.f / (vn[c * plane + q] + 1e-10f);
+                s3xx += gxv * gxv * iv; s3xy += gxv * gyv * iv; s3yy += gyv * gyv * iv;
+            }
+        }
+    }
+    s3xx /= 27.f; s3xy /= 27.f; s3yy /= 27.f;
+    {
+        const float tr = s3xx + s3yy, df = s3xx - s3yy;
+        const float rt = sqrt(0.25f * df * df + s3xy * s3xy);
+        const float l1 = max(0.f, 0.5f * tr + rt - 1.5f * p.g0);
+        const float l2 = max(0.f, 0.5f * tr - rt - 1.5f * p.g0);
+        float vx = s3xy, vy = 0.5f * tr + rt - s3xx;
+        float nv = sqrt(vx * vx + vy * vy);
+        if (!(nv > 1e-20f)) { vx = (s3xx >= s3yy) ? 1.f : 0.f; vy = 1.f - vx; nv = 1.f; }
+        vx /= nv; vy /= nv;
+        s3xx = l1 * vx * vx + l2 * vy * vy;
+        s3xy = (l1 - l2) * vx * vy;
+        s3yy = l1 * vy * vy + l2 * vx * vx;
+    }
+    const float Gs = s3xx + s3yy;
+    Du *= (G > 0.f) ? min(1.f, Gs / G) : 0.f;
+    const float Rp = exp(-0.5f * max(0.f, z - p.z0) * p.itp2 * p.exp_p);
     float tyf = clamp((2.f * float(gid.y) + 0.5f) / float(p.ts) - 0.5f, 0.f, float(p.fny - 1u));
     float txf = clamp((2.f * float(gid.x) + 0.5f) / float(p.ts) - 0.5f, 0.f, float(p.fnx - 1u));
     const uint ty0 = uint(tyf), tx0 = uint(txf);
     const uint ty1 = min(p.fny - 1u, ty0 + 1u), tx1 = min(p.fnx - 1u, tx0 + 1u);
     const float wy = tyf - float(ty0), wx = txf - float(tx0);
-    const float fb0 = efb2[ty0 * p.fnx + tx0] + (efb2[ty0 * p.fnx + tx1] - efb2[ty0 * p.fnx + tx0]) * wx;
-    const float fb1 = efb2[ty1 * p.fnx + tx0] + (efb2[ty1 * p.fnx + tx1] - efb2[ty1 * p.fnx + tx0]) * wx;
-    const float fl0 = eflow[ty0 * p.fnx + tx0] + (eflow[ty0 * p.fnx + tx1] - eflow[ty0 * p.fnx + tx0]) * wx;
-    const float fl1 = eflow[ty1 * p.fnx + tx0] + (eflow[ty1 * p.fnx + tx1] - eflow[ty1 * p.fnx + tx0]) * wx;
+    const uint i00 = 3u * (ty0 * p.fnx + tx0), i01 = 3u * (ty0 * p.fnx + tx1);
+    const uint i10 = 3u * (ty1 * p.fnx + tx0), i11 = 3u * (ty1 * p.fnx + tx1);
+    float tfb[3], tfl[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        const float a0 = efb2[i00 + k] + (efb2[i01 + k] - efb2[i00 + k]) * wx;
+        const float a1 = efb2[i10 + k] + (efb2[i11 + k] - efb2[i10 + k]) * wx;
+        tfb[k] = a0 + (a1 - a0) * wy;
+        const float b0 = eflow[i00 + k] + (eflow[i01 + k] - eflow[i00 + k]) * wx;
+        const float b1 = eflow[i10 + k] + (eflow[i11 + k] - eflow[i10 + k]) * wx;
+        tfl[k] = b0 + (b1 - b0) * wy;
+    }
     (void)to;
-    const float Rfb = exp(-G * 0.25f * (fb0 + (fb1 - fb0) * wy) * p.kfb);
-    const float Rfl = exp(-G * 0.25f * (fl0 + (fl1 - fl0) * wy) * p.kfl);
+    const float Dfb = 0.25f * (s3xx * tfb[0] + 2.f * s3xy * tfb[1] + s3yy * tfb[2]);
+    const float Dfl = 0.25f * (s3xx * tfl[0] + 2.f * s3xy * tfl[1] + s3yy * tfl[2]);
+    const float Rfb = exp(-Dfb * p.kfb);
+    const float Rfl = exp(-Dfl * p.kfl);
     const float Run = exp(-Du * p.ku);
-    const float Rdn = Rp * Rfb;
+    const float Rdn = Rp * Rfb * ((p.shift_on > 0.5f) ? Rs[o] : 1.f);
     const float Rsr = Rdn * Rfl * Run;
     R[o] = clamp(Rsr + (Rdn - Rsr) * flat[o], 0.f, 1.f);
 }

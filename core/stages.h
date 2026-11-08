@@ -119,7 +119,10 @@ void ms_init_reference(const Image& ref_raw, const Config& cfg, RefStats& st);
 void ms_fill_fb_error(FlowField& fwd, const FlowField& bwd, int tile_size);
 // Per-tile geometric errors in raw px^2: E_fb^2 (0 when not measured) and the affine
 // flow-model residual E_flow, [ny][nx] each.
-void ms_tile_errors(const FlowField& flow, std::vector<float>& efb2, std::vector<float>& eflow);
+// Per-tile error TENSORS e e^T (xx, xy, yy; raw px^2), 3 floats per tile, after the
+// dead zone has shrunk each error vector's length.
+void ms_tile_errors(const FlowField& flow, std::vector<float>& efb, std::vector<float>& eflow,
+                    float deadzone = 0.f);
 // The multi-signal R at guide resolution (after the local min). CPU; the Metal twin is
 // ms_compute_robustness_metal.
 Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,

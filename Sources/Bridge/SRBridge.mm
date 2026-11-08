@@ -587,6 +587,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"ms_tau_u"]) cfg.ms_tau_u = tuning[@"ms_tau_u"].floatValue;
     if (tuning[@"ms_flat_k"]) cfg.ms_flat_k = tuning[@"ms_flat_k"].floatValue;
     if (tuning[@"ms_min_window"]) cfg.ms_min_window = std::max(1, tuning[@"ms_min_window"].intValue);
+    if (tuning[@"ms_z_floor"]) cfg.ms_z_floor = tuning[@"ms_z_floor"].floatValue;
+    if (tuning[@"ms_z_radius"]) cfg.ms_z_radius = std::max(0, tuning[@"ms_z_radius"].intValue);
+    if (tuning[@"ms_shift_enabled"]) cfg.ms_shift_enabled = tuning[@"ms_shift_enabled"].boolValue;
+    if (tuning[@"ms_shift_tol"]) cfg.ms_shift_tol = tuning[@"ms_shift_tol"].floatValue;
+    if (tuning[@"ms_tau_shift"]) cfg.ms_tau_shift = tuning[@"ms_tau_shift"].floatValue;
+    if (tuning[@"ms_shift_radius"]) cfg.ms_shift_radius = std::max(1, tuning[@"ms_shift_radius"].intValue);
+    if (tuning[@"ms_geo_deadzone"]) cfg.ms_geo_deadzone = tuning[@"ms_geo_deadzone"].floatValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])

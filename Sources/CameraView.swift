@@ -1131,7 +1131,16 @@ struct CameraView: View {
                             ispRow("Uncertainty tolerance τu", $cam.tuningParams.ms_tau_u, 0.25...20.0, "%.2f")
                             ispRow("Flatness detail SNR", $cam.tuningParams.ms_flat_k, 0.5...20.0, "%.1f")
                             Stepper("Local-min window: \(cam.tuningParams.ms_min_window)", value: $cam.tuningParams.ms_min_window, in: 1...9, step: 2)
-                            Text("Lower τ rejects more. All τ are in noise standard deviations: the geometric signals are judged by the image damage their displacement error would cause (∇L·δ), so a large error in a flat area costs nothing and the same error on an edge is rejected.")
+                            ispRow("Photometric noise floor", $cam.tuningParams.ms_z_floor, 0.0...10.0, "%.1f")
+                            Stepper("Photometric window radius: \(cam.tuningParams.ms_z_radius)", value: $cam.tuningParams.ms_z_radius, in: 0...4)
+                            Toggle("Residual-Shift Test", isOn: $cam.tuningParams.ms_shift_enabled)
+                            if cam.tuningParams.ms_shift_enabled {
+                                ispRow("Shift tolerance (raw px)", $cam.tuningParams.ms_shift_tol, 0.0...1.5, "%.2f")
+                                ispRow("Shift significance τs", $cam.tuningParams.ms_tau_shift, 0.5...10.0, "%.2f")
+                                Stepper("Shift window radius: \(cam.tuningParams.ms_shift_radius)", value: $cam.tuningParams.ms_shift_radius, in: 2...12)
+                            }
+                            ispRow("FB / flow dead zone (raw px)", $cam.tuningParams.ms_geo_deadzone, 0.0...4.0, "%.2f")
+                            Text("Lower τ / tolerance rejects more. The residual-shift test measures the sub-pixel displacement the tile flow missed (edge slips) and rejects it beyond the tolerance; FB and flow-model errors only count beyond the dead zone (blunders). All τ are in noise standard deviations: the geometric signals are judged by the image damage their displacement error would cause (∇L·δ), so a large error in a flat area costs nothing and the same error on an edge is rejected.")
                                 .font(.footnote).foregroundColor(.secondary)
                         }
                         Toggle("IPOL Algorithm 6 (raw-res)", isOn: $cam.tuningParams.robustness_ipol_alg6)
