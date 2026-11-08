@@ -61,7 +61,10 @@ struct FinishHdrParams {
     // Where the scene's log-average lands in linear. The log-average is a
     // geometric mean, so it sits below the median on any scene with large dark
     // regions; 0.20 renders those at a sensible mid tone rather than dark.
-    float auto_key = 0.20f;
+    // Lowered from 0.20 to 0.13: the non-HDR capture is already correctly
+    // exposed, so a high key re-brightens it ~0.5-1 stop and the JPG reads as
+    // over-exposed next to the DNG. 0.13 keeps the capture's own exposure.
+    float auto_key = 0.13f;
     float exposure_ev = 0.f;          // manual trim, in stops
 
     // ---- tone mapping ---------------------------------------------------
@@ -69,11 +72,14 @@ struct FinishHdrParams {
     // detail is carried through untouched and only the range moves.
     // 0 = no change, 1 = the strongest compression this allows (half the
     // distance to middle grey).
-    float shadow_lift = 0.55f;
+    // Lowered 0.55 -> 0.33: a strong shadow lift is what makes the JPG look
+    // flat/milky and brighter than the DNG. Highlights keep their rolloff.
+    float shadow_lift = 0.33f;
     float highlight_rolloff = 0.75f;
     // How much of that base compression to apply. Below 1 the render keeps some
-    // of the original global contrast.
-    float local_strength = 0.85f;
+    // of the original global contrast. Lowered 0.85 -> 0.62 so the render holds
+    // more of the DNG's native contrast (less soft/flat).
+    float local_strength = 0.62f;
     // An S in display space, as a luminance ratio -- applied to luma and
     // re-applied to RGB as one factor, so it cannot rotate hue. Still modest on
     // purpose: the point of the base compression above is that the whole range
@@ -168,8 +174,12 @@ struct FinishHdrParams {
     // Colour-difference-only smoothing. Luminance is preserved exactly, so this
     // removes shadow blotching without touching detail. It is here because the
     // shadow lift above is strong enough to make chroma noise visible.
-    float chroma_denoise = 0.40f;
-    float chroma_denoise_radius = 12.f;   // in full-resolution pixels
+    // Lowered 0.40 -> 0.10 and radius 12 -> 6: at 0.40/12px this box-smears
+    // colour across detail, which is the "smeared/denoised" look vs the DNG.
+    // The burst merge already removes most chroma noise, so a light touch is
+    // enough.
+    float chroma_denoise = 0.10f;
+    float chroma_denoise_radius = 6.f;    // in full-resolution pixels
 };
 
 // Reads the DNG, renders it, and returns interleaved 8-bit sRGB (W*H*3).
