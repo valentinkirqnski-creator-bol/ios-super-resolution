@@ -860,18 +860,15 @@ bool prepare(std::vector<uint16_t>& rgb, int W, int H,
 
 }  // namespace
 
-bool finish_hdr_from_dng(const std::string& dng_path, const FinishHdrParams& p,
-                         std::vector<uint8_t>& out_rgb8, int& W, int& H,
-                         int& orientation_out) {
-    out_rgb8.clear();
-    W = H = 0;
-    orientation_out = 1;
-
-    std::vector<uint16_t> rgb;
-    LinearDngColorInfo info;
-    if (!load_linear_dng_rgb16_info(dng_path, rgb, W, H, info) || W <= 0 || H <= 0)
-        return false;
-    orientation_out = info.orientation;
+// Shared render: prepare() then per-pixel render_pixel() over an interleaved
+// camera-native linear RGB16 buffer. Used by both finish_hdr_from_dng and
+// finish_hdr_from_linear_rgb16 so a DNG and an in-memory buffer render
+// identically.
+static bool finish_hdr_render_rgb16(std::vector<uint16_t>& rgb, int W, int H,
+                                    const LinearDngColorInfo& info,
+                                    const FinishHdrParams& p,
+                                    std::vector<uint8_t>& out_rgb8) {
+    if (W <= 0 || H <= 0) return false;
 
     State st;
     if (!prepare(rgb, W, H, info, p, st)) return false;
@@ -895,6 +892,30 @@ bool finish_hdr_from_dng(const std::string& dng_path, const FinishHdrParams& p,
         }
     });
     return true;
+}
+
+bool finish_hdr_from_dng(const std::string& dng_path, const FinishHdrParams& p,
+                         std::vector<uint8_t>& out_rgb8, int& W, int& H,
+                         int& orientation_out) {
+    out_rgb8.clear();
+    W = H = 0;
+    orientation_out = 1;
+
+    std::vector<uint16_t> rgb;
+    LinearDngColorInfo info;
+    if (!load_linear_dng_rgb16_info(dng_path, rgb, W, H, info) || W <= 0 || H <= 0)
+        return false;
+    orientation_out = info.orientation;
+
+    return finish_hdr_render_rgb16(rgb, W, H, info, p, out_rgb8);
+}
+
+bool finish_hdr_from_linear_rgb16(std::vector<uint16_t>& rgb, int W, int H,
+                                  const LinearDngColorInfo& info,
+                                  const FinishHdrParams& p,
+                                  std::vector<uint8_t>& out_rgb8) {
+    out_rgb8.clear();
+    return finish_hdr_render_rgb16(rgb, W, H, info, p, out_rgb8);
 }
 
 }  // namespace hhsr

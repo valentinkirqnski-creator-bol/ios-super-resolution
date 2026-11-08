@@ -1068,11 +1068,64 @@ static bool GatherRawU16(NSDictionary* frame, int w0, int h0,
     return true;
 }
 
+// Bilinear CFA demosaic of a raw Bayer frame into finish_hdr's input domain:
+// camera-native linear RGB16, black-subtracted and white-normalized to
+// [0,65535], PRE white balance -- exactly what the Wronski LinearRaw DNG stores
+// and finish_hdr renders. Lets the HDR+ merge go through the same DNG->JPEG
+// finish as the Wronski path. The same-colour 3x3 average IS the bilinear
+// Bayer reconstruction (G at an R/B site averages its 4 orthogonal G neighbours;
+// R at a B site its 4 diagonal R neighbours; etc.).
+static void DemosaicHdrBayerToLinearRGB16(const uint16_t* bayer, int W, int H,
+                                          const Config& cfg,
+                                          std::vector<uint16_t>& out_rgb16) {
+    out_rgb16.assign((size_t)W * H * 3u, 0);
+    float black[3], denom[3];
+    for (int c = 0; c < 3; ++c) {
+        black[c] = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+        float d = (float)cfg.white_level - black[c];
+        denom[c] = (d > 1.f && std::isfinite(d)) ? d
+                   : ((cfg.white_level > 0.f) ? (float)cfg.white_level : 65535.f);
+    }
+    const uint8_t cfa00 = cfg.cfa.p[0][0], cfa01 = cfg.cfa.p[0][1],
+                  cfa10 = cfg.cfa.p[1][0], cfa11 = cfg.cfa.p[1][1];
+    auto colorAt = [=](int y, int x) -> int {
+        return (int)((y & 1) ? ((x & 1) ? cfa11 : cfa10)
+                             : ((x & 1) ? cfa01 : cfa00));
+    };
+    hhsr::parallel_rows(H, 0, [&](int y) {
+        auto px = [&](int yy, int xx) -> float {
+            if (xx < 0) xx = 0; else if (xx >= W) xx = W - 1;
+            if (yy < 0) yy = 0; else if (yy >= H) yy = H - 1;
+            return (float)bayer[(size_t)yy * W + xx];
+        };
+        for (int x = 0; x < W; ++x) {
+            float ch[3];
+            for (int tc = 0; tc < 3; ++tc) {
+                if (colorAt(y, x) == tc) { ch[tc] = px(y, x); continue; }
+                float sum = 0.f; int n = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        if (colorAt(y + dy, x + dx) == tc) { sum += px(y + dy, x + dx); ++n; }
+                    }
+                ch[tc] = n > 0 ? sum / (float)n : px(y, x);
+            }
+            size_t o = ((size_t)y * W + x) * 3u;
+            for (int c = 0; c < 3; ++c) {
+                float v = (ch[c] - black[c]) / denom[c] * 65535.f;
+                long iv = std::lround(v);
+                if (iv < 0) iv = 0; else if (iv > 65535) iv = 65535;
+                out_rgb16[o + c] = (uint16_t)iv;
+            }
+        }
+    });
+}
+
 // Shared HDR+ merge tail: build Params from cfg, run the HDR+ pipeline on the
-// given raw-u16 Bayer frames, write the merged Bayer DNG, stash the finished
-// render for JPEG/preview, and return a small sRGB preview. Used by both the
-// capture path (RunHdrPlusFromRawFrames) and the import path
-// (RunHdrPlusFromDNGPaths), so the two produce identical output.
+// given raw-u16 Bayer frames, write the merged Bayer DNG, render the JPEG/preview
+// through the Wronski finish (finish_hdr), stash it, and return a small sRGB
+// preview. Used by both the capture path (RunHdrPlusFromRawFrames) and the import
+// path (RunHdrPlusFromDNGPaths), so the two produce identical output.
 static Image FinishHdrPlusMerge(const std::vector<const uint16_t*>& ptrs,
                                 int OW, int OH, Config& cfg,
                                 const std::string& outPath) {
@@ -1121,8 +1174,39 @@ static Image FinishHdrPlusMerge(const std::vector<const uint16_t*>& ptrs,
                           cfg.orientation, cfg.camera_make,
                           cfg.camera_model.empty() ? std::string("HandheldSR-HDR") : cfg.camera_model);
 
-    // Stash the finished render for the JPEG export + Photos preview.
-    g_hdr_rgb = std::move(finished);
+    // Render the JPEG/preview through the SAME finish as the Wronski DNG->JPEG
+    // path (finish_hdr / the "JPG Look" settings) rather than HDR+'s own
+    // exposure-fusion tone-map, so the two match. Demosaic the merged Bayer into
+    // finish_hdr's camera-native linear domain and build the colour info the way
+    // the Wronski DNG read would (camera-native pre-WB samples; renderer applies
+    // WB + ColorMatrix1). Falls back to HDR+'s own render if finish_hdr fails.
+    std::vector<uint16_t> lin;
+    DemosaicHdrBayerToLinearRGB16(merged.data(), OW, OH, cfg, lin);
+    hhsr::LinearDngColorInfo info;
+    info.has_as_shot_neutral = true;
+    info.has_wb = true;
+    for (int c = 0; c < 3; ++c) {
+        float wbx = cfg.white_balance[c];
+        info.as_shot_neutral[c] = (wbx > 1e-6f && std::isfinite(wbx)) ? (1.f / wbx) : 1.f;
+        info.wb[c] = (wbx > 1e-6f && std::isfinite(wbx)) ? wbx : 1.f;
+    }
+    if (cfg.has_color_matrix) {
+        info.has_color_matrix = true;
+        for (int i = 0; i < 9; ++i) info.color_matrix[i] = cfg.color_matrix[i];
+    }
+    if (cfg.has_cam_to_srgb) {
+        info.has_cam_to_srgb = true;
+        for (int i = 0; i < 9; ++i) info.cam_to_srgb[i] = cfg.cam_to_srgb[i];
+    }
+    info.orientation = cfg.orientation;
+
+    std::vector<uint8_t> jpg_rgb;
+    if (hhsr::finish_hdr_from_linear_rgb16(lin, OW, OH, info, g_hdr, jpg_rgb) &&
+        jpg_rgb.size() == (size_t)OW * (size_t)OH * 3u) {
+        g_hdr_rgb = std::move(jpg_rgb);
+    } else {
+        g_hdr_rgb = std::move(finished);   // fall back to HDR+'s own finish
+    }
     g_hdr_w = OW; g_hdr_h = OH; g_hdr_orientation = cfg.orientation;
     g_hdr_path = outPath;
 

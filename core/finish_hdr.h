@@ -49,6 +49,7 @@
 //     a parameter set to zero.
 //
 #include "types.h"
+#include "dng_writer.h"   // LinearDngColorInfo
 
 #include <cstdint>
 #include <string>
@@ -188,5 +189,17 @@ struct FinishHdrParams {
 bool finish_hdr_from_dng(const std::string& dng_path, const FinishHdrParams& p,
                          std::vector<uint8_t>& out_rgb8, int& W, int& H,
                          int& orientation_out);
+
+// Render an already-demosaiced, camera-native linear RGB buffer through the same
+// path as finish_hdr_from_dng, for callers that hold the pixels in memory (e.g.
+// the HDR+ merge) rather than in a LinearRaw DNG. `rgb` is interleaved RGB16,
+// black-subtracted and white-normalized to [0,65535], PRE white balance; `info`
+// supplies the WB / colour matrix the renderer applies (build it the way
+// load_linear_dng_rgb16_info would for the equivalent DNG). Returns interleaved
+// 8-bit sRGB (W*H*3). `rgb` may be consumed.
+bool finish_hdr_from_linear_rgb16(std::vector<uint16_t>& rgb, int W, int H,
+                                  const LinearDngColorInfo& info,
+                                  const FinishHdrParams& p,
+                                  std::vector<uint8_t>& out_rgb8);
 
 }  // namespace hhsr
