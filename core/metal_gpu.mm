@@ -4,6 +4,8 @@
 #import <Foundation/Foundation.h>
 
 #include "metal_gpu.h"
+#include "cref.h"
+#include "cref_weights.h"
 #include "dng_writer.h"
 #include "debug_utils.h"
 #include "prof.h"
@@ -2686,6 +2688,17 @@ bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
             ref_stats.stds_hires = std::move(vh);
         }
     }
+    return true;
+}
+
+bool metal_fetch_ref_hf_loss(Image& out) {
+    if (!g_rob_ref_hf || g_rob_ref_h <= 0 || g_rob_ref_w <= 0) return false;
+    const size_t bytes = (size_t)g_rob_ref_h * (size_t)g_rob_ref_w * sizeof(float);
+    if (g_rob_ref_hf_bytes != bytes || [g_rob_ref_hf length] < bytes) return false;
+    if (!metal_merge_wait_inflight()) return false;
+    Image m(g_rob_ref_h, g_rob_ref_w, 1);
+    memcpy(m.data.data(), [g_rob_ref_hf contents], bytes);
+    out = std::move(m);
     return true;
 }
 
@@ -6305,6 +6318,93 @@ bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowFi
     memcpy(S_out.data(), [b_S contents], plane * sizeof(float));
     gh = (int)p.gh;
     gw = (int)p.gw;
+    return true;
+  }
+}
+
+// ============================================================================
+// Consensus refiner on the GPU (core/cref.cpp twin; kernels cref_*).
+struct CrefParamsCPU {
+    uint32_t w, h, rows, cin;
+    uint32_t dil, y0, halo, slo;
+    uint32_t srows, out_rows, vlo, vhi;
+    float na, nb, nfr, f0;
+};
+static_assert(sizeof(CrefParamsCPU) == 64, "CrefParamsCPU layout");
+
+bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
+                             const Image& Rg, int n_frames, const Config& cfg, Image& Rout) {
+  @autoreleasepool {
+    if (!kCrefTrained || !metal_gpu_init()) return false;
+    const int h = ref_grey.h, w = ref_grey.w;
+    if (h <= 0 || w <= 0 || comp_aligned.h != h || cons.h != h || Rg.h != h || Rout.h != h ||
+        comp_aligned.w != w || cons.w != w || Rg.w != w || Rout.w != w) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pf = c.pipe("cref_feat"), pc = c.pipe("cref_conv"), ph = c.pipe("cref_head");
+    if (!pf || !pc || !ph) return false;
+    const int band = 256, halo = kCrefHalo;
+    const int max_rows = band + 2 * halo, max_srows = band + 2 * halo + 2;
+    const size_t W = (size_t)w;
+    id<MTLBuffer> b_stg = buf(nullptr, 4 * (size_t)max_srows * W * sizeof(float));
+    id<MTLBuffer> b_F = buf(nullptr, 6 * (size_t)max_rows * W * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, 8 * (size_t)max_rows * W * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, 8 * (size_t)max_rows * W * sizeof(float));
+    id<MTLBuffer> b_out = buf(nullptr, (size_t)band * W * sizeof(float));
+    if (!b_stg || !b_F || !b_A || !b_B || !b_out) return false;
+    const float* Ws[4] = {kCrefW0, kCrefW1, kCrefW2, kCrefW3};
+    const float* Bs[4] = {kCrefB0, kCrefB1, kCrefB2, kCrefB3};
+    const size_t wbytes[4] = {sizeof(kCrefW0), sizeof(kCrefW1), sizeof(kCrefW2), sizeof(kCrefW3)};
+    const float bo = kCrefBO;
+    const Image* src[4] = {&ref_grey, &comp_aligned, &cons, &Rg};
+    for (int y0 = 0; y0 < h; y0 += band) {
+        const int y1 = std::min(h, y0 + band);
+        CrefParamsCPU p{};
+        p.w = (uint32_t)w; p.h = (uint32_t)h;
+        p.rows = (uint32_t)((y1 - y0) + 2 * halo);
+        p.halo = (uint32_t)halo; p.y0 = (uint32_t)y0;
+        const int slo = std::max(0, y0 - halo - 1), shi = std::min(h - 1, y1 + halo);
+        p.slo = (uint32_t)slo; p.srows = (uint32_t)(shi - slo + 1);
+        p.out_rows = (uint32_t)(y1 - y0);
+        p.vlo = (uint32_t)std::max(0, halo - y0);
+        p.vhi = (uint32_t)std::min((int)p.rows - 1, halo + (h - 1 - y0));
+        p.na = std::max(0.f, cfg.alpha_dng[1]);
+        p.nb = std::max(1e-12f, cfg.beta_dng[1]);
+        p.nfr = (float)std::max(1, n_frames);
+        float* stg = (float*)[b_stg contents];
+        for (int pl = 0; pl < 4; ++pl)
+            memcpy(stg + (size_t)pl * p.srows * W, src[pl]->data.data() + (size_t)slo * W,
+                   (size_t)p.srows * W * sizeof(float));
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!cmd || !enc) return false;
+        [enc setBuffer:b_stg offset:0 atIndex:0]; [enc setBuffer:b_F offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, pf, p.w, p.rows);
+        id<MTLBuffer> ins[4] = {b_F, b_A, b_B, b_A};
+        id<MTLBuffer> outs[4] = {b_A, b_B, b_A, b_B};
+        for (int l = 0; l < 4; ++l) {
+            CrefParamsCPU q = p;
+            q.cin = (uint32_t)(l == 0 ? kCrefIn : kCrefCh);
+            q.dil = (uint32_t)kCrefDil[l];
+            [enc setBuffer:ins[l] offset:0 atIndex:0]; [enc setBuffer:outs[l] offset:0 atIndex:1];
+            [enc setBytes:Ws[l] length:wbytes[l] atIndex:2];
+            [enc setBytes:Bs[l] length:kCrefCh * sizeof(float) atIndex:3];
+            [enc setBytes:&q length:sizeof(q) atIndex:4];
+            dispatch2(enc, pc, q.w, q.rows);
+        }
+        [enc setBuffer:b_B offset:0 atIndex:0]; [enc setBuffer:b_F offset:0 atIndex:1];
+        [enc setBuffer:b_out offset:0 atIndex:2];
+        [enc setBytes:kCrefWO length:sizeof(kCrefWO) atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        [enc setBytes:&bo length:sizeof(bo) atIndex:5];
+        dispatch2(enc, ph, p.w, p.out_rows);
+        [enc endEncoding];
+        prof_tag_gpu(cmd, "robustness:cref");
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+        memcpy(Rout.data.data() + (size_t)y0 * W, [b_out contents], (size_t)(y1 - y0) * W * sizeof(float));
+    }
     return true;
   }
 }

@@ -1955,6 +1955,13 @@ struct Config {
     // consensus pre-pass. Darken-only: R' = R * g, g in [0,1]. OFF by default;
     // distinct from robustness_refine_nn_enabled (the older 47-feature net).
     bool  rob_mask_nn_enabled = false;
+    // Consensus refiner (core/cref.h): a ~2.2k-weight CNN that refines the finished
+    // robustness mask (Wronski / Alg. 6 or GCam) from each frame's fine structure vs the
+    // reference AND vs the leave-one-out consensus of the other aligned frames (which
+    // separates sub-pixel slips from aliasing), able to lower or raise the mask. Needs
+    // the consensus pre-pass (decodes + aligns every frame twice) and host-side masks.
+    // No-op until trained weights are compiled in (core/cref_weights.h). OFF by default.
+    bool  cref_enabled = false;
     // tools/robust_nn: learned refinement R = sigmoid(logit(R0) + delta) of the
     // finished analytic mask, ~2.3k params (core/robust_nn_shared.h + _weights.h).
     // Trained on synthetic RAW bursts with exact ground-truth correspondence,

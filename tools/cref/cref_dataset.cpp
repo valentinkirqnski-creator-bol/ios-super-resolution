@@ -1,0 +1,287 @@
+// Consensus-refiner dataset harness (built against the app core, core/cref.h features).
+// For one rendered burst: the app's own alignment, injected tile slips (known), both
+// masks (Wronski / Alg.6 default and GCam), the warped greys + consensus, the cref
+// features, and per raw pixel the ghost size z = |clean_k(p+used) - clean_k(p+gt)| /
+// sigma_q (sigma_q = one-frame quad noise; z = 50 where the pixel is not visible in
+// frame k). Writes crops: per crop int32 {variant, frame, y, x} then f16 planes
+// [kCrefIn + 1][S][S] (features, then z).
+// usage: cref_dataset in.bin out.crops seed [crops_per_frame=16] [S=80]
+#include "stages.h"
+#include "cref.h"
+#include "snr_tuning.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <vector>
+using namespace hhsr;
+
+static uint16_t f2h(float f) {   // IEEE half (round-to-nearest-even), enough for features in [-1,1] and z
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t e = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)sign;
+        m |= 0x800000u;
+        const int sh = 14 - e;
+        uint32_t hm = m >> sh;
+        const uint32_t rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (hm & 1u))) ++hm;
+        return (uint16_t)(sign | hm);
+    }
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+    uint32_t hm = m >> 13;
+    const uint32_t rem = m & 0x1fffu;
+    uint16_t h = (uint16_t)(sign | ((uint32_t)e << 10) | hm);
+    if (rem > 0x1000u || (rem == 0x1000u && (hm & 1u))) ++h;
+    return h;
+}
+
+static float bil(const float* p, int h, int w, float y, float x) {
+    y = std::min(std::max(y, 0.f), (float)(h - 1));
+    x = std::min(std::max(x, 0.f), (float)(w - 1));
+    const int y0 = std::min(h - 2, (int)y), x0 = std::min(w - 2, (int)x);
+    const float fy = y - y0, fx = x - x0;
+    const float* r0 = p + (size_t)y0 * w;
+    const float* r1 = r0 + w;
+    const float t = r0[x0] + (r0[x0 + 1] - r0[x0]) * fx, b = r1[x0] + (r1[x0 + 1] - r1[x0]) * fx;
+    return t + (b - t) * fy;
+}
+
+// The pipeline's warp_comp_grey_to_ref: nearest tile flow, bilinear sample (grey == raw grid).
+static Image warp_grey(const Image& g, const FlowField& f, int ts) {
+    Image o(g.h, g.w, 1);
+    for (int y = 0; y < g.h; ++y) {
+        const int ty = std::min(y / ts, f.ny - 1);
+        for (int x = 0; x < g.w; ++x) {
+            const int tx = std::min(x / ts, f.nx - 1);
+            o.at(y, x) = bil(g.data.data(), g.h, g.w, (float)y + f.dy(ty, tx), (float)x + f.dx(ty, tx));
+        }
+    }
+    return o;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    FILE* fi = std::fopen(argv[1], "rb");
+    if (!fi) return 2;
+    int32_t hi[7];
+    float hf[5];
+    std::fread(hi, 4, 7, fi);
+    std::fread(hf, 4, 5, fi);
+    const int N = hi[0], H = hi[1], W = hi[2], Hg = H / 2, Wg = W / 2;
+    std::vector<Image> raw(N);
+    for (int k = 0; k < N; ++k) {
+        raw[k] = Image(H, W, 1);
+        std::fread(raw[k].data.data(), 4, (size_t)H * W, fi);
+    }
+    std::vector<float> gt((size_t)N * 2 * Hg * Wg), clean((size_t)N * Hg * Wg), vis((size_t)N * Hg * Wg);
+    std::fread(gt.data(), 4, gt.size(), fi);
+    std::fread(clean.data(), 4, clean.size(), fi);
+    std::fread(vis.data(), 4, vis.size(), fi);
+    std::fclose(fi);
+    const uint32_t seed = (uint32_t)std::atoi(argv[3]);
+    const int per_frame = argc > 4 ? std::atoi(argv[4]) : 16;
+    const int S = argc > 5 ? std::atoi(argv[5]) : 80;
+
+    Config cfg;
+    cfg.bayer_mode = true;
+    cfg.cfa.p[0][0] = (uint8_t)hi[3]; cfg.cfa.p[0][1] = (uint8_t)hi[4];
+    cfg.cfa.p[1][0] = (uint8_t)hi[5]; cfg.cfa.p[1][1] = (uint8_t)hi[6];
+    for (int c = 0; c < 3; ++c) { cfg.alpha_dng[c] = hf[0]; cfg.beta_dng[c] = hf[1]; cfg.white_balance[c] = hf[2 + c]; }
+    cfg.has_noise_profile = true;
+    cfg.raw_prewhitened = true;
+    cfg.burst_frame_count = N;
+    cfg.snr_auto_tune = false;            // manual tile size (the app's default 16), no per-burst Monte Carlo
+    cfg.alignment_tile_size = 16;
+    tune_config_snr(raw[0], cfg);
+    const int ts = cfg.bm_tile_sizes.empty() ? 16 : cfg.bm_tile_sizes[0];
+
+    const Image& ref = raw[0];
+    Image ref_grey = compute_grey(ref, cfg.bayer_mode, cfg.grey_method);
+    if (ref_grey.h != H || ref_grey.w != W) { std::fprintf(stderr, "grey not raw-res\n"); return 3; }
+    Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, cfg.grey_tile_size(ts)), cfg.bm_factors);
+
+    // Flows (app aligner) + injected slips, shared by both mask variants.
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> U(0.f, 1.f);
+    std::vector<FlowField> flows(N);
+    std::vector<Image> greys(N);
+    double err_sum = 0; size_t err_n = 0;
+    for (int k = 1; k < N; ++k) {
+        greys[k] = compute_grey(raw[k], cfg.bayer_mode, cfg.grey_method);
+        FlowField f = align(ref_pyr, ref_grey, greys[k], cfg, ts);
+        f = flow_to_raw_tile_grid(f, H, W, greys[k].h, greys[k].w, ts, cfg.r_Mt, cfg.num_threads, cfg.grey_tile_size(ts));
+        flows[k] = f;
+        clear_align_ref_ica_cache();
+        if (std::getenv("CREF_CONV") && k == 1) {
+            std::vector<float> vx, vy;
+            for (int i = 0; i < f.ny * f.nx; ++i) { vx.push_back(f.flow[2 * i]); vy.push_back(f.flow[2 * i + 1]); }
+            std::sort(vx.begin(), vx.end()); std::sort(vy.begin(), vy.end());
+            const size_t m = vx.size();
+            std::fprintf(stderr, "frame1 flow dx p10 %.2f p50 %.2f p90 %.2f | dy p10 %.2f p50 %.2f p90 %.2f | grid %dx%d grey %dx%d ts %d\n",
+                         vx[m / 10], vx[m / 2], vx[m * 9 / 10], vy[m / 10], vy[m / 2], vy[m * 9 / 10], f.nx, f.ny, greys[k].w, greys[k].h, ts);
+        }
+    }
+    if (std::getenv("CREF_CONV")) {   // convention check: app flow vs gt under 4 hypotheses (before slips)
+        double e[4] = {0, 0, 0, 0}; size_t n = 0; std::vector<float> ev, ev_tex;
+        for (int k = 1; k < N; ++k) {
+            const float* gk = gt.data() + (size_t)k * 2 * Hg * Wg;
+            for (int ty = 0; ty < flows[k].ny; ++ty)
+                for (int tx = 0; tx < flows[k].nx; ++tx) {
+                    const int gy = std::min((int)((ty + 0.5f) * ts * 0.5f), Hg - 1), gx = std::min((int)((tx + 0.5f) * ts * 0.5f), Wg - 1);
+                    const float g0 = 2.f * gk[(size_t)gy * Wg + gx], g1 = 2.f * gk[(size_t)Hg * Wg + (size_t)gy * Wg + gx];
+                    const float fx = flows[k].dx(ty, tx), fy = flows[k].dy(ty, tx);
+                    ev.push_back(std::hypot(fx - g0, fy - g1)); e[0] += ev.back();
+                    {   // texture: clean-grey gradient energy over the tile vs the noise variance
+                        const float* c0 = clean.data();
+                        double ge = 0; int cnt = 0;
+                        for (int yy = ty * ts / 2; yy < std::min(Hg - 1, (ty + 1) * ts / 2); ++yy)
+                            for (int xx = tx * ts / 2; xx < std::min(Wg - 1, (tx + 1) * ts / 2); ++xx) {
+                                const float dx = c0[(size_t)yy * Wg + xx + 1] - c0[(size_t)yy * Wg + xx];
+                                const float dy = c0[(size_t)(yy + 1) * Wg + xx] - c0[(size_t)yy * Wg + xx];
+                                ge += dx * dx + dy * dy; ++cnt;
+                            }
+                        const float m = c0[(size_t)gy * Wg + gx];
+                        const double nv = (hf[0] * std::max(0.f, m) + hf[1]) * 0.25;
+                        if (cnt && ge / cnt > 4.0 * nv) ev_tex.push_back(ev.back());
+                    } e[1] += std::hypot(fx + g0, fy + g1);
+                    e[2] += std::hypot(fx - g1, fy - g0); e[3] += std::hypot(fx + g1, fy + g0);
+                    ++n;
+                }
+        }
+        std::sort(ev.begin(), ev.end());
+        std::sort(ev_tex.begin(), ev_tex.end());
+        size_t lt = 0; for (float v : ev_tex) lt += v < 0.5f;
+        if (!ev_tex.empty()) std::fprintf(stderr, "TEXTURED tiles %zu/%zu: err median %.3f frac<0.5 %.3f\n", ev_tex.size(), ev.size(), ev_tex[ev_tex.size() / 2], (double)lt / ev_tex.size());
+        size_t lo = 0; for (float v : ev) lo += v < 0.5f;
+        std::fprintf(stderr, "err median %.3f p90 %.3f frac<0.5 %.3f  ", ev[ev.size() / 2], ev[ev.size() * 9 / 10], (double)lo / ev.size());
+        std::fprintf(stderr, "conv: (+x,+y) %.3f  (-x,-y) %.3f  swapped %.3f  swapped- %.3f\n", e[0] / n, e[1] / n, e[2] / n, e[3] / n);
+    }
+    // Slips: per frame with p 0.7, a fraction 0.05-0.35 of tiles gets a slip of 0.1-3 px (log-uniform), random
+    // angle; plus burst-consistent slips (one per tile, in 40-95% of frames, +-15% jitter) on 5-15% of tiles.
+    const int ny = flows[1].ny, nx = flows[1].nx;
+    std::vector<float> cdx((size_t)ny * nx, 0.f), cdy((size_t)ny * nx, 0.f), cpf((size_t)ny * nx, 0.f);
+    {
+        const float frac = 0.05f + 0.10f * U(rng);
+        for (size_t t = 0; t < cdx.size(); ++t)
+            if (U(rng) < frac) {
+                const float m = std::exp(std::log(0.1f) + U(rng) * (std::log(3.f) - std::log(0.1f)));
+                const float a = 6.2831853f * U(rng);
+                cdx[t] = m * std::cos(a); cdy[t] = m * std::sin(a); cpf[t] = 0.4f + 0.55f * U(rng);
+            }
+    }
+    for (int k = 1; k < N; ++k) {
+        FlowField& f = flows[k];
+        const bool corrupt = U(rng) < 0.7f;
+        const float frac = 0.05f + 0.30f * U(rng);
+        for (int ty = 0; ty < f.ny; ++ty)
+            for (int tx = 0; tx < f.nx; ++tx) {
+                const size_t t = (size_t)ty * f.nx + tx;
+                if (corrupt && U(rng) < frac) {
+                    const float m = std::exp(std::log(0.1f) + U(rng) * (std::log(3.f) - std::log(0.1f)));
+                    const float a = 6.2831853f * U(rng);
+                    f.dx(ty, tx) += m * std::cos(a); f.dy(ty, tx) += m * std::sin(a);
+                }
+                if (cpf[t] > 0.f && U(rng) < cpf[t]) {
+                    const float j = 1.f + 0.15f * (2.f * U(rng) - 1.f);
+                    f.dx(ty, tx) += cdx[t] * j; f.dy(ty, tx) += cdy[t] * j;
+                }
+            }
+    }
+    // Warped greys + consensus (mean of all comparison frames).
+    std::vector<Image> aligned(N);
+    Image cons(H, W, 1);
+    for (int k = 1; k < N; ++k) {
+        aligned[k] = warp_grey(greys[k], flows[k], ts);
+        for (size_t i = 0; i < cons.data.size(); ++i) cons.data[i] += aligned[k].data[i];
+    }
+    for (float& v : cons.data) v /= (float)(N - 1);
+
+    // Ghost size z per raw pixel and frame (same for both variants: the flow is shared).
+    const float a = hf[0], b = hf[1];
+    std::vector<std::vector<float>> Z(N);
+    for (int k = 1; k < N; ++k) {
+        Z[k].assign((size_t)H * W, 0.f);
+        const float* ck = clean.data() + (size_t)k * Hg * Wg;
+        const float* gk = gt.data() + (size_t)k * 2 * Hg * Wg;
+        const float* vk = vis.data() + (size_t)k * Hg * Wg;
+        const float* c0 = clean.data();
+        for (int y = 0; y < H; ++y) {
+            const int ty = std::min(y / ts, ny - 1);
+            for (int x = 0; x < W; ++x) {
+                const int tx = std::min(x / ts, nx - 1);
+                const float gy = (y + 0.5f) * 0.5f - 0.5f, gx = (x + 0.5f) * 0.5f - 0.5f;
+                const float tgx = bil(gk, Hg, Wg, gy, gx), tgy = bil(gk + (size_t)Hg * Wg, Hg, Wg, gy, gx);
+                const float ux = 0.5f * flows[k].dx(ty, tx), uy = 0.5f * flows[k].dy(ty, tx);
+                const float vis_k = bil(vk, Hg, Wg, gy, gx);
+                const float d = bil(ck, Hg, Wg, gy + uy, gx + ux) - bil(ck, Hg, Wg, gy + tgy, gx + tgx);
+                const float m = std::max(0.f, bil(c0, Hg, Wg, gy, gx));
+                const float sq = std::sqrt((a * m + b) * 0.25f);
+                float z = std::fabs(d) / std::max(sq, 1e-6f);
+                if (vis_k < 0.5f) z = 50.f;
+                Z[k][(size_t)y * W + x] = std::min(50.f, z);
+                if (y % 8 == 0 && x % 8 == 0) {
+                    err_sum += std::hypot(2.f * tgx - flows[k].dx(ty, tx), 2.f * tgy - flows[k].dy(ty, tx));
+                    ++err_n;
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, "burst %s N=%d %dx%d ts=%d mean |flow-gt| %.3f raw px\n", argv[1], N, W, H, ts, err_sum / std::max<size_t>(1, err_n));
+
+    FILE* fo = std::fopen(argv[2], "wb");
+    if (!fo) return 4;
+    std::vector<uint16_t> buf((size_t)(kCrefIn + 1) * S * S);
+    size_t ncrops = 0;
+    for (int variant = 0; variant < 2; ++variant) {
+        Config cv = cfg;
+        cv.robustness_gcam_enabled = (variant == 1);
+        RefStats rs = init_robustness(ref, cv);
+        for (int k = 1; k < N; ++k) {
+            FlowField f = flows[k];
+            if (cv.robustness_gcam_enabled) median3x3_tile_flow(f);   // as the pipeline does on the GCam path
+            Image R = compute_robustness(raw[k], rs, f, ts, cv);
+            if (R.h <= 0) continue;
+            Image Rg(H, W, 1);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    Rg.at(y, x) = R.at(std::min(R.h - 1, (int)((int64_t)y * R.h / H)), std::min(R.w - 1, (int)((int64_t)x * R.w / W)));
+            std::vector<float> F;
+            cref_features(ref_grey, aligned[k], cons, N - 1, Rg, cv, 0, H, 0, F);
+            const size_t plane = (size_t)H * W;
+            // Crops: half uniform, half centred on harmful (z > 2) or detailed pixels.
+            std::vector<size_t> hot;
+            for (size_t i = 0; i < plane; i += 7)
+                if (Z[k][i] > 2.f || std::fabs(F[4 * plane + i]) > 0.25f) hot.push_back(i);
+            for (int c = 0; c < per_frame; ++c) {
+                int y0, x0;
+                if ((c & 1) && !hot.empty()) {
+                    const size_t i = hot[(size_t)(U(rng) * hot.size()) % hot.size()];
+                    y0 = (int)(i / W) - S / 2; x0 = (int)(i % W) - S / 2;
+                } else {
+                    y0 = (int)(U(rng) * (H - S)); x0 = (int)(U(rng) * (W - S));
+                }
+                y0 = std::min(H - S, std::max(0, y0)); x0 = std::min(W - S, std::max(0, x0));
+                for (int ch = 0; ch <= kCrefIn; ++ch)
+                    for (int y = 0; y < S; ++y)
+                        for (int x = 0; x < S; ++x) {
+                            const size_t q = (size_t)(y0 + y) * W + (x0 + x);
+                            const float v = ch < kCrefIn ? F[(size_t)ch * plane + q] : Z[k][q];
+                            buf[((size_t)ch * S + y) * S + x] = f2h(v);
+                        }
+                const int32_t hd[4] = {variant, k, y0, x0};
+                std::fwrite(hd, 4, 4, fo);
+                std::fwrite(buf.data(), 2, buf.size(), fo);
+                ++ncrops;
+            }
+        }
+    }
+    std::fclose(fo);
+    std::fprintf(stderr, "wrote %zu crops of %d px\n", ncrops, S);
+    return 0;
+}

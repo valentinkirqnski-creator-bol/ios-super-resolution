@@ -47,6 +47,7 @@ targets:
           - "pipeline.cpp"
           - "pipeline_paths.cpp"
           - "structure_map.cpp"
+          - "cref.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"

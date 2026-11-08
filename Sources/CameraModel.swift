@@ -114,6 +114,8 @@ struct TuningParams: Equatable, Codable {
     var robustness_save_mask: Bool = false
     /// Per-frame structure-tensor map (reference included), saved to Photos.
     var structure_map_save: Bool = false
+    /// Consensus refiner NN (core/cref.h): refines the Wronski / GCam mask using the other frames.
+    var cref_enabled: Bool = false
     /// Codec for the output DNG image strip. Every option is lossless -- the
     /// decoded 16-bit samples are identical to the bit -- so this trades file
     /// size against write cost, never quality.
@@ -570,7 +572,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
-        case robustness_enabled, robustness_save_mask, structure_map_save
+        case robustness_enabled, robustness_save_mask, structure_map_save, cref_enabled
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -656,6 +658,7 @@ struct TuningParams: Equatable, Codable {
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         structure_map_save = try c.decodeIfPresent(Bool.self, forKey: .structure_map_save) ?? structure_map_save
+        cref_enabled = try c.decodeIfPresent(Bool.self, forKey: .cref_enabled) ?? cref_enabled
         // Older presets carry the boolean. Only an explicit `true` is honoured,
         // and it maps to the codec that actually earns the name "lossless".
         //
@@ -2533,6 +2536,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "structure_map_save": NSNumber(value: tuningParams.structure_map_save),
+            "cref_enabled": NSNumber(value: tuningParams.cref_enabled),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),

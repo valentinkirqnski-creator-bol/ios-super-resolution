@@ -511,6 +511,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
     if (tuning[@"structure_map_save"])
         cfg.structure_map_save = tuning[@"structure_map_save"].boolValue;
+    if (tuning[@"cref_enabled"])
+        cfg.cref_enabled = tuning[@"cref_enabled"].boolValue;
     // dng_codec is the current knob (0 = none, 1 = lossless JPEG, 2 = Deflate).
     // dng_lossless_compress is the older boolean and still honoured for saved
     // tuning presets; "lossless" now means the codec that actually earns it.

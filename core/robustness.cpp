@@ -2357,6 +2357,58 @@ static void gcam_structure_match_apply(Image* R, Mask8* m8, const Image& comp_ra
     }
 }
 
+// HF-artifact rejection (Config::hf_artifact_removal_enabled) on the GCam path.
+// The GCam operator returns before the Eq.5-9 paths that hold this rule, so the
+// toggle used to do nothing with GCam on. Same rule as those paths: force the
+// weight to 0 where the reference is almost entirely high-frequency texture
+// (hf_loss > hf_variance_loss_threshold, guide grid) AND the tile's flow is
+// irregular (compute_s's r_Mt test). Applied to whichever grid the mask is on
+// (guide, raw, or the 8-bit merge-res mask) by nearest mapping.
+static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const FlowField& flow,
+                                 int tile_size, const Config& cfg) {
+    const Image& L = rs.hf_loss;
+    if (!cfg.hf_artifact_removal_enabled || L.h <= 0 || L.w <= 0 ||
+        L.data.size() != (size_t)L.h * L.w || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0)
+        return;
+    std::vector<uint32_t> irr;
+    compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, &irr);
+    if (irr.size() != (size_t)flow.ny * flow.nx) return;
+    const int gh = L.h, gw = L.w, nt = cfg.num_threads;
+    std::vector<uint8_t> rej((size_t)gh * gw, 0);
+    bool any = false;
+    for (int y = 0; y < gh; ++y) {
+        const int ty = std::min(flow.ny - 1, std::max(0, (int)((2.f * y + 0.5f) / (f32)tile_size)));
+        for (int x = 0; x < gw; ++x) {
+            const int tx = std::min(flow.nx - 1, std::max(0, (int)((2.f * x + 0.5f) / (f32)tile_size)));
+            if (irr[(size_t)ty * flow.nx + tx] != 0u && L.at(y, x) > cfg.hf_variance_loss_threshold) {
+                rej[(size_t)y * gw + x] = 1;
+                any = true;
+            }
+        }
+    }
+    if (!any) return;
+    auto rej_at = [&](int Y, int X, int H, int W) {
+        const int hy = std::min(gh - 1, (int)(((int64_t)Y * gh) / H));
+        const int hx = std::min(gw - 1, (int)(((int64_t)X * gw) / W));
+        return rej[(size_t)hy * gw + hx] != 0;
+    };
+    if (R && R->h > 0 && R->w > 0 && R->data.size() == (size_t)R->h * R->w * R->c) {
+        Image& M = *R;
+        parallel_rows(M.h, nt, [&](int Y) {
+            for (int X = 0; X < M.w; ++X)
+                if (rej_at(Y, X, M.h, M.w))
+                    for (int ch = 0; ch < M.c; ++ch) M.at(Y, X, ch) = 0.f;
+        });
+    }
+    if (m8 && !m8->empty()) {
+        Mask8& M = *m8;
+        parallel_rows(M.h, nt, [&](int Y) {
+            for (int X = 0; X < M.w; ++X)
+                if (rej_at(Y, X, M.h, M.w)) M.data[(size_t)Y * M.w + X] = 0;
+        });
+    }
+}
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
@@ -2380,6 +2432,9 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
                     if (cfg.gcam_structure_match) gcam_structure_ref(gpu, ref_host, cfg);
                 }
             }
+            // HF-artifact rejection on the GCam path is applied on the host
+            // (gcam_hf_reject_apply), so bring the GPU-resident map across once.
+            if (cfg.hf_artifact_removal_enabled) metal_fetch_ref_hf_loss(gpu.hf_loss);
         }
         return gpu;
     }
@@ -3435,6 +3490,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             if (g.h > 0 && g.w > 0) {
                 if (cfg.gcam_structure_match)
                     gcam_structure_match_apply(&g, nullptr, *craw, ref_stats, flow, tile_size, cfg);
+                gcam_hf_reject_apply(&g, nullptr, ref_stats, flow, tile_size, cfg);
                 return g;
             }
             // GPU twin unavailable -> fall through to the CPU operator below.
@@ -3446,11 +3502,13 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             if (out8 && !out8->empty()) {
                 if (cfg.gcam_structure_match)
                     gcam_structure_match_apply(nullptr, out8, *craw, ref_stats, flow, tile_size, cfg);
+                gcam_hf_reject_apply(nullptr, out8, ref_stats, flow, tile_size, cfg);
                 return Image();
             }
         } else if (r.h > 0 && r.w > 0) {
             if (cfg.gcam_structure_match)
                 gcam_structure_match_apply(&r, nullptr, *craw, ref_stats, flow, tile_size, cfg);
+            gcam_hf_reject_apply(&r, nullptr, ref_stats, flow, tile_size, cfg);
             return r;
         }
     }

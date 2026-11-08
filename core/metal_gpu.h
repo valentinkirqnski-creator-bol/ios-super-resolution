@@ -199,6 +199,11 @@ bool metal_fetch_host_ref_stats(RefStats& ref_stats);
 // shell), so the gcam path calls this to recover the pixels. False if residency is
 // off or the slot has no raw.
 bool metal_fetch_host_raw(Image& out);
+
+// Copy the reference's GPU-resident HF variance-loss map (guide grid, built by
+// init_robustness_metal when hf_artifact_removal_enabled) to the host. The GCam
+// path applies HF rejection on the host, once per burst. False if absent.
+bool metal_fetch_ref_hf_loss(Image& out);
 // Upload a host robustness mask into slot's resident rob slice and mark it ready.
 // The GCam SABRE path returns a host guide-resolution mask; the fused merge reads
 // the GPU rob slot, so this pushes it in (mirrors what the standard resident mask
@@ -238,6 +243,11 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
 //  structure_match_metal: comparison tensor, warped match against the resident
 //    reference, local min -> S (half-res, row-major) read back.
 Image structure_tensor_metal(const Image& raw, const Config& cfg, float sigma);
+// Consensus refiner (core/cref.h) on the GPU: cref_feat / cref_conv / cref_head over
+// 256-row bands with an 8-row halo. Rg / Rout are on the grey grid (host). False when
+// Metal or the kernels are unavailable (the CPU twin then runs).
+bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
+                             const Image& Rg, int n_frames, const Config& cfg, Image& Rout);
 uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma);
 bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
                            int tile_size, const Config& cfg, std::vector<float>& S_out,

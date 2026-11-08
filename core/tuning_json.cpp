@@ -155,6 +155,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("robustness_enabled"))   cfg.robustness_enabled = bv("robustness_enabled");
     if (has("robustness_save_mask")) cfg.robustness_save_mask = bv("robustness_save_mask");
     if (has("structure_map_save")) cfg.structure_map_save = bv("structure_map_save");
+    if (has("cref_enabled")) cfg.cref_enabled = bv("cref_enabled");
     if (has("dng_lossless_compress"))
         cfg.dng_codec = bv("dng_lossless_compress") ? Config::DNG_CODEC_LJPEG : Config::DNG_CODEC_NONE;
     if (has("dng_codec")) cfg.dng_codec = std::max(0, std::min(2, iv("dng_codec")));

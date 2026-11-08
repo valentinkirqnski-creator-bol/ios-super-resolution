@@ -1137,6 +1137,9 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_enabled {
+                        Toggle("Consensus Refiner (NN)", isOn: $cam.tuningParams.cref_enabled)
+                        Text("A small network refines the robustness mask (Wronski or GCam) by comparing each frame's fine structure with the reference AND with the other frames at their motion-compensated positions: real detail (aliasing) agrees with the other frames, a misaligned or moving sample does not. Can lower or raise the mask. Aligns every frame twice. Inactive until a trained model is built in.")
+                            .font(.footnote).foregroundColor(.secondary)
                         ispRow("Threshold t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
                         ispRow("s1 (irregular flow)", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
                         ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")

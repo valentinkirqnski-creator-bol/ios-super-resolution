@@ -15,6 +15,7 @@
 #include "flow_consensus.h"
 #include "isa_prealign.h"
 #include "structure_map.h"
+#include "cref.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1481,7 +1482,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.halftile_refine_enabled ||
                               work.dense_flow_enabled ||
                               work.feat_metric_refine_enabled ||
-                              work.rob_mask_nn_enabled);
+                              work.rob_mask_nn_enabled || work.cref_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1514,7 +1515,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this makes it explicit so the refined host mask is what the banded merge
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
-    frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled &&
+    frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled && !work.cref_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1899,7 +1900,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this same consensus -- lands next. Decodes + aligns every frame again, so
     // it is strictly opt-in. An empty result disables the refine downstream.
     Image mask_nn_consensus;
-    if (work.rob_mask_nn_enabled) {
+    if (work.rob_mask_nn_enabled || work.cref_enabled) {
         const double t_cons = prof_now_ms();
         mask_nn_consensus = compute_mask_nn_consensus(loader, comp_indices, ref_grey,
                                                       ref_pyr, tile_size, cons_ts,
@@ -2207,7 +2208,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // consensus below. Empty consensus (pre-pass skipped/failed, incl. the
         // device path) leaves it empty and the refine no-ops.
         Image mask_nn_aligned_grey;
-        if (work.rob_mask_nn_enabled && mask_nn_consensus.h > 0 && !comp_grey.data.empty())
+        if ((work.rob_mask_nn_enabled || work.cref_enabled) && mask_nn_consensus.h > 0 &&
+            !comp_grey.data.empty())
             mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
                                                          work.num_threads);
         const double t_freeg = prof_now_ms();
@@ -2289,6 +2291,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   frames_resident ? k : -1,
                                                   &rob_accept_frac, &rob8);
             covs = cov_fut.get();
+        }
+        // Consensus refiner (Config::cref_enabled): refine the finished host mask from
+        // this frame's warped grey vs the reference and the leave-one-out consensus.
+        // It can RAISE the mask, so the row activity is recomputed afterwards (the merge
+        // skips rows it believes are all zero). Not on the 8-bit merge-res mask.
+        if (work.cref_enabled && mask_nn_consensus.h > 0 && rob8.empty() &&
+            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
+            rob.h > 0 && rob.data.size() == (size_t)rob.h * rob.w * rob.c) {
+            const double t_cref = prof_now_ms();
+            if (cref_refine(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus,
+                            (int)comp_indices.size(), work))
+                rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
+                                                          work.frame_discard_enabled);
+            prof_add_cpu("comp:cref", prof_now_ms() - t_cref);
         }
         // gcam_sabre_merge_res: the operator wrote the 48MP mask straight into rob8 at
         // 8-bit (~48MB/frame, the raw-res budget) -- no 48MP fp32 mask was ever built,
