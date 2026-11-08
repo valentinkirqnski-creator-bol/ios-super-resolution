@@ -2494,8 +2494,6 @@ final class CameraModel: NSObject, ObservableObject {
                 try? jpeg.write(to: tmp, options: .atomic)
                 maskJPEGs.append(tmp)
             }
-            let savedMask = !maskJPEGs.isEmpty
-            let label = format == .jpg ? "JPG" : "DNG"
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
@@ -2529,12 +2527,9 @@ final class CameraModel: NSObject, ObservableObject {
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = ispThumb
+                    // No success banner above the shutter; only report failures.
                     self.finish(success: success,
-                                message: success
-                                    ? (savedMask
-                                       ? "Saved \(label) + \(maskJPEGs.count) robustness mask\(maskJPEGs.count == 1 ? "" : "s") to Photos"
-                                       : "Saved super-res \(label) to Photos")
-                                    : "Could not save to Photos")
+                                message: success ? "" : "Could not save to Photos")
                 }
                 self.removeBurstDir(burstDir)
                 self.burstDir = nil
