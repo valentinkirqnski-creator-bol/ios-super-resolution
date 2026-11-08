@@ -277,8 +277,8 @@ struct TuningParams: Equatable, Codable {
     // exposure, so those defaults render too bright. Lowered here so the HDR JPG
     // is correctly exposed out of the box; the C++ Params still default to the
     // true HDR+ values so the ported twin stays faithful.
-    var hdrplus_gain: Float = 0.85
-    var hdrplus_compression: Float = 3.0
+    var hdrplus_gain: Float = 0.69
+    var hdrplus_compression: Float = 2.4
 
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one

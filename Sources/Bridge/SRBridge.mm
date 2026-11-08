@@ -271,8 +271,8 @@ static hhsr::FinishHdrParams g_hdr;
 // the normal pipeline's finish_hdr. Defaults match the HDR+ CLI, but the app
 // overrides them from the "HDR Look" settings with lower values suited to a
 // normally-exposed burst (HDR+'s defaults assume an under-exposed one).
-static float g_hdrplus_gain = 1.1f;
-static float g_hdrplus_compression = 3.8f;
+static float g_hdrplus_gain = 0.69f;
+static float g_hdrplus_compression = 2.4f;
 
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only

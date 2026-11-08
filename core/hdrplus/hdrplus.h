@@ -60,9 +60,11 @@ struct Params {
     // sRGB stage computes out_c = sum_r ccm[r*3+c] * in_r (finish.cpp:634).
     // Fill from LibRaw as GetColorCorrectionMatrix: ccm(i,j) = rgb_cam[j][i].
     float ccm[9] = {1,0,0, 0,1,0, 0,0,1};
-    // Tone-map dynamic-range compression and gain (HDRPlus.cpp defaults).
-    float compression = 3.8f;
-    float gain = 1.1f;
+    // Tone-map dynamic-range compression and gain. HDRPlus.cpp ships 3.8/1.1,
+    // but the app shoots at normal exposure, so a lower gain avoids over-bright
+    // output and lower compression keeps more global contrast (app default).
+    float compression = 2.4f;
+    float gain = 0.69f;
 };
 
 // Align + temporally/spatially merge a burst of raw Bayer frames into one
