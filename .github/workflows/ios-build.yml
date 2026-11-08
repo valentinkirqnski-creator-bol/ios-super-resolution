@@ -82,21 +82,37 @@ jobs:
       # ---------------------------------------------------------
       # Install XcodeGen
       # ---------------------------------------------------------
-      - name: Install XcodeGen (prebuilt binary, no Homebrew)
+      - name: Install XcodeGen (prebuilt binary, Homebrew fallback)
         run: |
           set -e
 
-          curl -fsSL \
-            -o xcodegen.zip \
-            https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          # GitHub's release CDN occasionally returns 5xx (e.g. 504). curl -f
+          # turns that into a hard failure and aborts the whole build, so retry
+          # the download (curl's own --retry plus an outer loop that validates
+          # the archive), then fall back to Homebrew if the CDN stays down.
+          XG=""
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --retry-connrefused \
+                 -o xcodegen.zip \
+                 https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip \
+               && [ -s xcodegen.zip ] && unzip -q xcodegen.zip; then
+              XG="$PWD/xcodegen/bin/xcodegen"
+              break
+            fi
+            echo "XcodeGen download attempt $i failed; retrying in 10s..."
+            rm -rf xcodegen.zip xcodegen
+            sleep 10
+          done
 
-          unzip -q xcodegen.zip
+          if [ -z "$XG" ]; then
+            echo "Prebuilt download failed after retries; falling back to Homebrew."
+            brew install xcodegen
+            XG="$(command -v xcodegen)"
+          fi
 
-          chmod +x xcodegen/bin/xcodegen
-
-          echo "XCODEGEN=$PWD/xcodegen/bin/xcodegen" >> "$GITHUB_ENV"
-
-          "$PWD/xcodegen/bin/xcodegen" --version
+          chmod +x "$XG" 2>/dev/null || true
+          echo "XCODEGEN=$XG" >> "$GITHUB_ENV"
+          "$XG" --version
 
       # ---------------------------------------------------------
       # Vendor LibRaw
