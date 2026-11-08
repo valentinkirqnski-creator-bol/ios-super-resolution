@@ -774,8 +774,17 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
     std::vector<double> noise;
     CollectNumbers(FirstValueForKeys(dng, @[@"NoiseProfile"]), noise);
     std::string noise_log;
+    cfg.noise460_alpha = cfg.noise460_beta = -1.f;
     if (noise.size() >= 2) {
         const size_t nplanes = noise.size() / 2u;
+        // 460-main: alpha = sum(values[::2]) / 3, beta = sum(values[1::2]) / 3 over all
+        // planes (iPhone DNGs carry one plane -> alpha / 3, beta / 3).
+        {
+            double sa = 0.0, sb = 0.0;
+            for (size_t i = 0; i + 1 < noise.size(); i += 2) { sa += noise[i]; sb += noise[i + 1]; }
+            cfg.noise460_alpha = (float)(sa / 3.0);
+            cfg.noise460_beta = (float)(sb / 3.0);
+        }
         // Read per-channel [R, G, B] noise without averaging, preserving differences.
         // If fewer than 3 planes, replicate the last one.
         bool ok = true;

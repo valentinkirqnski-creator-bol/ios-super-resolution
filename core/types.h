@@ -317,6 +317,13 @@ struct Config {
     float alpha_dng[3] = {1.80710882e-4f, 1.80710882e-4f, 1.80710882e-4f};
     float beta_dng[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
     bool  has_noise_profile = false;
+    // 460-main super_resolution.process(): alpha = sum(values[::2]) / 3,
+    // beta = sum(values[1::2]) / 3 over ALL NoiseProfile planes -- divided by 3 whatever
+    // the plane count, so a single-plane profile (iPhone DNGs carry one) gives alpha/3,
+    // beta/3. Set by the DNG / frame readers; < 0 = not read (fall back to the per-channel
+    // mean). Used by noise_alpha()/noise_beta() when noise_model_match_460.
+    float noise460_alpha = -1.f;
+    float noise460_beta = -1.f;
 
     // The effective noise model, derived rather than stored.
     //
@@ -382,12 +389,14 @@ struct Config {
         return (n > 0) ? 1.f / (float)n : 1.f;
     }
     float noise_alpha() const {
+        if (noise_model_match_460 && noise460_alpha >= 0.f) return noise460_alpha;
         float s = 0.f;
         for (int c = 0; c < 3; ++c)
             s += alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
         return s / 3.f;
     }
     float noise_beta() const {
+        if (noise_model_match_460 && noise460_beta >= 0.f) return noise460_beta;
         float s = 0.f;
         for (int c = 0; c < 3; ++c) {
             const float g = noise_wb_gain(c);

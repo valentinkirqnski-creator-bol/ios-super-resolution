@@ -974,8 +974,12 @@ static f32 sample_nearest_or_inf(const Image& img, f32 y, f32 x, int ch) {
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
-    // Python OOB: HR[...] = 1/0  (+inf)
-    if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
+    // Out of frame -> +inf (R = 0). LR = (p + 0.5) / 2 - 0.5 for raw position p = y + V,
+    // so p in [0, 2h) <=> LR in [-0.25, h - 0.25). Testing LR >= 0 instead rejected raw
+    // row/column 0 (LR = -0.25, still inside guide pixel 0) even for the reference
+    // itself, which the 5x5 min spread into a 3-pixel dead band on the top/left border.
+    if (!(LR_y >= -0.25f && LR_y < (f32)stats.h - 0.25f &&
+          LR_x >= -0.25f && LR_x < (f32)stats.w - 0.25f))
         return std::numeric_limits<f32>::infinity();
 
     // CUDA round = __nv_llrint: half to even

@@ -1929,7 +1929,10 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
     for (uint ch = 0u; ch < p.nch; ++ch) {
         float val;
-        if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
+        // Raw position y + V in [0, out) <=> LR in [-0.25, in - 0.25) (see robustness.cpp
+        // sample_dogson): LR >= 0 wrongly rejected raw row/column 0.
+        if (!(LR_y >= -0.25f && LR_y < float(p.in_h) - 0.25f &&
+              LR_x >= -0.25f && LR_x < float(p.in_w) - 0.25f)) {
             val = INFINITY;
         } else {
             int center_y = int(rint(LR_y));   // CUDA round: half to even

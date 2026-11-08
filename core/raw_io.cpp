@@ -62,7 +62,9 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
 // Walks IFD0 + SubIFDs (330) + IFD chain. Supports II (LE) and MM (BE) — Apple
 // ProRAW/DNG is often MM; old LE-only path silently fell back to Pixel α/β.
 // alpha_rgb and beta_rgb are output arrays of 3 floats each.
-static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[3], float beta_rgb[3]) {
+static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[3], float beta_rgb[3],
+                                       double* sum_alpha = nullptr, double* sum_beta = nullptr) {
+    double s_alpha = 0.0, s_beta = 0.0;   // over ALL planes (460: sum(values[::2]))
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     uint8_t hdr[8];
@@ -100,6 +102,16 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
         if (std::fseek(f, (long)data_off, SEEK_SET) != 0) return false;
         if (std::fread(bytes.data(), 8, cnt, f) != cnt) return false;
         const uint32_t nplanes = cnt / 2u;
+        s_alpha = 0.0; s_beta = 0.0;
+        for (uint32_t i = 0; i < cnt; ++i) {
+            uint8_t raw8[8];
+            const uint8_t* src = bytes.data() + (size_t)i * 8u;
+            if (le) std::memcpy(raw8, src, 8);
+            else for (int k = 0; k < 8; ++k) raw8[k] = src[7 - k];
+            double d;
+            std::memcpy(&d, raw8, 8);
+            if ((i & 1u) == 0u) s_alpha += d; else s_beta += d;
+        }
         // Read per-channel noise values [R, G, B]. If fewer than 3 planes,
         // replicate the available value to all three channels.
         // The DNG NoiseProfile describes the sensor BEFORE white balance multiplication.
@@ -198,6 +210,8 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
         alpha_rgb[c] = a[c];
         beta_rgb[c] = b[c];
     }
+    if (sum_alpha) *sum_alpha = s_alpha;
+    if (sum_beta) *sum_beta = s_beta;
     return true;
 }
 
@@ -302,11 +316,15 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             na[c] = cfg.alpha_dng[c];
             nb[c] = cfg.beta_dng[c];
         }
-        if (try_read_dng_noise_profile(path, na, nb)) {
+        double sum_a = 0.0, sum_b = 0.0;
+        cfg.noise460_alpha = cfg.noise460_beta = -1.f;
+        if (try_read_dng_noise_profile(path, na, nb, &sum_a, &sum_b)) {
             for (int c = 0; c < 3; ++c) {
                 cfg.alpha_dng[c] = na[c];
                 cfg.beta_dng[c] = nb[c];
             }
+            cfg.noise460_alpha = (float)(sum_a / 3.0);   // 460: sum(values[::2]) / 3
+            cfg.noise460_beta = (float)(sum_b / 3.0);
             cfg.has_noise_profile = true;
             char buf[512];
             std::snprintf(buf, sizeof(buf),
