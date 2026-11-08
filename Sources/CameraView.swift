@@ -22,7 +22,10 @@ struct CameraView: View {
         GeometryReader { geo in
             let topBarH: CGFloat = 88
             let exposureBarH: CGFloat = 58
-            let bottomH: CGFloat = 96
+            // Tall enough that the 78pt shutter sits fully inside the black bar
+            // with a clear margin above it (it is centered below), rather than
+            // flush against the bottom edge of the live preview.
+            let bottomH: CGFloat = 122
             let vfWidth = geo.size.width
             // One value for the space below the controls, used both to reserve
             // it and to apply it. They were computed separately before, and the
@@ -672,6 +675,8 @@ struct CameraView: View {
                     .padding(.bottom, 6)
             }
 
+            Spacer(minLength: 12)
+
             HStack(alignment: .center) {
                 galleryButton
                     .frame(width: 72)
@@ -687,8 +692,9 @@ struct CameraView: View {
             }
             .padding(.horizontal, 28)
 
+            Spacer(minLength: 12)
         }
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(maxHeight: .infinity)
     }
 
     private var flipCameraButton: some View {
