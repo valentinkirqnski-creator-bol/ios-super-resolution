@@ -2362,7 +2362,8 @@ static void gcam_structure_match_apply(Image* R, Mask8* m8, const Image& comp_ra
 // toggle used to do nothing with GCam on. Same rule as those paths: force the
 // weight to 0 where the reference is almost entirely high-frequency texture
 // (hf_loss > hf_variance_loss_threshold, guide grid) AND the tile's flow is
-// irregular (compute_s's r_Mt test). Applied to whichever grid the mask is on
+// irregular (compute_s's r_Mt test), spread by Eq. 9's 5x5 guide min exactly as on
+// the Wronski path. Applied to whichever grid the mask is on
 // (guide, raw, or the 8-bit merge-res mask) by nearest mapping.
 static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const FlowField& flow,
                                  int tile_size, const Config& cfg) {
@@ -2387,6 +2388,31 @@ static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const 
         }
     }
     if (!any) return;
+    // Spread like the Wronski path does: there the HF zero is written BEFORE Eq. 9
+    // (2x2 min-reduce to the guide lattice, then a 5x5 min), so every flagged guide
+    // pixel rejects its whole 5x5 guide neighbourhood (~10x10 raw px). Here the GCam
+    // mask is already dilated, so apply that same 5x5 (radius-2) spread to the
+    // reject map itself -- otherwise only the speckled flagged pixels are zeroed.
+    {
+        const int rr = 2;
+        std::vector<uint8_t> t(rej.size(), 0);
+        parallel_rows(gh, nt, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                uint8_t v = 0;
+                for (int j = -rr; j <= rr && !v; ++j)
+                    v = rej[(size_t)y * gw + std::min(gw - 1, std::max(0, x + j))];
+                t[(size_t)y * gw + x] = v;
+            }
+        });
+        parallel_rows(gh, nt, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                uint8_t v = 0;
+                for (int i = -rr; i <= rr && !v; ++i)
+                    v = t[(size_t)std::min(gh - 1, std::max(0, y + i)) * gw + x];
+                rej[(size_t)y * gw + x] = v;
+            }
+        });
+    }
     auto rej_at = [&](int Y, int X, int H, int W) {
         const int hy = std::min(gh - 1, (int)(((int64_t)Y * gh) / H));
         const int hx = std::min(gw - 1, (int)(((int64_t)X * gw) / W));
