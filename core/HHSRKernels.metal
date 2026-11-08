@@ -5062,3 +5062,170 @@ kernel void rnn15_out(device const float* hband [[buffer(0)]],
         R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
     r_out[y * W + x] = R;
 }
+
+
+// ============================================================================
+// Structure tensors (core/structure_map.cpp twin) and the GCam structure-match
+// factor (Config::gcam_structure_match; gcam_structure_match_apply twin). All
+// planes are plane-major: channel ch of half-res pixel o at [ch * gh * gw + o].
+struct SmParams {
+    uint gh, gw, w, ntaps;        // half-res dims; raw row stride; Gaussian taps (centre first)
+    uint ts, fny, fnx, bil;       // tile size; flow grid; bilinear tile flow (gcam_sabre_flow_bilinear)
+    uint mwin_r, _u0, _u1, _u2;   // local-min radius (half-res px)
+    float na, nb, kts, kta;       // DNG noise alpha/beta; 1/tau_strength; 1/tau_angle
+    float ksig, _f0, _f1, _f2;    // noise gate (x noise trace)
+    float taps[16];
+};
+
+// sqrt of the 2x2 quad mean at half-res (y, x), edge-clamped (= the CPU's clamped
+// central-difference neighbours).
+inline float sm_grey(device const float* raw, constant SmParams& p, int y, int x) {
+    y = clamp(y, 0, int(p.gh) - 1);
+    x = clamp(x, 0, int(p.gw) - 1);
+    const uint r0 = uint(2 * y) * p.w + uint(2 * x);
+    const float s = raw[r0] + raw[r0 + 1u] + raw[r0 + p.w] + raw[r0 + p.w + 1u];
+    return sqrt(max(0.f, s * 0.25f));
+}
+
+// Unsmoothed tensor components + per-axis gradient noise variance.
+kernel void sm_tensor(device const float* raw [[buffer(0)]],
+                      device float* J [[buffer(1)]],
+                      constant SmParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int y = int(gid.y), x = int(gid.x);
+    const float gx = 0.5f * (sm_grey(raw, p, y, x + 1) - sm_grey(raw, p, y, x - 1));
+    const float gy = 0.5f * (sm_grey(raw, p, y + 1, x) - sm_grey(raw, p, y - 1, x));
+    const float v = sm_grey(raw, p, y, x);
+    const float m = max(1e-5f, v * v);
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    J[o] = gx * gx;
+    J[plane + o] = gx * gy;
+    J[2u * plane + o] = gy * gy;
+    J[3u * plane + o] = (p.na * m + p.nb) / (32.f * m);
+}
+
+kernel void sm_blur_h(device const float* in [[buffer(0)]],
+                      device float* out [[buffer(1)]],
+                      constant SmParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw;
+    const int r = int(p.ntaps) - 1, W = int(p.gw), x = int(gid.x);
+    for (uint c = 0u; c < 4u; ++c) {
+        device const float* src = in + c * plane + gid.y * p.gw;
+        float s = p.taps[0] * src[x];
+        for (int i = 1; i <= r; ++i) s += p.taps[i] * (src[max(0, x - i)] + src[min(W - 1, x + i)]);
+        out[c * plane + gid.y * p.gw + gid.x] = s;
+    }
+}
+
+kernel void sm_blur_v(device const float* in [[buffer(0)]],
+                      device float* out [[buffer(1)]],
+                      constant SmParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw;
+    const int r = int(p.ntaps) - 1, H = int(p.gh), y = int(gid.y);
+    for (uint c = 0u; c < 4u; ++c) {
+        device const float* src = in + c * plane + gid.x;
+        float s = p.taps[0] * src[uint(y) * p.gw];
+        for (int i = 1; i <= r; ++i)
+            s += p.taps[i] * (src[uint(max(0, y - i)) * p.gw] + src[uint(min(H - 1, y + i)) * p.gw]);
+        out[c * plane + gid.y * p.gw + gid.x] = s;
+    }
+}
+
+// Noise-subtracted strength / coherence / doubled-angle direction of one tensor.
+struct SmDesc { float s, coh, ux, uy; };
+inline SmDesc sm_describe(float a, float b, float d, float nv) {
+    const float rt = sqrt(0.25f * (a - d) * (a - d) + b * b);
+    const float l1 = max(0.f, 0.5f * (a + d) + rt - nv);
+    const float l2 = max(0.f, 0.5f * (a + d) - rt - nv);
+    SmDesc o;
+    o.s = l1 + l2;
+    o.coh = (o.s > 1e-30f) ? (l1 - l2) / o.s : 0.f;
+    if (rt > 1e-30f) { o.ux = 0.5f * (a - d) / rt; o.uy = b / rt; }
+    else { o.ux = 1.f; o.uy = 0.f; }
+    return o;
+}
+
+// Reference tensor vs the comparison tensor at the flow-warped position -> S.
+kernel void sm_match(device const float* Jr [[buffer(0)]],
+                     device const float* Jc [[buffer(1)]],
+                     device const float* flow [[buffer(2)]],
+                     device float* S [[buffer(3)]],
+                     constant SmParams& p [[buffer(4)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    S[o] = 1.f;
+    const float ry = 2.f * float(gid.y) + 0.5f, rx = 2.f * float(gid.x) + 0.5f;
+    float fdx, fdy;
+    if (p.bil != 0u) {
+        const float ty = ry / float(p.ts) - 0.5f, tx = rx / float(p.ts) - 0.5f;
+        const int y0 = int(floor(ty)), x0 = int(floor(tx));
+        const float wy = ty - float(y0), wx = tx - float(x0);
+        const int ay = clamp(y0, 0, int(p.fny) - 1), by = clamp(y0 + 1, 0, int(p.fny) - 1);
+        const int ax = clamp(x0, 0, int(p.fnx) - 1), bx = clamp(x0 + 1, 0, int(p.fnx) - 1);
+        const uint i00 = 2u * uint(ay * int(p.fnx) + ax), i01 = 2u * uint(ay * int(p.fnx) + bx);
+        const uint i10 = 2u * uint(by * int(p.fnx) + ax), i11 = 2u * uint(by * int(p.fnx) + bx);
+        const float tx0 = flow[i00] + (flow[i01] - flow[i00]) * wx;
+        const float tx1 = flow[i10] + (flow[i11] - flow[i10]) * wx;
+        fdx = tx0 + (tx1 - tx0) * wy;
+        const float ty0 = flow[i00 + 1u] + (flow[i01 + 1u] - flow[i00 + 1u]) * wx;
+        const float ty1 = flow[i10 + 1u] + (flow[i11 + 1u] - flow[i10 + 1u]) * wx;
+        fdy = ty0 + (ty1 - ty0) * wy;
+    } else {
+        const int ty = clamp(int(ry / float(p.ts)), 0, int(p.fny) - 1);
+        const int tx = clamp(int(rx / float(p.ts)), 0, int(p.fnx) - 1);
+        const uint t = 2u * uint(ty * int(p.fnx) + tx);
+        fdx = flow[t];
+        fdy = flow[t + 1u];
+    }
+    const float sy = float(gid.y) + 0.5f * fdy, sx = float(gid.x) + 0.5f * fdx;
+    if (!(sy >= 0.f && sy <= float(p.gh - 1u) && sx >= 0.f && sx <= float(p.gw - 1u))) return;
+    const int y0 = min(int(p.gh) - 2, int(sy)), x0 = min(int(p.gw) - 2, int(sx));
+    const float wy = sy - float(y0), wx = sx - float(x0);
+    const uint q = uint(y0) * p.gw + uint(x0);
+    float c[4];
+    for (uint ch = 0u; ch < 4u; ++ch) {
+        device const float* P = Jc + ch * plane;
+        const float top = P[q] + (P[q + 1u] - P[q]) * wx;
+        const float bot = P[q + p.gw] + (P[q + p.gw + 1u] - P[q + p.gw]) * wx;
+        c[ch] = top + (bot - top) * wy;
+    }
+    const float nvr = Jr[3u * plane + o], nvc = c[3];
+    const SmDesc r = sm_describe(Jr[o], Jr[plane + o], Jr[2u * plane + o], nvr);
+    const SmDesc m = sm_describe(c[0], c[1], c[2], nvc);
+    const float noise_tr = nvr + nvc;
+    if (!(max(r.s, m.s) > p.ksig * noise_tr)) return;
+    const float ds = fabs(log((r.s + noise_tr) / (m.s + noise_tr)));
+    const float cos2 = clamp(r.ux * m.ux + r.uy * m.uy, -1.f, 1.f);
+    const float da = sqrt(r.coh * m.coh) * sqrt(max(0.f, 0.5f * (1.f - cos2)));
+    const float e = ds * p.kts, f = da * p.kta;
+    S[o] = exp(-0.5f * (e * e + f * f));
+}
+
+kernel void sm_min_h(device const float* in [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant SmParams& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int r = int(p.mwin_r), W = int(p.gw), x = int(gid.x);
+    device const float* row = in + gid.y * p.gw;
+    float v = 1.f;
+    for (int j = -r; j <= r; ++j) v = min(v, row[min(W - 1, max(0, x + j))]);
+    out[gid.y * p.gw + gid.x] = v;
+}
+
+kernel void sm_min_v(device const float* in [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant SmParams& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int r = int(p.mwin_r), H = int(p.gh), y = int(gid.y);
+    float v = 1.f;
+    for (int i = -r; i <= r; ++i) v = min(v, in[uint(min(H - 1, max(0, y + i))) * p.gw + gid.x]);
+    out[gid.y * p.gw + gid.x] = v;
+}

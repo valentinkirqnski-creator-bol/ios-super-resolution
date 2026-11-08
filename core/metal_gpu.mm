@@ -6130,4 +6130,183 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
     }
 }
 
+// ============================================================================
+// Structure tensors / GCam structure match on the GPU (sm_* kernels). Twins of
+// structure_tensor_half (core/structure_map.cpp) and gcam_structure_match_apply
+// (core/robustness.cpp): same grey, gradients, noise term, Gaussian taps (built
+// here exactly as on the CPU), flow fetch, match formula and local min.
+struct SmParamsCPU {
+    uint32_t gh, gw, w, ntaps;
+    uint32_t ts, fny, fnx, bil;
+    uint32_t mwin_r, u0, u1, u2;
+    float na, nb, kts, kta;
+    float ksig, f0, f1, f2;
+    float taps[16];
+};
+static_assert(sizeof(SmParamsCPU) == 144, "SmParamsCPU layout");
+
+static bool sm_fill_params(SmParamsCPU& p, const Image& raw, const Config& cfg, float sigma) {
+    if (raw.c != 1 || raw.h < 4 || raw.w < 4 ||
+        raw.data.size() < (size_t)raw.h * (size_t)raw.w) return false;
+    p = SmParamsCPU{};
+    p.gh = (uint32_t)(raw.h / 2);
+    p.gw = (uint32_t)(raw.w / 2);
+    p.w = (uint32_t)raw.w;
+    const float s = std::max(0.3f, sigma);
+    const int kr = std::max(1, (int)std::ceil(3.f * s));
+    if (kr + 1 > 16) return false;   // very wide integration scale: CPU twin
+    float k[16];
+    float ks = 0.f;
+    for (int i = 0; i <= kr; ++i) {
+        k[i] = std::exp(-0.5f * (float)(i * i) / (s * s));
+        ks += (i == 0) ? k[0] : 2.f * k[i];
+    }
+    for (int i = 0; i <= kr; ++i) p.taps[i] = k[i] / ks;
+    p.ntaps = (uint32_t)(kr + 1);
+    p.na = std::max(0.f, cfg.alpha_dng[1]);
+    p.nb = std::max(0.f, cfg.beta_dng[1]);
+    return true;
+}
+
+// raw -> smoothed tensor in b_A (4 planes), b_B scratch. Encodes three dispatches.
+static bool sm_encode_tensor(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> b_raw,
+                             id<MTLBuffer> b_A, id<MTLBuffer> b_B, const SmParamsCPU& p) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pt = c.pipe("sm_tensor"), ph = c.pipe("sm_blur_h"),
+        pv = c.pipe("sm_blur_v");
+    if (!pt || !ph || !pv) return false;
+    [enc setBuffer:b_raw offset:0 atIndex:0]; [enc setBuffer:b_B offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pt, p.gw, p.gh);
+    [enc setBuffer:b_B offset:0 atIndex:0]; [enc setBuffer:b_A offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, ph, p.gw, p.gh);
+    [enc setBuffer:b_A offset:0 atIndex:0]; [enc setBuffer:b_B offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pv, p.gw, p.gh);
+    return true;   // result in b_B
+}
+
+struct SmRefGpu {
+    __strong id<MTLBuffer> J = nil;
+    uint32_t gh = 0, gw = 0;
+    uint64_t gen = 0;
+};
+static SmRefGpu g_sm_ref;
+static uint64_t g_sm_gen = 0;
+
+Image structure_tensor_metal(const Image& raw, const Config& cfg, float sigma) {
+  @autoreleasepool {
+    if (!metal_gpu_init()) return Image();
+    SmParamsCPU p;
+    if (!sm_fill_params(p, raw, cfg, sigma)) return Image();
+    auto& c = ctx();
+    const size_t plane = (size_t)p.gh * p.gw;
+    id<MTLBuffer> b_raw = buf(raw.data.data(), (size_t)raw.h * raw.w * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, 4 * plane * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, 4 * plane * sizeof(float));
+    if (!b_raw || !b_A || !b_B) return Image();
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return Image();
+    const bool ok = sm_encode_tensor(enc, b_raw, b_A, b_B, p);
+    [enc endEncoding];
+    if (!ok) return Image();
+    prof_tag_gpu(cmd, "structure:tensor");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+    Image J((int)p.gh, (int)p.gw, 4);
+    const float* src = (const float*)[b_B contents];
+    for (size_t o = 0; o < plane; ++o)
+        for (int ch = 0; ch < 4; ++ch) J.data[o * 4 + (size_t)ch] = src[(size_t)ch * plane + o];
+    return J;
+  }
+}
+
+uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma) {
+  @autoreleasepool {
+    if (!metal_gpu_init()) return 0;
+    SmParamsCPU p;
+    if (!sm_fill_params(p, ref_raw, cfg, sigma)) return 0;
+    auto& c = ctx();
+    const size_t plane = (size_t)p.gh * p.gw;
+    id<MTLBuffer> b_raw = buf(ref_raw.data.data(), (size_t)ref_raw.h * ref_raw.w * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, 4 * plane * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, 4 * plane * sizeof(float));
+    if (!b_raw || !b_A || !b_B) return 0;
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return 0;
+    const bool ok = sm_encode_tensor(enc, b_raw, b_A, b_B, p);
+    [enc endEncoding];
+    if (!ok) return 0;
+    prof_tag_gpu(cmd, "robustness:structure-ref");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return 0;
+    g_sm_ref.J = b_B;   // resident for the burst (replaced by the next reference)
+    g_sm_ref.gh = p.gh;
+    g_sm_ref.gw = p.gw;
+    g_sm_ref.gen = ++g_sm_gen;
+    return g_sm_ref.gen;
+  }
+}
+
+bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
+                           int tile_size, const Config& cfg, std::vector<float>& S_out,
+                           int& gh, int& gw) {
+  @autoreleasepool {
+    gh = gw = 0;
+    if (!metal_gpu_init() || ref_gen == 0 || ref_gen != g_sm_ref.gen || !g_sm_ref.J) return false;
+    if (tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return false;
+    SmParamsCPU p;
+    if (!sm_fill_params(p, comp_raw, cfg, cfg.gcam_structure_sigma)) return false;
+    if (p.gh != g_sm_ref.gh || p.gw != g_sm_ref.gw) return false;
+    p.ts = (uint32_t)tile_size;
+    p.fny = (uint32_t)flow.ny;
+    p.fnx = (uint32_t)flow.nx;
+    p.bil = cfg.gcam_flow_bilinear_active() ? 1u : 0u;
+    p.mwin_r = (uint32_t)std::max(0, cfg.gcam_structure_min_window / 2);
+    p.kts = 1.f / std::max(1e-3f, cfg.gcam_structure_tau_strength);
+    p.kta = 1.f / std::max(1e-3f, cfg.gcam_structure_tau_angle);
+    p.ksig = std::max(0.f, cfg.gcam_structure_noise_k);
+    auto& c = ctx();
+    id<MTLComputePipelineState> pm = c.pipe("sm_match"), pmh = c.pipe("sm_min_h"),
+        pmv = c.pipe("sm_min_v");
+    if (!pm || !pmh || !pmv) return false;
+    const size_t plane = (size_t)p.gh * p.gw;
+    id<MTLBuffer> b_raw = buf(comp_raw.data.data(), (size_t)comp_raw.h * comp_raw.w * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, 4 * plane * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, 4 * plane * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    id<MTLBuffer> b_S = buf(nullptr, plane * sizeof(float));
+    id<MTLBuffer> b_T = buf(nullptr, plane * sizeof(float));
+    if (!b_raw || !b_A || !b_B || !b_flow || !b_S || !b_T) return false;
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return false;
+    if (!sm_encode_tensor(enc, b_raw, b_A, b_B, p)) { [enc endEncoding]; return false; }
+    [enc setBuffer:g_sm_ref.J offset:0 atIndex:0];
+    [enc setBuffer:b_B offset:0 atIndex:1];
+    [enc setBuffer:b_flow offset:0 atIndex:2];
+    [enc setBuffer:b_S offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    dispatch2(enc, pm, p.gw, p.gh);
+    if (p.mwin_r > 0u) {
+        [enc setBuffer:b_S offset:0 atIndex:0]; [enc setBuffer:b_T offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pmh, p.gw, p.gh);
+        [enc setBuffer:b_T offset:0 atIndex:0]; [enc setBuffer:b_S offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pmv, p.gw, p.gh);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:structure-match");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    S_out.resize(plane);
+    memcpy(S_out.data(), [b_S contents], plane * sizeof(float));
+    gh = (int)p.gh;
+    gw = (int)p.gw;
+    return true;
+  }
+}
+
 } // namespace hhsr

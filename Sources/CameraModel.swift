@@ -112,6 +112,8 @@ struct TuningParams: Equatable, Codable {
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
     var robustness_save_mask: Bool = false
+    /// Per-frame structure-tensor map (reference included), saved to Photos.
+    var structure_map_save: Bool = false
     /// Codec for the output DNG image strip. Every option is lossless -- the
     /// decoded 16-bit samples are identical to the bit -- so this trades file
     /// size against write cost, never quality.
@@ -322,6 +324,12 @@ struct TuningParams: Equatable, Codable {
     /// Bilinear motion field: per-tile flow interpolated between tile centres, fetched
     /// by both the merge and the gcam robustness mask. Off by default (both nearest).
     var gcam_sabre_flow_bilinear: Bool = false
+    /// GCam add-on: multiply the mask by a reference-vs-comparison structure-tensor match.
+    var gcam_structure_match: Bool = false
+    var gcam_structure_tau_strength: Float = 0.7
+    var gcam_structure_tau_angle: Float = 0.35
+    var gcam_structure_noise_k: Float = 1.0
+    var gcam_structure_min_window: Int = 3
     /// GCam ComputeGuideImage o_gauss_cov: build the MERGE kernel from the GCam structure
     /// tensor (ConstructGaussianCovariance) instead of estimate_kernels. Opt-in, merge-
     /// critical; the six covariance constants default to the realshot2 2x-SRZ capture
@@ -562,7 +570,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
-        case robustness_enabled, robustness_save_mask
+        case robustness_enabled, robustness_save_mask, structure_map_save
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -579,7 +587,8 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
+             gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -646,6 +655,7 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
+        structure_map_save = try c.decodeIfPresent(Bool.self, forKey: .structure_map_save) ?? structure_map_save
         // Older presets carry the boolean. Only an explicit `true` is honoured,
         // and it maps to the codec that actually earns the name "lossless".
         //
@@ -731,6 +741,11 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_dilate_2x = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_2x) ?? gcam_sabre_dilate_2x
         gcam_sabre_rejection_only = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_rejection_only) ?? gcam_sabre_rejection_only
         gcam_sabre_flow_bilinear = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_flow_bilinear) ?? gcam_sabre_flow_bilinear
+        gcam_structure_match = try c.decodeIfPresent(Bool.self, forKey: .gcam_structure_match) ?? gcam_structure_match
+        gcam_structure_tau_strength = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_tau_strength) ?? gcam_structure_tau_strength
+        gcam_structure_tau_angle = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_tau_angle) ?? gcam_structure_tau_angle
+        gcam_structure_noise_k = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_noise_k) ?? gcam_structure_noise_k
+        gcam_structure_min_window = try c.decodeIfPresent(Int.self, forKey: .gcam_structure_min_window) ?? gcam_structure_min_window
         gcam_sabre_kernel = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_kernel) ?? gcam_sabre_kernel
         gcam_cov_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_cov_scale) ?? gcam_cov_scale
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
@@ -2517,6 +2532,7 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
+            "structure_map_save": NSNumber(value: tuningParams.structure_map_save),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
@@ -2587,6 +2603,11 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_dilate_2x": NSNumber(value: tuningParams.gcam_sabre_dilate_2x),
             "gcam_sabre_rejection_only": NSNumber(value: tuningParams.gcam_sabre_rejection_only),
             "gcam_sabre_flow_bilinear": NSNumber(value: tuningParams.gcam_sabre_flow_bilinear),
+            "gcam_structure_match": NSNumber(value: tuningParams.gcam_structure_match),
+            "gcam_structure_tau_strength": NSNumber(value: tuningParams.gcam_structure_tau_strength),
+            "gcam_structure_tau_angle": NSNumber(value: tuningParams.gcam_structure_tau_angle),
+            "gcam_structure_noise_k": NSNumber(value: tuningParams.gcam_structure_noise_k),
+            "gcam_structure_min_window": NSNumber(value: tuningParams.gcam_structure_min_window),
             "gcam_sabre_kernel": NSNumber(value: tuningParams.gcam_sabre_kernel),
             "gcam_cov_scale": NSNumber(value: tuningParams.gcam_cov_scale),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
@@ -2710,9 +2731,20 @@ final class CameraModel: NSObject, ObservableObject {
                 maskSuffixes.append("_robustness.pgm")
             }
             let base = outURL.deletingPathExtension().path
-            let robURLs = maskSuffixes
+            var robURLs = maskSuffixes
                 .map { URL(fileURLWithPath: base + $0) }
                 .filter { FileManager.default.fileExists(atPath: $0.path) }
+            // Structure maps: one per frame, reference included
+            // (<stem>_structure_fNN[_ref].ppm, written by core/structure_map.cpp).
+            if tuningParams.structure_map_save {
+                let dir = outURL.deletingLastPathComponent()
+                let prefix = outURL.deletingPathExtension().lastPathComponent + "_structure_f"
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+                robURLs += names
+                    .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".ppm") }
+                    .sorted()
+                    .map { dir.appendingPathComponent($0) }
+            }
             saveToPhotos(url: outURL, robustnessMasks: robURLs, preview: preview, burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)

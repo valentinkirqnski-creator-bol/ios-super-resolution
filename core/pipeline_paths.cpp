@@ -14,6 +14,7 @@
 #include "global_homography.h"
 #include "flow_consensus.h"
 #include "isa_prealign.h"
+#include "structure_map.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1662,6 +1663,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // for the whole burst.
     if (frames_resident) metal_set_active_frame(ref_index);
 #endif
+    // Structure maps (Config::structure_map_save): the reference first -- it sets the
+    // burst-wide brightness scale every comparison frame's map then shares. After the
+    // active-frame switch: on the capture path the frame lives only in its GPU slot.
+    float structure_map_scale = 0.f;
+    if (work.structure_map_save) {
+        const double t_sm = prof_now_ms();
+        write_structure_map(ref, work, dng_path, ref_index, true, structure_map_scale);
+        prof_add_cpu("debug:structure-map", prof_now_ms() - t_sm);
+    }
     if (full_res) {
         ref_stats = init_robustness(ref, work);
         ref_covs = estimate_kernels(ref, work);
@@ -1981,6 +1991,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
         }
 #endif
+        // Structure map of this frame (after the active-frame switch, see the reference).
+        if (work.structure_map_save) {
+            const double t_sm = prof_now_ms();
+            write_structure_map(comp, work, dng_path, k, false, structure_map_scale);
+            prof_add_cpu("debug:structure-map", prof_now_ms() - t_sm);
+        }
         const double t_comp_grey = prof_now_ms();
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
         prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);

@@ -509,6 +509,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
+    if (tuning[@"structure_map_save"])
+        cfg.structure_map_save = tuning[@"structure_map_save"].boolValue;
     // dng_codec is the current knob (0 = none, 1 = lossless JPEG, 2 = Deflate).
     // dng_lossless_compress is the older boolean and still honoured for saved
     // tuning presets; "lossless" now means the codec that actually earns it.
@@ -644,6 +646,11 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_dilate_2x"])      cfg.gcam_sabre_dilate_2x = tuning[@"gcam_sabre_dilate_2x"].boolValue;
     if (tuning[@"gcam_sabre_rejection_only"]) cfg.gcam_sabre_rejection_only = tuning[@"gcam_sabre_rejection_only"].boolValue;
     if (tuning[@"gcam_sabre_flow_bilinear"]) cfg.gcam_sabre_flow_bilinear = tuning[@"gcam_sabre_flow_bilinear"].boolValue;
+    if (tuning[@"gcam_structure_match"]) cfg.gcam_structure_match = tuning[@"gcam_structure_match"].boolValue;
+    if (tuning[@"gcam_structure_tau_strength"]) cfg.gcam_structure_tau_strength = tuning[@"gcam_structure_tau_strength"].floatValue;
+    if (tuning[@"gcam_structure_tau_angle"]) cfg.gcam_structure_tau_angle = tuning[@"gcam_structure_tau_angle"].floatValue;
+    if (tuning[@"gcam_structure_noise_k"]) cfg.gcam_structure_noise_k = tuning[@"gcam_structure_noise_k"].floatValue;
+    if (tuning[@"gcam_structure_min_window"]) cfg.gcam_structure_min_window = std::max(1, tuning[@"gcam_structure_min_window"].intValue);
     if (tuning[@"gcam_sabre_kernel"])        cfg.gcam_sabre_kernel = tuning[@"gcam_sabre_kernel"].boolValue;
     if (tuning[@"gcam_cov_scale"])           cfg.gcam_cov_scale = tuning[@"gcam_cov_scale"].floatValue;
     if (tuning[@"robustness_guide_res_bilinear"])

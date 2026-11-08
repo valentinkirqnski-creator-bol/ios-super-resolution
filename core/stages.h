@@ -173,6 +173,12 @@ struct RefStats {
     // lookup. Built once per burst in init_robustness (host, both platforms).
     // Empty on every other path.
     Image gcam_guide;
+    // Config::gcam_structure_match: the reference's half-res structure tensor
+    // (structure_tensor_half: Jxx, Jxy, Jyy, noise), built once per burst on the host.
+    Image gcam_struct;
+    // Non-zero when the reference tensor lives on the GPU instead (structure_ref_tensor_metal;
+    // gcam_struct then carries only h/w/c): the generation the match kernel checks.
+    uint64_t gcam_struct_gpu_gen = 0;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide

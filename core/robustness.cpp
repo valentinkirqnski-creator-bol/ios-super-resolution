@@ -5,6 +5,7 @@
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include "prof.h"
+#include "structure_map.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2201,6 +2202,161 @@ void median3x3_tile_flow(FlowField& flow) {
     flow.flow = std::move(out);
 }
 
+// Structure match (Config::gcam_structure_match): per reference half-res pixel, compare
+// the reference structure tensor with the comparison frame's at the flow-warped position
+// (the same tile vector the GCam operator uses: nearest, or bilinear under
+// gcam_sabre_flow_bilinear), and multiply the finished GCam mask by
+//   S = exp(-0.5 ((D_strength / tau_s)^2 + (D_angle / tau_a)^2)).
+// Each tensor first has its noise part (nv I) removed from the eigenvalues, so
+// strength = l1 + l2 and coherence = (l1 - l2) / (l1 + l2) describe signal only:
+//   D_strength = |ln((s_r + n) / (s_c + n))|, n = the noise trace (flat vs flat = 0)
+//   D_angle    = sqrt(coh_r coh_c) |sin(theta_r - theta_c)|  (only edge-like vs edge-like)
+// and pixels where neither side exceeds noise_k x the noise trace keep S = 1. S is
+// spread by a local min, then mapped onto R's grid (guide-, raw- or merge-res; nearest
+// half-res pixel) or onto the 8-bit merge-res mask.
+// The reference tensor, once per burst: resident on the GPU (only the header kept on
+// the host) when the GCam GPU path is on, else on the host.
+static void gcam_structure_ref(RefStats& st, const Image& ref_raw, const Config& cfg) {
+#ifdef __APPLE__
+    if (cfg.gcam_sabre_gpu) {
+        const uint64_t gen = structure_ref_tensor_metal(ref_raw, cfg, cfg.gcam_structure_sigma);
+        if (gen != 0) {
+            st.gcam_struct = Image();
+            st.gcam_struct.h = ref_raw.h / 2;
+            st.gcam_struct.w = ref_raw.w / 2;
+            st.gcam_struct.c = 4;
+            st.gcam_struct_gpu_gen = gen;
+            return;
+        }
+    }
+#endif
+    st.gcam_struct = structure_tensor_half(ref_raw, cfg, cfg.gcam_structure_sigma);
+    st.gcam_struct_gpu_gen = 0;
+}
+
+static void gcam_structure_match_apply(Image* R, Mask8* m8, const Image& comp_raw,
+                                       const RefStats& rs, const FlowField& flow,
+                                       int tile_size, const Config& cfg) {
+    const Image& Jr = rs.gcam_struct;
+    if (Jr.h <= 0 || Jr.w <= 0 || Jr.c != 4 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0) return;
+    const int gh = Jr.h, gw = Jr.w;
+    const int nt = cfg.num_threads;
+    std::vector<f32> S;
+    bool have_s = false;
+#ifdef __APPLE__
+    // GPU: comparison tensor + match + local min in one command buffer against the
+    // resident reference tensor (sm_* kernels).
+    if (rs.gcam_struct_gpu_gen != 0) {
+        int sh = 0, sw = 0;
+        have_s = structure_match_metal(comp_raw, rs.gcam_struct_gpu_gen, flow, tile_size, cfg, S, sh, sw) &&
+                 sh == gh && sw == gw && S.size() == (size_t)gh * gw;
+        if (!have_s) return;   // reference only on the GPU: nothing to fall back to
+    }
+#endif
+    if (!have_s) {
+    if (Jr.data.size() != (size_t)gh * gw * 4) return;
+    Image Jc = structure_tensor_half(comp_raw, cfg, cfg.gcam_structure_sigma);
+    if (Jc.h != Jr.h || Jc.w != Jr.w || Jc.c != 4) return;
+    const f32 kts = 1.f / std::max(1e-3f, cfg.gcam_structure_tau_strength);
+    const f32 kta = 1.f / std::max(1e-3f, cfg.gcam_structure_tau_angle);
+    const f32 ksig = std::max(0.f, cfg.gcam_structure_noise_k);
+    const bool bil = cfg.gcam_flow_bilinear_active();
+    const std::vector<f32> no_irr;
+    // Noise-subtracted eigen-description of one tensor.
+    struct Desc { f32 s, coh, ux, uy; };
+    auto describe = [](f32 a, f32 b, f32 d, f32 nv) {
+        const f32 rt = std::sqrt(0.25f * (a - d) * (a - d) + b * b);
+        const f32 l1 = std::max(0.f, 0.5f * (a + d) + rt - nv);
+        const f32 l2 = std::max(0.f, 0.5f * (a + d) - rt - nv);
+        Desc o;
+        o.s = l1 + l2;
+        o.coh = (o.s > 1e-30f) ? (l1 - l2) / o.s : 0.f;
+        // doubled-angle unit vector of the dominant gradient direction
+        if (rt > 1e-30f) { o.ux = 0.5f * (a - d) / rt; o.uy = b / rt; }
+        else { o.ux = 1.f; o.uy = 0.f; }
+        return o;
+    };
+    S.assign((size_t)gh * gw, 1.f);
+    parallel_rows(gh, nt, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            const f32 ry = 2.f * (f32)y + 0.5f, rx = 2.f * (f32)x + 0.5f;
+            f32 fdx, fdy;
+            if (bil) {
+                f32 fz;
+                gcam_tile_bilinear(ry, rx, tile_size, flow, no_irr, fdx, fdy, fz);
+            } else {
+                const int ty = std::min(flow.ny - 1, std::max(0, (int)(ry / (f32)tile_size)));
+                const int tx = std::min(flow.nx - 1, std::max(0, (int)(rx / (f32)tile_size)));
+                fdx = flow.dx(ty, tx);
+                fdy = flow.dy(ty, tx);
+            }
+            const f32 sy = (f32)y + 0.5f * fdy, sx = (f32)x + 0.5f * fdx;
+            if (!(sy >= 0.f && sy <= (f32)(gh - 1) && sx >= 0.f && sx <= (f32)(gw - 1))) continue;
+            const int y0 = std::min(gh - 2, (int)sy), x0 = std::min(gw - 2, (int)sx);
+            const f32 wy = sy - (f32)y0, wx = sx - (f32)x0;
+            f32 c[4];
+            for (int ch = 0; ch < 4; ++ch) {
+                const f32 top = Jc.at(y0, x0, ch) + (Jc.at(y0, x0 + 1, ch) - Jc.at(y0, x0, ch)) * wx;
+                const f32 bot = Jc.at(y0 + 1, x0, ch) + (Jc.at(y0 + 1, x0 + 1, ch) - Jc.at(y0 + 1, x0, ch)) * wx;
+                c[ch] = top + (bot - top) * wy;
+            }
+            const f32 nvr = Jr.at(y, x, 3), nvc = c[3];
+            const Desc r = describe(Jr.at(y, x, 0), Jr.at(y, x, 1), Jr.at(y, x, 2), nvr);
+            const Desc m = describe(c[0], c[1], c[2], nvc);
+            const f32 noise_tr = nvr + nvc;   // mean noise trace (2 axes x mean nv)
+            if (!(std::max(r.s, m.s) > ksig * noise_tr)) continue;
+            const f32 ds = std::fabs(std::log((r.s + noise_tr) / (m.s + noise_tr)));
+            const f32 cos2 = std::min(1.f, std::max(-1.f, r.ux * m.ux + r.uy * m.uy));
+            const f32 da = std::sqrt(r.coh * m.coh) * std::sqrt(std::max(0.f, 0.5f * (1.f - cos2)));
+            const f32 e = ds * kts, f = da * kta;
+            S[(size_t)y * gw + x] = std::exp(-0.5f * (e * e + f * f));
+        }
+    });
+    // Spread like the mask's own dilation: separable local min.
+    const int mr = std::max(0, cfg.gcam_structure_min_window / 2);
+    if (mr > 0) {
+        std::vector<f32> T(S.size());
+        parallel_rows(gh, nt, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                f32 v = 1.f;
+                for (int j = -mr; j <= mr; ++j) v = std::min(v, S[(size_t)y * gw + std::min(gw - 1, std::max(0, x + j))]);
+                T[(size_t)y * gw + x] = v;
+            }
+        });
+        parallel_rows(gh, nt, [&](int y) {
+            for (int x = 0; x < gw; ++x) {
+                f32 v = 1.f;
+                for (int i = -mr; i <= mr; ++i) v = std::min(v, T[(size_t)std::min(gh - 1, std::max(0, y + i)) * gw + x]);
+                S[(size_t)y * gw + x] = v;
+            }
+        });
+    }
+    }   // CPU path
+    auto s_at = [&](int Y, int X, int H, int W) {
+        const int hy = std::min(gh - 1, (int)(((int64_t)Y * gh) / H));
+        const int hx = std::min(gw - 1, (int)(((int64_t)X * gw) / W));
+        return S[(size_t)hy * gw + hx];
+    };
+    if (R && R->h > 0 && R->w > 0 && R->data.size() == (size_t)R->h * R->w * R->c) {
+        Image& M = *R;
+        parallel_rows(M.h, nt, [&](int Y) {
+            for (int X = 0; X < M.w; ++X) {
+                const f32 s = s_at(Y, X, M.h, M.w);
+                for (int ch = 0; ch < M.c; ++ch) M.at(Y, X, ch) *= s;
+            }
+        });
+    }
+    if (m8 && !m8->empty()) {
+        Mask8& M = *m8;
+        parallel_rows(M.h, nt, [&](int Y) {
+            for (int X = 0; X < M.w; ++X) {
+                uint8_t& v = M.data[(size_t)Y * M.w + X];
+                v = (uint8_t)std::min(255.f, (f32)v * s_at(Y, X, M.h, M.w) + 0.5f);
+            }
+        });
+    }
+}
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
@@ -2215,11 +2371,14 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         if (cfg.robustness_gcam_enabled) {
             if (ref_raw.data.size() >= (size_t)ref_raw.h * (size_t)ref_raw.w) {
                 gpu.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+                if (cfg.gcam_structure_match) gcam_structure_ref(gpu, ref_raw, cfg);
             } else {
                 Image ref_host;
                 if (metal_fetch_host_raw(ref_host) &&
-                    ref_host.h == ref_raw.h && ref_host.w == ref_raw.w)
+                    ref_host.h == ref_raw.h && ref_host.w == ref_raw.w) {
                     gpu.gcam_guide = compute_gcam_guide(ref_host, cfg, /*prefilter_ref=*/true);
+                    if (cfg.gcam_structure_match) gcam_structure_ref(gpu, ref_host, cfg);
+                }
             }
         }
         return gpu;
@@ -2271,8 +2430,10 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // GCam SABRE (§2): the reference's 4-channel sqrt guide, pre-filtered (§2.10),
     // built once per burst. Read by the operator (CPU) / uploaded by the Metal
     // twin. Other paths leave it empty.
-    if (cfg.robustness_gcam_enabled)
+    if (cfg.robustness_gcam_enabled) {
         st.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+        if (cfg.gcam_structure_match) gcam_structure_ref(st, ref_raw, cfg);
+    }
     return st;
 #endif
 }
@@ -3271,14 +3432,27 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         if (cfg.gcam_sabre_gpu && !want8) {
             Image g = compute_robustness_gcam_sabre_metal(*craw, ref_stats, flow,
                                                           tile_size, cfg, s_select_out);
-            if (g.h > 0 && g.w > 0) return g;
+            if (g.h > 0 && g.w > 0) {
+                if (cfg.gcam_structure_match)
+                    gcam_structure_match_apply(&g, nullptr, *craw, ref_stats, flow, tile_size, cfg);
+                return g;
+            }
             // GPU twin unavailable -> fall through to the CPU operator below.
         }
 #endif
         Image r = compute_robustness_gcam_sabre(*craw, ref_stats, flow, tile_size,
                                                 cfg, s_select_out, want8 ? out8 : nullptr);
-        if (want8) { if (out8 && !out8->empty()) return Image(); }
-        else if (r.h > 0 && r.w > 0) return r;
+        if (want8) {
+            if (out8 && !out8->empty()) {
+                if (cfg.gcam_structure_match)
+                    gcam_structure_match_apply(nullptr, out8, *craw, ref_stats, flow, tile_size, cfg);
+                return Image();
+            }
+        } else if (r.h > 0 && r.w > 0) {
+            if (cfg.gcam_structure_match)
+                gcam_structure_match_apply(&r, nullptr, *craw, ref_stats, flow, tile_size, cfg);
+            return r;
+        }
     }
 
     // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both

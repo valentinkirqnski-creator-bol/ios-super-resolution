@@ -227,6 +227,22 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
                                           const FlowField& flow, int tile_size,
                                           const Config& cfg, Image* s_select_out = nullptr);
 
+// Structure tensors on the GPU (sm_* kernels; twins of core/structure_map.cpp and
+// gcam_structure_match_apply). All take a HOST raw (1-channel Bayer) and return
+// empty / false / 0 when Metal or the kernels are unavailable, so callers fall back
+// to the CPU code.
+//  structure_tensor_metal: half-res tensor read back as Image(h/2, w/2, 4) (the
+//    Structure Map export).
+//  structure_ref_tensor_metal: the reference tensor kept RESIDENT for the burst;
+//    returns its generation (non-zero) for structure_match_metal.
+//  structure_match_metal: comparison tensor, warped match against the resident
+//    reference, local min -> S (half-res, row-major) read back.
+Image structure_tensor_metal(const Image& raw, const Config& cfg, float sigma);
+uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma);
+bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
+                           int tile_size, const Config& cfg, std::vector<float>& S_out,
+                           int& gh, int& gw);
+
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
 // No CPU fallback. Host caches per-frame GPU buffers across bands and batches

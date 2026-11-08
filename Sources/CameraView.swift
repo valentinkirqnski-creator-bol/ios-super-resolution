@@ -1125,6 +1125,9 @@ struct CameraView: View {
                         Text("64").tag(64)
                     }
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
+                    Toggle("Structure Map", isOn: $cam.tuningParams.structure_map_save)
+                    Text("Saves a structure-tensor map of every frame, reference included, to Photos: hue = edge orientation, saturation = how edge-like (vs corner/texture), brightness = structure strength (same scale for all frames). Black = flat.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Robustness Mask")) {
@@ -1227,6 +1230,15 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_gcam_enabled {
+                        Toggle("Structure Match", isOn: $cam.tuningParams.gcam_structure_match)
+                        Text("Also compares the local structure tensor of each comparison frame (at its motion-compensated position) with the reference's: edge direction (weighted by how edge-like both are) and structure strength, counted only where structure is clearly above noise. Mismatches multiply the GCam mask down. Catches moved, appeared or re-textured content and multi-pixel misalignment; a sub-pixel shift of an edge leaves the tensor unchanged, so it does not catch those.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.gcam_structure_match {
+                            ispRow("Strength tolerance (log ratio)", $cam.tuningParams.gcam_structure_tau_strength, 0.1...3.0, "%.2f")
+                            ispRow("Direction tolerance (sin)", $cam.tuningParams.gcam_structure_tau_angle, 0.05...1.0, "%.2f")
+                            ispRow("Noise gate (x noise)", $cam.tuningParams.gcam_structure_noise_k, 0.0...10.0, "%.1f")
+                            Stepper("Spread window: \(cam.tuningParams.gcam_structure_min_window)", value: $cam.tuningParams.gcam_structure_min_window, in: 1...9, step: 2)
+                        }
                         Toggle("Motion Field Bilinear Interpolation", isOn: $cam.tuningParams.gcam_sabre_flow_bilinear)
                         Text("""
                              To eliminate tile-boundary artifacts under rotation or sub-pixel motion, the per-tile motion vectors are bilinearly interpolated across tile centres into a smooth per-pixel motion field. ON: this one continuous field is used both for sample placement in the merge (kernel regression) and for computing the local colour difference in the robustness model, so the mask grades exactly the samples the merge fetches. Off (default) = both use one vector per tile (GCam's nearest flow texture). Dense / affine motion take precedence when they are on. Requires GCam SABRE Robustness.

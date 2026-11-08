@@ -1080,6 +1080,12 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
+    // Structure map (core/structure_map.h): per frame, reference included, write a
+    // colour structure-tensor map beside the DNG (<stem>_structure_fNN[_ref].ppm; the
+    // app saves them to Photos). Hue = edge orientation, saturation = coherence,
+    // brightness = strength (burst-wide scale from the reference). Off by default.
+    bool  structure_map_save = false;
+    float structure_map_sigma = 1.5f;   // tensor integration scale, half-res px
     // ISA-style PER-CHANNEL robustness: a separate weight per R/G/B channel
     // (clamp(s*exp(-d_c^2/sigma_c^2)-t)) instead of the Wronski Eq.6 single
     // channel-summed weight. Each output channel is then merged with its own
@@ -1890,6 +1896,23 @@ struct Config {
     // (GCam's alt_flow_texture is NEAREST). Dense / affine flow still take precedence.
     // Requires robustness_gcam_enabled -- see gcam_flow_bilinear_active().
     bool  gcam_sabre_flow_bilinear = false;
+    // Structure match (GCam robustness add-on, off by default): compare the reference's
+    // structure tensor (core/structure_map.h) with the comparison frame's tensor at the
+    // flow-warped location -- edge-direction mismatch weighted by how edge-like both are
+    // (sqrt(coh_r coh_c) |sin dtheta|), plus |log| of the signal-strength ratio, both on
+    // the noise-subtracted tensors and only where either side has structure clearly
+    // above noise (trace > noise_k x the noise trace). The factor
+    //   S = exp(-0.5 ((D_strength / tau_strength)^2 + (D_angle / tau_angle)^2))
+    // is local-min spread over gcam_structure_min_window half-res px and MULTIPLIES the
+    // finished GCam mask (guide-, raw- or merge-res). Catches moved / appeared /
+    // re-textured content and multi-pixel misalignment; a sub-pixel slip of an edge
+    // leaves the tensor unchanged by construction.
+    bool  gcam_structure_match = false;
+    float gcam_structure_sigma = 1.5f;         // tensor integration scale, half-res px
+    float gcam_structure_tau_strength = 0.7f;  // |log strength ratio| at 1 std (0.7 ~ 2x)
+    float gcam_structure_tau_angle = 0.35f;    // coherence-weighted |sin dtheta| at 1 std (~20 deg)
+    float gcam_structure_noise_k = 1.f;        // structure must exceed k x noise trace to count
+    int   gcam_structure_min_window = 3;       // local-min spread of S (half-res px; 1 = off)
     bool gcam_flow_bilinear_active() const {
         return robustness_enabled && robustness_gcam_enabled && gcam_sabre_flow_bilinear;
     }
