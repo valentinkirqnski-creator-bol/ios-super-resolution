@@ -455,7 +455,11 @@ struct GalleryView: View {
             let fetched = PHAsset.fetchAssets(with: opts)
             var out: [PHAsset] = []
             fetched.enumerateObjects { a, _, _ in out.append(a) }
-            // Flag which images are RAW (DNG) for the RAW filter and badge.
+            // Publish the grid immediately -- do NOT wait on the RAW scan below.
+            DispatchQueue.main.async { assets = out; denied = false }
+            // Flag which images are RAW (DNG) for the RAW filter and badge. This
+            // scans PHAssetResource for every library image, which is slow on a
+            // large library, so it runs after the grid is already on screen.
             var raws: Set<String> = []
             for a in out where a.mediaType == .image {
                 let res = PHAssetResource.assetResources(for: a)
@@ -463,7 +467,7 @@ struct GalleryView: View {
                     raws.insert(a.localIdentifier)
                 }
             }
-            DispatchQueue.main.async { assets = out; rawIDs = raws }
+            DispatchQueue.main.async { rawIDs = raws }
         }
     }
 
