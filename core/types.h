@@ -483,6 +483,48 @@ struct Config {
     float beta_dng[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
     bool  has_noise_profile = false;
 
+    // ---- Match bran (Handheld-Multi-Frame-Super-Resolution-1.4) pipeline ----------
+    // When bran14_active(), process_burst_loader_to_dng hands the whole burst to
+    // process_burst_bran14 (pipeline_paths.cpp): 1.4's super_resolution.process()/main()
+    // end to end -- frame 0 reference, (raw - black) / (white - black) per CFA site with no
+    // white balance, no clip, no exposure match; cfa_to_rggb flip of the burst (BGGR =
+    // 180 deg) and rggb_to_cfa of the output; estimate_image_snr + update_snr_config
+    // (tiles up to 64); align_match_14 alignment; estimate_kernels with the float64 RGBG
+    // GAT; robustness.py with the Monte Carlo noise LUT (noise_lut14.h, generated once
+    // per noise profile and cached); merge_match_14 accumulate with the reference first;
+    // num / den, NaN pixels -> 0. Never used with GCam robustness, which keeps the
+    // regular pipeline.
+    bool  bran14_pipeline = true;
+    // 1.4 kernels.py compute_k has no flat-patch guard: l1 = l2 = 0 gives A = NaN, a NaN
+    // covariance, a NaN merge and a black output pixel (process() zeroes NaN pixels).
+    // false = exactly that. true = the port's guard (isotropic kernel on a flat patch).
+    bool  bran14_flat_kernel_guard = false;
+    // NoiseProfile as 1.4 reads it: float64, expanded to R, G1, B, G2
+    // (expand_noise_profile_to_rgbg). noise14_valid false = tag absent / malformed.
+    double noise14_alpha[4] = {0, 0, 0, 0};
+    double noise14_beta[4]  = {0, 0, 0, 0};
+    bool  noise14_valid = false;
+    // BlackLevel per CFA SITE [row * 2 + col] of the unflipped sensor (rawpy
+    // black_level_per_channel indexed through raw_pattern). black14_valid false -> the
+    // per-colour black_levels are used.
+    float black14_site[4] = {0, 0, 0, 0};
+    bool  black14_valid = false;
+    // Where generated noise LUTs are cached ("" = the system temp directory).
+    std::string noise_lut14_cache_dir;
+    // monte_carlo.py work blocks per chunk = 4 x Numba threads. 8 reproduces a LUT made
+    // on a 2-thread machine (Colab); the curves are statistically the same for any value.
+    int   noise_lut14_blocks = 8;
+    // Set by process_burst_bran14 on its working config: switches estimate_kernels to the
+    // float64 RGBG GAT and the unguarded compute_k (above).
+    bool  bran14_kernels = false;
+    // Run the bran pipeline's alignment and merge on the CPU with 1.4's float64 typing
+    // (Numba promotes parts of ICA and all of accumulate() to double; Metal has no double).
+    // false = Metal for those two stages: the same formulas in float32, much faster.
+    bool  bran14_exact_cpu = false;
+    // update_snr_config's lerps as the Python floats 1.4 hands its kernel (float64);
+    // k_detail / k_denoise / D_th / D_tr above hold the same values rounded to float.
+    double bran14_k_detail = 0.25, bran14_k_denoise = 3.0, bran14_D_th = 0.71, bran14_D_tr = 1.0;
+
     // The effective noise model, derived rather than stored.
     //
     // Both loaders multiply every Bayer site by wb[c]/wb[G] before anything
@@ -1899,6 +1941,10 @@ struct Config {
     bool  gcam_sabre_flow_bilinear = false;
     bool gcam_flow_bilinear_active() const {
         return robustness_enabled && robustness_gcam_enabled && gcam_sabre_flow_bilinear;
+    }
+    // The bran (1.4) pipeline replaces the regular one unless GCam robustness is on.
+    bool bran14_active() const {
+        return bran14_pipeline && bayer_mode && !robustness_gcam_enabled;
     }
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where

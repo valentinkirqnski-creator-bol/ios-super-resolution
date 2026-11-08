@@ -131,6 +131,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("k_detail"))  cfg.k_detail  = fv("k_detail");
     if (has("k_detail_override"))       cfg.k_detail_override       = bv("k_detail_override");
     if (has("merge_match_14"))          cfg.merge_match_14          = bv("merge_match_14");
+    if (has("bran14_pipeline"))         cfg.bran14_pipeline         = bv("bran14_pipeline");
+    if (has("bran14_flat_kernel_guard")) cfg.bran14_flat_kernel_guard = bv("bran14_flat_kernel_guard");
+    if (has("bran14_exact_cpu"))        cfg.bran14_exact_cpu        = bv("bran14_exact_cpu");
     if (has("k_detail_override_value")) cfg.k_detail_override_value = fv("k_detail_override_value");
     if (has("k_denoise")) cfg.k_denoise = fv("k_denoise");
     if (has("k_stretch")) cfg.k_stretch = fv("k_stretch");

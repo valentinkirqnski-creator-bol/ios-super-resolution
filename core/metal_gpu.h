@@ -96,7 +96,7 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
                                  const float site_wb[4],
                                  int src_y0, int src_x0, int out_h, int out_w,
                                  int gpu_slot, bool keep_host,
-                                 Image& out);
+                                 Image& out, bool bran14 = false);
 
 // Alg. 3 FFT grey on GPU. Empty image on failure.
 Image compute_grey_fft_metal(const Image& raw);
@@ -338,5 +338,20 @@ void metal_merge_begin_online(int out_h, int out_w, int nch);
 bool metal_merge_map_online(const float** num, const float** den, size_t* nelem);
 void metal_merge_end_online();
 bool metal_merge_flush_online();
+
+// bran (1.4) pipeline on the GPU (bran14_* kernels; Config::bran14_exact_cpu = false).
+// analyze: the reference (is_ref) keeps its robustness statistics resident and returns
+// its kernel covariances; a comparison frame returns r = local_min(R) (guide res) and its
+// covariances. rp = nullptr skips robustness. false -> the caller runs the CPU twins.
+struct Robustness14Params;
+bool bran14_analyze_metal(const Image& raw, bool is_ref, const FlowField* flow,
+                          const Robustness14Params* rp, const Config& cfg,
+                          Image* r_out, CovField* covs_out);
+bool bran14_flip_metal(Image& img, int mode);
+// Output rows [y0, y0 + bh) of the online accumulator, deflipped, num / den (zero den ->
+// 0 pixel), clipped, 16-bit. *rows valid until the next call.
+bool bran14_encode_online_rows_metal(int y0, int bh, int Hs, int Ws, int flip,
+                                     const Config& cfg, const uint16_t** rows);
+void bran14_metal_release();
 
 } // namespace hhsr

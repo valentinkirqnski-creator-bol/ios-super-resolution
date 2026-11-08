@@ -14,6 +14,8 @@
 #include "global_homography.h"
 #include "flow_consensus.h"
 #include "isa_prealign.h"
+#include "bran14.h"
+#include "noise_lut14.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1249,12 +1251,379 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
     return con;
 }
 
+
+// ============================================================================
+// bran (Handheld-Multi-Frame-Super-Resolution-1.4) pipeline, Config::bran14_active().
+//
+// super_resolution.py process() + main(), stage for stage:
+//   load_dng_burst / get_raw_arrays : frame 0 is the reference; (raw - black) / (white -
+//       black) per CFA site, no white balance, no clip (the loaders honour
+//       bran14_active()); cfa_to_rggb flips every frame to RGGB.
+//   estimate_image_snr + update_snr_config : tile size 16 / 32 / 64 and the kernel lerps.
+//   noise LUT : monte_carlo.generate_noise_lut for the burst's RGBG profile, generated
+//       once per profile and cached (noise_lut14_cached).
+//   main() : FFT grey, circular-padded reference pyramid, align() (align_match_14),
+//       init_robustness, the reference merged FIRST through accumulate with a zero flow
+//       and r = 1 (merge_match_14), then per comparison frame in file order: align,
+//       compute_robustness (bran14.cpp), estimate_kernels (float64 GAT), merge.
+//   divide num / den, NaN pixels -> 0, rggb_to_cfa of the output (and of the summed
+//       robustness), clip to [0, 1] into the 16-bit DNG.
+// On Apple every per-frame stage runs on the GPU: decode (bridge), CFA flip, FFT grey,
+// alignment, robustness + kernel estimation (bran14_analyze_metal), merge and the DNG row
+// encode. Metal has no float64, so those stages are 1.4's formulas in float32 (with
+// cancellation-free rearrangements, see HHSRKernels.metal bran14_*). Config::
+// bran14_exact_cpu instead runs them on the CPU with 1.4's float64 typing -- bit-exact
+// against Numba -- and is what the non-Apple build always does. Once per burst on the
+// CPU: the SNR estimate (a NumPy float32 reduction) and, once per noise profile, the
+// Monte Carlo LUT (Numba's MT19937 stream, float64 sums).
+static Image process_burst_bran14(int n, const RawFrameLoaderFn& loader, const Config& cfg,
+                                  const std::string& dng_path, const ProgressFn& progress,
+                                  int maxPreviewDim) {
+    auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
+    Config work = cfg;
+    // 1.4 config.py defaults for everything the app exposes as an experiment. Kept from
+    // the app: scale, kernel shape + selection law, k_detail override, a manual tile
+    // size, robustness on/off, save mask, crop zoom, DNG codec / colour metadata.
+    work.align_match_14 = true;
+    work.merge_match_14 = true;
+    work.bran14_kernels = true;
+    work.bayer_mode = true;
+    work.grey_method = GreyMethod::FFT;
+    work.bm_factors = {1, 2, 4, 4};
+    work.bm_search_radii = {1, 4, 4, 4};
+    work.bm_metrics = {"L1", "L2", "L2", "L2"};
+    work.coarsest_search_radius_delta = 0;
+    work.ica_n_iter = 3;
+    work.k_stretch = 4.f;
+    work.k_shrink = 2.f;
+    work.gcam_sabre_kernel = false;
+    work.affine_flow_enabled = false;
+    work.merge_backend_d3d11 = false;
+    work.exposure_match_enabled = false;
+    work.burst_frame_count = n;
+    const double r_t = 0.12, r_s1 = 2.0, r_s2 = 12.0, r_Mt = 0.8;
+    const bool rob_on = work.robustness_enabled;
+
+    report("Loading reference (bran 1.4)", 0.02f);
+    clear_align_ref_ica_cache();
+#if defined(__APPLE__)
+    metal_set_grey_force_host(true);
+#endif
+    Image ref = loader(0, work, /*is_reference*/true, 0, 0);
+    if (ref.h <= 1 || ref.w <= 1 || ref.data.empty()) {
+        report("Error: could not load the reference frame", 1.f);
+        return Image();
+    }
+    const int H = ref.h, W = ref.w;
+    const int flip = bran14_flip_mode(work.cfa);
+    if (flip < 0 || (H & 1) || (W & 1)) {
+        report("Error: bran pipeline needs an even-sized Bayer RGGB/BGGR/GBRG/GRBG frame", 1.f);
+        return Image();
+    }
+    work.raw_prewhitened = false;
+    // Per-frame stages on the GPU unless the exact float64 CPU mode is on; each GPU call
+    // falls back to its CPU twin if it fails.
+#if defined(__APPLE__)
+    const bool gpu = !work.bran14_exact_cpu;
+#else
+    const bool gpu = false;
+#endif
+    auto flip_frame = [&](Image& im) {
+#if defined(__APPLE__)
+        if (gpu && bran14_flip_metal(im, flip)) return;
+#endif
+        bran14_flip(im, flip);
+    };
+    flip_frame(ref);
+    const CFA sensor_cfa = work.cfa;
+    work.cfa = CFA();   // RGGB from here on (merge.py "rggb hardcoded")
+
+    // The noise profile, as 1.4 reads it. 1.4 refuses a DNG without one; the app falls
+    // back to the float profile the bridge already has (its documented defaults if none).
+    if (!work.noise14_valid) {
+        const double v[6] = {work.alpha_dng[0], work.beta_dng[0], work.alpha_dng[1],
+                             work.beta_dng[1], work.alpha_dng[2], work.beta_dng[2]};
+        bran14_set_noise_profile(work, v, 6);
+    }
+    const double* alpha = work.noise14_alpha;
+    const double* beta = work.noise14_beta;
+
+    const double snr = bran14_estimate_snr(ref, alpha, beta);
+    const int ts = bran14_update_snr_config(work, snr);
+    {
+        char b[160];
+        std::snprintf(b, sizeof(b), "bran 1.4: SNR %.2f dB, tile %d, k_detail %.4f", snr, ts,
+                      (double)work.k_detail);
+        report(b, 0.04f);
+    }
+
+    const NoiseLut14* lut = nullptr;
+    if (rob_on) {
+        report("Noise LUT (Monte Carlo, cached per profile)", 0.05f);
+        std::string dir = work.noise_lut14_cache_dir;
+        if (dir.empty()) {
+            std::error_code ec;
+            dir = (fs::temp_directory_path(ec) / "hhsr_noise_lut14").string();
+            if (ec) dir.clear();
+        }
+        lut = &noise_lut14_cached(alpha, beta, dir, 1001, 10000000, 0,
+                                  std::max(1, work.noise_lut14_blocks));
+        if (!lut->valid()) {
+            report("Error: noise LUT generation failed", 1.f);
+            return Image();
+        }
+    }
+    Robustness14Params rp;
+    rp.tile_size = ts;
+    rp.noise_correction = true;
+    rp.t = r_t; rp.s1 = r_s1; rp.s2 = r_s2; rp.Mt = r_Mt;
+    if (lut) {
+        rp.sigma_sq_curve = lut->sigma_noise_sq.data();
+        rp.d_sq_curve = lut->d_noise_sq.data();
+        rp.n_curve = lut->bins;
+    }
+    rp.num_threads = work.num_threads;
+
+    // Reference: grey, padded pyramid, local stats, kernels.
+    report("Reference analysis", 0.08f);
+    Image ref_grey = compute_grey_fft(ref);
+    if (ref_grey.data.empty()) {
+        report("Error: FFT grey failed", 1.f);
+        return Image();
+    }
+    Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, ts), work.bm_factors);
+    RefStats14 ref_stats;
+    CovField ref_covs;
+    bool gpu_analyze = false;   // ref statistics resident on the GPU -> comps there too
+#if defined(__APPLE__)
+    if (gpu)
+        gpu_analyze = bran14_analyze_metal(ref, /*is_ref*/true, nullptr, rob_on ? &rp : nullptr,
+                                           work, nullptr, &ref_covs);
+#endif
+    if (!gpu_analyze) {
+        if (rob_on) ref_stats = bran14_init_robustness(ref, work.num_threads);
+        ref_covs = estimate_kernels(ref, work);
+    }
+    if (ref_covs.h <= 0) {
+        report("Error: kernel estimation failed", 1.f);
+        return Image();
+    }
+
+    const int Hs = (int)std::lround(work.scale * (double)H);
+    const int Ws = (int)std::lround(work.scale * (double)W);
+    const int nch = 3;
+    const int gh = H / 2, gw = W / 2;
+    std::vector<double> acc_r;
+    const bool want_mask = rob_on && work.robustness_save_mask;
+    if (want_mask) acc_r.assign((size_t)gh * gw, 0.0);
+
+    // Accumulators. Apple: the Metal online accumulator (whole output, shared memory);
+    // elsewhere host images. Either way every output pixel sums the reference first,
+    // then the comparison frames in order -- 1.4's order.
+    Image num_host, den_host;
+    const bool gpu_merge = gpu;
+    Image num_sink(1, 1, nch), den_sink(1, 1, nch);   // GPU: dims come from the online acc
+    if (!gpu_merge) {
+        num_host = Image(Hs, Ws, nch);
+        den_host = Image(Hs, Ws, nch);
+    }
+#if defined(__APPLE__)
+    if (gpu_merge) {
+        metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
+        metal_merge_begin_online(Hs, Ws, nch);
+    }
+#endif
+    Image& num_acc = gpu_merge ? num_sink : num_host;
+    Image& den_acc = gpu_merge ? den_sink : den_host;
+    merge_ref_band(ref, ref_covs, num_acc, den_acc, 0, work, nullptr);
+    ref_covs = CovField();
+
+    int merged = 0;
+    for (int k = 1; k < n; ++k) {
+        report("Frame " + std::to_string(k) + "/" + std::to_string(n - 1),
+               0.10f + 0.70f * (float)(k - 1) / (float)std::max(1, n - 1));
+        Image comp = loader(k, work, /*is_reference*/false, H, W);
+        if (comp.h != H || comp.w != W || comp.data.empty()) continue;
+        flip_frame(comp);
+        Image comp_grey = compute_grey_fft(comp);
+        if (comp_grey.data.empty()) continue;
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, ts);
+        comp_grey = Image();
+        if (flow.ny <= 0 || flow.nx <= 0) continue;
+        Image rob;
+        CovField covs;
+        bool done = false;
+#if defined(__APPLE__)
+        if (gpu_analyze)
+            done = bran14_analyze_metal(comp, /*is_ref*/false, &flow, rob_on ? &rp : nullptr,
+                                        work, rob_on ? &rob : nullptr, &covs);
+#endif
+        if (!done) {
+            if (rob_on && ref_stats.gh == 0) ref_stats = bran14_init_robustness(ref, work.num_threads);
+            if (rob_on) rob = bran14_compute_robustness(comp, ref_stats, flow, rp);
+            covs = estimate_kernels(comp, work);
+        }
+        if (!rob_on) {
+            rob = Image(gh, gw, 1);
+            std::fill(rob.data.begin(), rob.data.end(), 1.f);
+        }
+        if (rob.data.empty() || covs.h <= 0) continue;
+        if (want_mask) {
+            for (size_t i = 0; i < acc_r.size(); ++i) acc_r[i] += (double)rob.data[i];
+        }
+        if (merge_comp_band(comp, flow, covs, rob, ts, num_acc, den_acc, 0, work, k)) ++merged;
+#if defined(__APPLE__)
+        if (gpu_merge) {
+            if (!metal_merge_flush_online()) {
+                report("Error: GPU merge failed (memory?)", 1.f);
+                metal_merge_end_online();
+                return Image();
+            }
+            metal_merge_release_frame(k);
+        }
+#endif
+    }
+
+    const f32* nump = nullptr;
+    const f32* denp = nullptr;
+    if (!gpu_merge) {
+        nump = num_host.data.data();
+        denp = den_host.data.data();
+    }
+#if defined(__APPLE__)
+    if (gpu_merge && !metal_merge_map_online(&nump, &denp, nullptr)) {
+        report("Error: GPU merge failed (memory?)", 1.f);
+        metal_merge_end_online();
+        return Image();
+    }
+#endif
+
+    report("Writing DNG", 0.82f);
+    DngStreamWriter writer;
+    const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
+    const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
+    const CaptureExif dng_exif = DngStreamWriter::exif_from_config(work);
+    if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
+                     work.has_color_matrix ? work.color_matrix : nullptr,
+                     work.white_balance, work.bake_srgb, make,
+                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
+                     /*pixelsPrewhitened*/ false, work.dng_codec, &dng_exif, work.num_threads)) {
+        report("Error: cannot open output DNG", 1.f);
+#if defined(__APPLE__)
+        if (gpu_merge) metal_merge_end_online();
+#endif
+        return Image();
+    }
+
+    const float pscale = std::min(1.f, (float)maxPreviewDim / (float)std::max(Hs, Ws));
+    const int ph = std::max(1, (int)(Hs * pscale));
+    const int pw = std::max(1, (int)(Ws * pscale));
+    Image preview(ph, pw, 3);
+    const int pstep = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
+    work.cfa = sensor_cfa;
+    const bool bake = work.bake_srgb;
+    const f32* m = work.cam_to_srgb;
+    const f32 wb0 = work.white_balance[0], wb1 = work.white_balance[1], wb2 = work.white_balance[2];
+    auto to_srgb = [](f32 v) {
+        v = clampf(v, 0.f, 1.f);
+        return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+    };
+    const int band_rows = 256;
+    std::vector<uint16_t> row16((size_t)band_rows * Ws * 3u);
+    size_t nan_px = 0;
+    std::mutex nan_mu;
+    for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+        const int bh = std::min(band_rows, Hs - y0);
+#if defined(__APPLE__)
+        // GPU: divide, rggb_to_cfa, clip and 16-bit straight out of the online
+        // accumulator; only the sparse preview samples are read on the host.
+        const uint16_t* gpu_rows = nullptr;
+        if (gpu_merge && bran14_encode_online_rows_metal(y0, bh, Hs, Ws, flip, work, &gpu_rows) &&
+            gpu_rows) {
+            const int first = (pstep - (y0 % pstep)) % pstep;
+            for (int i = first; i < bh; i += pstep) {
+                const int y = y0 + i;
+                const int fy = (flip == 1 || flip == 3) ? Hs - 1 - y : y;
+                for (int x = 0; x < Ws; x += pstep) {
+                    const int fx = (flip == 1 || flip == 2) ? Ws - 1 - x : x;
+                    const size_t o = ((size_t)fy * Ws + fx) * 3u;
+                    f32 c[3] = {0.f, 0.f, 0.f};
+                    if (denp[o] != 0.f && denp[o + 1] != 0.f && denp[o + 2] != 0.f)
+                        for (int ch = 0; ch < 3; ++ch) c[ch] = nump[o + ch] / denp[o + ch];
+                    preview_store_sample(preview, std::min(ph - 1, (int)(y * pscale)),
+                                         std::min(pw - 1, (int)(x * pscale)),
+                                         c[0], c[1], c[2], work, nch);
+                }
+            }
+            writer.write_rows(gpu_rows, bh);
+            report("Writing DNG", 0.82f + 0.15f * (float)(y0 + bh) / (float)Hs);
+            continue;
+        }
+#endif
+        parallel_rows(bh, work.num_threads, [&](int i) {
+            const int y = y0 + i;
+            // rggb_to_cfa: output pixel (y, x) comes from the RGGB-space pixel (fy, fx).
+            const int fy = (flip == 1 || flip == 3) ? Hs - 1 - y : y;
+            size_t local_nan = 0;
+            for (int x = 0; x < Ws; ++x) {
+                const int fx = (flip == 1 || flip == 2) ? Ws - 1 - x : x;
+                const size_t o = ((size_t)fy * Ws + fx) * 3u;
+                // cuda_divide: num / den in float32 (0/0 -> NaN, x/0 -> inf).
+                f32 c[3] = {nump[o] / denp[o], nump[o + 1] / denp[o + 1], nump[o + 2] / denp[o + 2]};
+                if (std::isnan(c[0]) || std::isnan(c[1]) || std::isnan(c[2])) {
+                    c[0] = c[1] = c[2] = 0.f;   // process(): NaN pixels -> [0, 0, 0]
+                    ++local_nan;
+                }
+                f32 v[3];
+                if (bake) {
+                    const f32 wr = c[0] * wb0, wg = c[1] * wb1, wbv = c[2] * wb2;
+                    v[0] = to_srgb(m[0] * wr + m[1] * wg + m[2] * wbv);
+                    v[1] = to_srgb(m[3] * wr + m[4] * wg + m[5] * wbv);
+                    v[2] = to_srgb(m[6] * wr + m[7] * wg + m[8] * wbv);
+                } else {
+                    for (int ch = 0; ch < 3; ++ch) v[ch] = clampf(c[ch], 0.f, 1.f);   // inf -> 1
+                }
+                uint16_t* dst = row16.data() + ((size_t)i * Ws + x) * 3u;
+                for (int ch = 0; ch < 3; ++ch) dst[ch] = (uint16_t)(v[ch] * 65535.f + 0.5f);
+                if ((y % pstep) == 0 && (x % pstep) == 0)
+                    preview_store_sample(preview, std::min(ph - 1, (int)(y * pscale)),
+                                         std::min(pw - 1, (int)(x * pscale)),
+                                         c[0], c[1], c[2], work, nch);
+            }
+            if (local_nan) { std::lock_guard<std::mutex> lk(nan_mu); nan_px += local_nan; }
+        });
+        writer.write_rows(row16.data(), bh);
+        report("Writing DNG", 0.82f + 0.15f * (float)(y0 + bh) / (float)Hs);
+    }
+    writer.close();
+#if defined(__APPLE__)
+    if (gpu_merge) metal_merge_end_online();
+    metal_set_grey_force_host(false);
+    bran14_metal_release();
+#endif
+    clear_align_ref_ica_cache();
+    if (nan_px) report("bran 1.4: " + std::to_string(nan_px) + " NaN pixels set to 0", 0.975f);
+
+    if (want_mask && merged > 0) {
+        Image acc(gh, gw, 1);
+        for (size_t i = 0; i < acc_r.size(); ++i) acc.data[i] = (f32)acc_r[i];
+        bran14_flip(acc, flip);   // rggb_to_cfa(accumulated robustness)
+        if (write_robustness_mask_pgm(acc, n - 1, dng_path, "", H, W))
+            report("Wrote robustness mask", 0.985f);
+    }
+    report(merged > 0 ? "Done (bran 1.4)" : "Done (bran 1.4, reference only)", 1.f);
+    return preview;
+}
+
 } // namespace
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
                                   const Config& cfg, const std::string& dng_path,
                                   const ProgressFn& progress, int maxPreviewDim) {
     if (frame_count < 2 || !loader_in) return Image();
+    // bran (1.4) pipeline replaces everything below unless GCam robustness is on.
+    if (cfg.bran14_active())
+        return process_burst_bran14(frame_count, loader_in, cfg, dng_path, progress, maxPreviewDim);
     // Every frame of the burst comes through this loader (reference, prealign thumbnails, analysis and merge
     // passes), so brightness matching here covers the DNG and ZSL paths alike. The gain is the ratio of the
     // frames' own exposure metadata (shutter x ISO), one gain for all channels; nothing happens when either

@@ -106,7 +106,10 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     }
     if (raw_det) {
         f32 det = xx * yy - xy * xy;
-        if (std::fabs(det) > 1e-10f) {
+        // merge_match_14 (soften off): 1.4 inverts unguarded, inv_det = 1.0 / det
+        // ("invertible by design") -- a flat patch's NaN covariance stays NaN and the
+        // z = max(0, z) clamp then gives it weight 1, as in 1.4.
+        if (!soften || std::fabs(det) > 1e-10f) {
             f32 inv_det = 1.f / det;
             ixx =  inv_det * yy;
             ixy = -inv_det * xy;
@@ -125,6 +128,116 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
+// ---------------------------------------------------------------------------
+// bran (1.4) merge.py accumulate(), with Numba's typing (Config::bran14_kernels on a CPU
+// merge). scale reaches the kernel as a Python float, so lr = (hr + 0.5) / scale, the
+// moved position, the kernel-map position, the covariance lerp (float32 corners, float64
+// fractions), the inverse (unguarded 1.0 / det), the distances, z and exp() are all
+// float64; val / acc are float32 local arrays (+= in float64, stored float32); num / den
+// get float32 adds. The reference goes through the same kernel with a zero flow and
+// r = 1 (super_resolution.main: dummy_alignment / dummy_r).
+
+// CPython / Numba float floor division (float_floor_div): fmod-based, not floor(a / b).
+static inline double py_floordiv(double a, double b) {
+    double mod = std::fmod(a, b);
+    double div = (a - mod) / b;
+    if (mod != 0.0 && ((b < 0) != (mod < 0))) div -= 1.0;
+    double fl;
+    if (div != 0.0) {
+        fl = std::floor(div);
+        if (div - fl > 0.5) fl += 1.0;
+    } else {
+        fl = std::copysign(0.0, a / b);
+    }
+    return fl;
+}
+
+static void accumulate14_exact(const Image& img, const FlowField* flow, const CovField& covs,
+                               const Image* r, int tile_size, Image& num, Image& den, int y0,
+                               const Config& cfg) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int band_h = num.h, Ws = num.w;
+    const int lr_h = img.h, lr_w = img.w;
+    const double scale = (double)cfg.scale;
+    const double ts = (double)tile_size;
+    parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
+        const int hr_i = y0 + local_i;
+        for (int hr_j = 0; hr_j < Ws; ++hr_j) {
+            const double lr_x = ((double)hr_j + 0.5) / scale;
+            const double lr_y = ((double)hr_i + 0.5) / scale;
+            float flowx = 0.f, flowy = 0.f;
+            if (flow) {
+                const int px = (int)py_floordiv(lr_x, ts);
+                const int py = (int)py_floordiv(lr_y, ts);
+                flowx = flow->dx(py, px);
+                flowy = flow->dy(py, px);
+            }
+            float local_r = 1.f;
+            if (r) {
+                const int i_r = std::min((int)(py_floordiv(lr_y, 2.0) - 0.5), lr_h / 2 - 1);
+                const int j_r = std::min((int)(py_floordiv(lr_x, 2.0) - 0.5), lr_w / 2 - 1);
+                local_r = r->at(i_r, j_r);
+            }
+            const double lr_mov_x = lr_x + (double)flowx;
+            const double lr_mov_y = lr_y + (double)flowy;
+            if (!(0 <= lr_mov_x && lr_mov_x < lr_w && 0 <= lr_mov_y && lr_mov_y < lr_h)) continue;
+
+            const double kmap_j = lr_mov_x / 2 - 0.5;
+            const double kmap_i = lr_mov_y / 2 - 0.5;
+            double ip;
+            const double frac_x = std::modf(kmap_j, &ip);
+            const double frac_y = std::modf(kmap_i, &ip);
+            const int floor_x = std::max((int)kmap_j, 0);
+            const int floor_y = std::max((int)kmap_i, 0);
+            const int ceil_x = std::min(floor_x + 1, covs.w - 1);
+            const int ceil_y = std::min(floor_y + 1, covs.h - 1);
+            const f32* tr = covs.at(floor_y, floor_x);
+            const f32* tl = covs.at(floor_y, ceil_x);
+            const f32* br = covs.at(ceil_y, floor_x);
+            const f32* bl = covs.at(ceil_y, ceil_x);
+            auto lerp = [&](int k) {
+                const double top = (double)tr[k] + frac_x * (double)(tl[k] - tr[k]);
+                const double bot = (double)br[k] + frac_x * (double)(bl[k] - br[k]);
+                return top + frac_y * (bot - top);
+            };
+            const double cxx = lerp(0), cxy = lerp(1), cyy = lerp(3);
+            const double det = cxx * cyy - cxy * cxy;
+            const double inv_det = 1.0 / det;
+            const double ixx = inv_det * cyy;
+            const double ixy = -inv_det * cxy;
+            const double iyy = inv_det * cxx;
+
+            const int center_j = (int)lr_mov_x;
+            const int center_i = (int)lr_mov_y;
+            const double lr_mov_j = lr_mov_x - 0.5;
+            const double lr_mov_i = lr_mov_y - 0.5;
+            float val[3] = {0.f, 0.f, 0.f}, acc[3] = {0.f, 0.f, 0.f};
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    const int j = center_j + dj;
+                    const int i = center_i + di;
+                    if (!(0 <= j && j < lr_w && 0 <= i && i < lr_h)) continue;
+                    const int channel = i % 2 + j % 2;      // RGGB hardcoded
+                    const float c = img.at(i, j);
+                    const double dist_x = (double)j - lr_mov_j;
+                    const double dist_y = (double)i - lr_mov_i;
+                    double z = ixx * dist_x * dist_x + 2 * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
+                    z = (z > 0) ? z : 0.0;                   // max(0, z): NaN -> 0
+                    const double w = std::exp(-0.5 * z);
+                    val[channel] = (float)((double)val[channel] + w * (double)local_r * (double)c);
+                    acc[channel] = (float)((double)acc[channel] + w * (double)local_r);
+                }
+            }
+            for (int ch = 0; ch < 3; ++ch) {
+                num.at(local_i, hr_j, ch) += val[ch];
+                den.at(local_i, hr_j, ch) += acc[ch];
+            }
+        }
+    });
+}
+
 // On Apple, merge_comp_band_metal runs the same math on GPU.
 static void accumulate_comp(const Image& img, const FlowField& flow, const CovField& covs,
                             const Image& robustness, int tile_size,
@@ -139,6 +252,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     // read 1:1 at the output pixel (v/255). Avoids a 48MP fp32 mask in memory.
     const bool use_m8 = (rob8 && !rob8->empty());
     const bool m14 = cfg.merge_match_14;   // 1.4 merge.py conventions (see Config)
+    if (cfg.bran14_kernels && m14 && cfg.bayer_mode && !use_m8) {
+        accumulate14_exact(img, &flow, covs, &robustness, tile_size, num, den, y0, cfg);
+        return;
+    }
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -356,6 +473,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     // comparison-frame conventions: pixel-centre lr, kmap = lr/2 - 0.5, raw-det inverse,
     // int() centre with (j + 0.5) - lr distances, iso via the diag(k_detail) covariance.
     const bool m14 = cfg.merge_match_14;
+    if (cfg.bran14_kernels && m14 && cfg.bayer_mode) {
+        accumulate14_exact(img, nullptr, covs, nullptr, 1, num, den, y0, cfg);
+        return;
+    }
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -444,6 +565,11 @@ bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovFiel
         return true;
     }
 #ifdef __APPLE__
+    // bran pipeline, exact mode: 1.4's float64 accumulate on the CPU.
+    if (cfg.bran14_kernels && cfg.bran14_exact_cpu) {
+        accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg, rob8);
+        return true;
+    }
     // Metal GPU only — same Alg. 4 math as accumulate_comp (incl. per-pixel robustness).
     return merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
                                  num_band, den_band, y0, cfg, frame_id);
@@ -466,6 +592,10 @@ void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
                     const Image* acc_rob) {
 #ifdef __APPLE__
+    if (cfg.bran14_kernels && cfg.bran14_exact_cpu) {   // bran exact mode: CPU float64
+        accumulate_ref(ref_raw, covs, acc_rob, num_band, den_band, y0, cfg);
+        return;
+    }
     // Metal GPU only — same Alg. 11 math. Waits for this band (sync API).
     // pipeline_paths Apple path calls merge_ref_band_metal directly for async overlap.
     if (!merge_ref_band_metal(ref_raw, covs, num_band, den_band, y0, cfg, acc_rob) ||

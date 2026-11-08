@@ -19,7 +19,7 @@ struct RawDecodeParams {
     // the source plane. Both origins are forced even by the host, so the CFA
     // phase of the output matches the source and `site` below is the same colour
     // the uncropped decode would have read.
-    uint h, w, stride_shorts, _pad0;
+    uint h, w, stride_shorts, bran14;   // bran14: 1.4 get_raw_arrays (no WB/clip/+1e-4)
     float4 black;
     float4 denom;
     float4 wb;
@@ -33,6 +33,12 @@ kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint site = ((gid.y & 1u) << 1u) | (gid.x & 1u);
     ushort rawv = raw[(p.src_y0 + gid.y) * p.stride_shorts + (p.src_x0 + gid.x)];
+    if (p.bran14 != 0u) {
+        // bran (1.4) utils_dng.get_raw_arrays: (raw - black[site]) / (white - black[site]),
+        // no white balance, no clip -- negatives are kept.
+        out[gid.y * p.w + gid.x] = (float(rawv) - p.black[site]) / p.denom[site];
+        return;
+    }
     // GCam ExtractBayer parity: +1e-4 on the SENSOR value before the (v-black)/denom
     // normalization and WB gain (a ~1e-7 floor in [0,1]) so nothing is exactly zero
     // before the guide sqrt/variance/division. Matches raw_io.cpp load_raw_dng (the
@@ -437,8 +443,9 @@ kernel void zero_fft_borders_natural(device float2* data [[buffer(0)]],
                                  : ((x < 2u * half_w) ? (x - half_w) : x);
     const uint ys = (y < half_h) ? (y + half_h)
                                  : ((y < 2u * half_h) ? (y - half_h) : y);
-    const uint y0 = h / 4u, x0 = w / 4u;
-    if (ys < y0 || ys >= h - y0 || xs < x0 || xs >= w - x0)
+    // [-h//4:] = (-h)//4 = -ceil(h/4): the far band is ceil(h/4) wide.
+    const uint y0 = h / 4u, x0 = w / 4u, y1 = (h + 3u) / 4u, x1 = (w + 3u) / 4u;
+    if (ys < y0 || ys >= h - y1 || xs < x0 || xs >= w - x1)
         data[y * w + x] = float2(0.f, 0.f);
 }
 
@@ -448,8 +455,8 @@ kernel void zero_fft_borders(device float2* data [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]]) {
     uint y = gid.y, x = gid.x;
     if (y >= h || x >= w) return;
-    uint y0 = h / 4u, x0 = w / 4u;
-    if (y < y0 || y >= h - y0 || x < x0 || x >= w - x0)
+    uint y0 = h / 4u, x0 = w / 4u, y1 = (h + 3u) / 4u, x1 = (w + 3u) / 4u;   // -h//4 = -ceil(h/4)
+    if (y < y0 || y >= h - y1 || x < x0 || x >= w - x1)
         data[y * w + x] = float2(0.f, 0.f);
 }
 
@@ -1033,7 +1040,8 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     }
     if (raw_det) {
         float det = xx * yy - xy * xy;
-        if (fabs(det) > 1e-10f) {
+        // merge_match_14 (soften off): 1.4 inverts unguarded (twin of merge.cpp).
+        if (!soften || fabs(det) > 1e-10f) {
             float inv_det = 1.f / det;
             ixx =  inv_det * yy;
             ixy = -inv_det * xy;
@@ -5390,4 +5398,344 @@ kernel void align14_ica(device const float* ref [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) { flow[tile * 2u + 0u] = s_al[0]; flow[tile * 2u + 1u] = s_al[1]; }
+}
+
+// ============================================================================
+// bran (Handheld-Multi-Frame-Super-Resolution-1.4) pipeline on the GPU
+// (Config::bran14_active, Config::bran14_exact_cpu = false). Twins of core/bran14.cpp
+// (robustness.py), the bran branch of kernels.cpp (kernels.py estimate_kernels), the CFA
+// flip (utils_image.cfa_to_rggb) and process_burst_bran14's num/den -> 16-bit encode.
+//
+// Metal has no float64, and 1.4's Numba kernels compute several steps in float64. Where
+// float32 would lose more than rounding -- cancellation -- these use forms that are
+// algebraically identical and accurate in float32: two-pass local variance instead of
+// E[c^2] - mean^2, eigenvalue discriminant (a - d)^2 + 4b^2 instead of (a + d)^2 - 4(ad -
+// b^2), the small root through Vieta (det / l1) with an fma-compensated det, and the
+// guide-pixel warp centre / bounds from integer + offset parts so y + flow*0.5 is never
+// rounded. Out-of-frame pixels and flat patches are handled by explicit branches, not by
+// inf / NaN arithmetic, which fast math does not preserve: out-of-frame -> R = 0 (1.4:
+// inf -> NaN -> clamp -> 0), sigma == 0 -> R = 0 (1.4: 0/0 or exp(-inf)), a flat patch in
+// the unguarded linear law -> a huge isotropic covariance, whose inverse is ~0 so every
+// merge tap gets weight exp(0) = 1 (1.4: NaN covariance -> z = max(0, NaN) = 0 -> w = 1).
+struct Bran14Params {
+    uint h, w, gh, gw;          // raw (RGGB) and guide = raw / 2
+    uint fny, fnx, ts2, n_curve; // flow tile grid, guide pixels per tile, LUT size
+    uint noise_corr, iso, hard, guard;
+    float t, s1, s2, mt2;       // robustness; mt2 = float(Mt * Mt)
+    float kd, kn, dth, dtr;     // update_snr_config lerps
+    float kst, ksh, _p0, _p1;   // k_stretch, k_shrink
+    float4 alpha;               // R, G1, B, G2
+    float4 beta;
+};
+
+// cuda_compute_guide_image: planar [3][gh][gw].
+kernel void bran14_guide(device const float* raw [[buffer(0)]],
+                         device float* g [[buffer(1)]],
+                         constant Bran14Params& p [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint x = gid.x, y = gid.y, plane = p.gh * p.gw, o = y * p.gw + x;
+    const uint r0 = (2u * y) * p.w + 2u * x, r1 = r0 + p.w;
+    g[o]             = precise::sqrt(max(raw[r0], 0.f));
+    g[plane + o]     = precise::sqrt(max(0.5f * (raw[r0 + 1u] + raw[r1]), 0.f));
+    g[2u * plane + o] = precise::sqrt(max(raw[r1 + 1u], 0.f));
+}
+
+// cuda_compute_local_stats: 3x3 clamped window per channel. Two-pass variance.
+kernel void bran14_stats(device const float* g [[buffer(0)]],
+                         device float* mean [[buffer(1)]],
+                         device float* var [[buffer(2)]],
+                         constant Bran14Params& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    uint ys[3], xs[3];
+    for (int i = 0; i < 3; ++i) {
+        ys[i] = (uint)clamp((int)gid.y + i - 1, 0, (int)p.gh - 1);
+        xs[i] = (uint)clamp((int)gid.x + i - 1, 0, (int)p.gw - 1);
+    }
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        device const float* gp = g + ch * plane;
+        float s = 0.f;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) s += gp[ys[i] * p.gw + xs[j]];
+        const float m = s / 9.f;
+        float v = 0.f;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                const float d = gp[ys[i] * p.gw + xs[j]] - m;
+                v += d * d;
+            }
+        mean[ch * plane + o] = m;
+        var[ch * plane + o] = v / 9.f;
+    }
+}
+
+// cuda_compute_s on the tile grid (flow[ty][tx][2] = (x, y) in raw pixels).
+kernel void bran14_s(device const float* flow [[buffer(0)]],
+                     device float* S [[buffer(1)]],
+                     constant Bran14Params& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.fnx || gid.y >= p.fny) return;
+    float mn0 = INFINITY, mn1 = INFINITY, mx0 = -INFINITY, mx1 = -INFINITY;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            const int yy = (int)gid.y + i, xx = (int)gid.x + j;
+            if (yy < 0 || yy >= (int)p.fny || xx < 0 || xx >= (int)p.fnx) continue;
+            const uint fo = ((uint)yy * p.fnx + (uint)xx) * 2u;
+            mx0 = max(mx0, flow[fo]); mx1 = max(mx1, flow[fo + 1u]);
+            mn0 = min(mn0, flow[fo]); mn1 = min(mn1, flow[fo + 1u]);
+        }
+    const float d0 = mx0 - mn0, d1 = mx1 - mn1;
+    S[gid.y * p.fnx + gid.x] = (d0 * d0 + d1 * d1 > p.mt2) ? p.s1 : p.s2;
+}
+
+inline float bran14_dogson(float x) {
+    const float a = fabs(x);
+    if (a <= 0.5f) return -2.f * a * a + 1.f;
+    if (a <= 1.5f) return a * a - 2.5f * a + 1.5f;
+    return 0.f;
+}
+
+// round(y + off) (half to even) for integer y without forming y + off.
+inline int bran14_round_shift(int y, float off) {
+    const float fl = floor(off);
+    const float fr = off - fl;            // exact
+    const int base = y + (int)fl;
+    const bool up = (fr > 0.5f) || (fr == 0.5f && (base & 1) != 0);
+    return base + (up ? 1 : 0);
+}
+
+// cuda_warp_dogson + cuda_compute_d_sigma + cuda_robustness_threshold, fused per guide
+// pixel: R (before the 5x5 min).
+kernel void bran14_robust(device const float* cmean [[buffer(0)]],
+                          device const float* rmean [[buffer(1)]],
+                          device const float* rvar [[buffer(2)]],
+                          device const float* flow [[buffer(3)]],
+                          device const float* S [[buffer(4)]],
+                          device const float* sig_curve [[buffer(5)]],
+                          device const float* d_curve [[buffer(6)]],
+                          device float* R [[buffer(7)]],
+                          constant Bran14Params& p [[buffer(8)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int x = (int)gid.x, y = (int)gid.y;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    const uint py = gid.y / p.ts2, px = gid.x / p.ts2;
+    const uint fo = (py * p.fnx + px) * 2u;
+    const float offx = flow[fo] * 0.5f, offy = flow[fo + 1u] * 0.5f;   // exact
+    // 0 <= y + off < gh, without rounding y + off
+    if (!(offy >= -(float)y && offy < (float)((int)p.gh - y) &&
+          offx >= -(float)x && offx < (float)((int)p.gw - x))) {
+        R[o] = 0.f;                     // 1.4: warped = inf -> R = 0
+        return;
+    }
+    const int cy = bran14_round_shift(y, offy), cx = bran14_round_shift(x, offx);
+    float wacc = 0.f, b0 = 0.f, b1 = 0.f, b2 = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        const int yy = clamp(cy + i, 0, (int)p.gh - 1);
+        const float wy = bran14_dogson((float)(yy - y) - offy);
+        for (int j = -1; j <= 1; ++j) {
+            const int xx = clamp(cx + j, 0, (int)p.gw - 1);
+            const float wgt = wy * bran14_dogson((float)(xx - x) - offx);
+            const uint so = (uint)yy * p.gw + (uint)xx;
+            b0 += cmean[so] * wgt;
+            b1 += cmean[plane + so] * wgt;
+            b2 += cmean[2u * plane + so] * wgt;
+            wacc += wgt;
+        }
+    }
+    const float m0 = b0 / wacc, m1 = b1 / wacc, m2 = b2 / wacc;
+    const float e0 = rmean[o] - m0, e1 = rmean[plane + o] - m1, e2 = rmean[2u * plane + o] - m2;
+    float d = e0 * e0 + e1 * e1 + e2 * e2;
+    float sg = rvar[o] + rvar[plane + o] + rvar[2u * plane + o];
+    if (p.noise_corr != 0u && p.n_curve >= 2u) {
+        float b = (rmean[o] + rmean[plane + o] + rmean[2u * plane + o]) / 3.f;
+        b = clamp(b, 0.f, 1.f);
+        const uint id = (uint)rint((float)(p.n_curve - 1u) * b);
+        sg = max(sg, sig_curve[id]);
+        if (d > 0.f) {
+            const float shrink = d / (d + d_curve[id]);
+            d *= shrink * shrink;
+        }
+    }
+    float r;
+    if (sg == 0.f) {
+        r = 0.f;                        // 1.4: 0/0 -> NaN -> 0, or exp(-inf) - t -> 0
+    } else {
+        const float q = min(-d / sg, 80.f);   // sigma < 0 (rounding): exp(+) -> clamp 1
+        r = clamp(S[py * p.fnx + px] * precise::exp(q) - p.t, 0.f, 1.f);
+    }
+    R[o] = r;
+}
+
+// cuda_compute_local_min: 5x5 clamped.
+kernel void bran14_localmin(device const float* R [[buffer(0)]],
+                            device float* r [[buffer(1)]],
+                            constant Bran14Params& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    float m = INFINITY;
+    for (int i = -2; i <= 2; ++i) {
+        const uint yy = (uint)clamp((int)gid.y + i, 0, (int)p.gh - 1);
+        for (int j = -2; j <= 2; ++j) {
+            const uint xx = (uint)clamp((int)gid.x + j, 0, (int)p.gw - 1);
+            m = min(m, R[yy * p.gw + xx]);
+        }
+    }
+    r[gid.y * p.gw + gid.x] = m;
+}
+
+// kernels.py: cuda_GAT per CFA site (i = px + py * (3 - 2 px) into R, G1, B, G2), then
+// cuda_decimate_to_grey (mean of the quad).
+kernel void bran14_gat_grey(device const float* raw [[buffer(0)]],
+                            device float* grey [[buffer(1)]],
+                            constant Bran14Params& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    float s = 0.f;
+    for (uint i = 0u; i < 2u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            const uint idx = j + i * (3u - 2u * j);
+            const float a = p.alpha[idx], b = p.beta[idx];
+            const float v = raw[(2u * gid.y + i) * p.w + 2u * gid.x + j];
+            const float vst = max(a * v + 0.375f * a * a + b, 0.f);
+            s += 2.f / a * precise::sqrt(vst);
+        }
+    }
+    grey[gid.y * p.gw + gid.x] = s / 4.f;
+}
+
+// cuda_estimate_kernel: torch's separable gradients, 2x2 structure tensor,
+// get_eigen_elmts_2x2, compute_k (linear / hard_threshold), covs = k^2 e e^T.
+kernel void bran14_cov(device const float* grey [[buffer(0)]],
+                       device float* covs [[buffer(1)]],
+                       constant Bran14Params& p [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    device float* c = covs + (gid.y * p.gw + gid.x) * 4u;
+    if (p.iso != 0u) { c[0] = p.kd; c[1] = 0.f; c[2] = 0.f; c[3] = p.kd; return; }
+    const int Gh = (int)p.gh - 1, Gw = (int)p.gw - 1;   // gradient grid
+    float m00 = 0.f, m01 = 0.f, m11 = 0.f;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const int y = (int)gid.y - 1 + i, x = (int)gid.x - 1 + j;
+            if (y < 0 || y >= Gh || x < 0 || x >= Gw) continue;
+            const float tl = grey[(uint)y * p.gw + (uint)x], tr = grey[(uint)y * p.gw + (uint)x + 1u];
+            const float bl = grey[((uint)y + 1u) * p.gw + (uint)x], br = grey[((uint)y + 1u) * p.gw + (uint)x + 1u];
+            const float t0 = (-0.5f * tl) + (0.5f * tr), t0b = (-0.5f * bl) + (0.5f * br);
+            const float t1 = (0.5f * tl) + (0.5f * tr), t1b = (0.5f * bl) + (0.5f * br);
+            const float gx = (0.5f * t0) + (0.5f * t0b);
+            const float gy = (-0.5f * t1) + (0.5f * t1b);
+            m00 += gx * gx; m01 += gx * gy; m11 += gy * gy;
+        }
+    }
+    // Eigenvalues: l1 = (tr + sqrt((a - d)^2 + 4 b^2)) / 2, l2 = det / l1.
+    const float trc = m00 + m11;
+    const float df = m00 - m11;
+    const float sq = precise::sqrt(df * df + 4.f * m01 * m01);
+    const float l1 = 0.5f * (trc + sq);
+    const float pb = m01 * m01;
+    const float det = fma(m00, m11, -pb) - fma(m01, m01, -pb);   // compensated ad - b^2
+    const float l2 = (l1 > 0.f) ? det / l1 : 0.f;
+    // get_eigen_vect_2x2
+    float e10, e11, e20, e21;
+    if (m01 == 0.f && m00 == m11) {
+        e10 = 1.f; e11 = 0.f; e20 = 0.f; e21 = 1.f;
+    } else {
+        e10 = m00 + m01 - l2;
+        e11 = m01 + m11 - l2;
+        if (e10 == 0.f) {
+            e11 = 1.f; e20 = 1.f; e21 = 0.f;
+        } else if (e11 == 0.f) {
+            e10 = 1.f; e20 = 0.f; e21 = 1.f;
+        } else {
+            const float nrm = precise::sqrt(e10 * e10 + e11 * e11);
+            e10 /= nrm; e11 /= nrm;
+            const float sgn = (e10 < 0.f) ? -1.f : 1.f;
+            e21 = fabs(e10);
+            e20 = -e11 * sgn;
+        }
+    }
+    // compute_k
+    const bool flat = !(l1 + l2 > 0.f);
+    float k1, k2, D;
+    if (flat && p.hard == 0u && p.guard == 0u) {
+        // 1.4: A = NaN -> NaN covariance -> every merge tap at weight 1.
+        c[0] = 1e15f; c[1] = 0.f; c[2] = 0.f; c[3] = 1e15f;
+        return;
+    }
+    D = clamp(1.f - precise::sqrt(max(l1, 0.f)) / p.dtr + p.dth, 0.f, 1.f);
+    if (flat) {
+        k1 = 1.f; k2 = 1.f;               // hard_threshold NaN branch / guard
+    } else {
+        const float A = 1.f + precise::sqrt((l1 - l2) / (l1 + l2));
+        if (p.hard != 0u) {
+            if (A > 1.95f) { k1 = 1.f / p.ksh; k2 = p.kst; } else { k1 = 1.f; k2 = 1.f; }
+        } else {
+            k1 = (2.f - A) + (A - 1.f) / p.ksh;
+            k2 = (2.f - A) + (A - 1.f) * p.kst;
+        }
+    }
+    const float ka = p.kd * ((1.f - D) * k1 + D * p.kn);
+    const float kb = p.kd * ((1.f - D) * k2 + D * p.kn);
+    const float k1s = ka * ka, k2s = kb * kb;
+    c[0] = k1s * e10 * e10 + k2s * e20 * e20;
+    c[1] = k1s * e10 * e11 + k2s * e20 * e21;
+    c[2] = c[1];
+    c[3] = k1s * e11 * e11 + k2s * e21 * e21;
+}
+
+// utils_image.cfa_to_rggb (its own inverse): mode 1 = flip both axes, 2 = x, 3 = y.
+struct Bran14FlipParams { uint h, w, c, mode; };
+kernel void bran14_flip(device const float* src [[buffer(0)]],
+                        device float* dst [[buffer(1)]],
+                        constant Bran14FlipParams& p [[buffer(2)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    const uint sy = (p.mode == 1u || p.mode == 3u) ? p.h - 1u - gid.y : gid.y;
+    const uint sx = (p.mode == 1u || p.mode == 2u) ? p.w - 1u - gid.x : gid.x;
+    for (uint k = 0u; k < p.c; ++k)
+        dst[(gid.y * p.w + gid.x) * p.c + k] = src[(sy * p.w + sx) * p.c + k];
+}
+
+// num / den -> 16-bit DNG rows for output rows [y0, y0 + bh), reading the RGGB-space
+// accumulator through rggb_to_cfa. A zero denominator is 1.4's 0 / 0 = NaN pixel -> 0.
+struct Bran14EncodeParams {
+    uint Hs, Ws, y0, bh;
+    uint flip, bake, _p0, _p1;
+    float4 wb;
+    float4 m0, m1, m2;   // cam -> sRGB rows (xyz used)
+};
+inline float bran14_srgb(float v) {
+    v = clamp(v, 0.f, 1.f);
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * precise::pow(v, 1.f / 2.4f) - 0.055f;
+}
+kernel void bran14_encode(device const float* num [[buffer(0)]],
+                          device const float* den [[buffer(1)]],
+                          device ushort* out [[buffer(2)]],
+                          constant Bran14EncodeParams& p [[buffer(3)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.Ws || gid.y >= p.bh) return;
+    const uint y = p.y0 + gid.y, x = gid.x;
+    const uint fy = (p.flip == 1u || p.flip == 3u) ? p.Hs - 1u - y : y;
+    const uint fx = (p.flip == 1u || p.flip == 2u) ? p.Ws - 1u - x : x;
+    const uint o = (fy * p.Ws + fx) * 3u;
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f;
+    if (den[o] != 0.f && den[o + 1u] != 0.f && den[o + 2u] != 0.f) {
+        c0 = num[o] / den[o]; c1 = num[o + 1u] / den[o + 1u]; c2 = num[o + 2u] / den[o + 2u];
+    }
+    float v0, v1, v2;
+    if (p.bake != 0u) {
+        const float wr = c0 * p.wb.x, wg = c1 * p.wb.y, wbv = c2 * p.wb.z;
+        v0 = bran14_srgb(p.m0.x * wr + p.m0.y * wg + p.m0.z * wbv);
+        v1 = bran14_srgb(p.m1.x * wr + p.m1.y * wg + p.m1.z * wbv);
+        v2 = bran14_srgb(p.m2.x * wr + p.m2.y * wg + p.m2.z * wbv);
+    } else {
+        v0 = clamp(c0, 0.f, 1.f); v1 = clamp(c1, 0.f, 1.f); v2 = clamp(c2, 0.f, 1.f);
+    }
+    const uint q = (gid.y * p.Ws + x) * 3u;
+    out[q]      = (ushort)(v0 * 65535.f + 0.5f);
+    out[q + 1u] = (ushort)(v1 * 65535.f + 0.5f);
+    out[q + 2u] = (ushort)(v2 * 65535.f + 0.5f);
 }

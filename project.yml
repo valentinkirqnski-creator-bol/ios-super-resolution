@@ -54,6 +54,8 @@ targets:
           - "dng_writer.cpp"
           - "ljpeg.cpp"
           - "snr_tuning.cpp"
+          - "bran14.cpp"
+          - "noise_lut14.cpp"
           - "preset_lut.cpp"
           - "render_isp.cpp"
           - "finish_hdr.cpp"

@@ -8,6 +8,7 @@
 #include "debug_utils.h"
 #include "prof.h"
 #include "mps_fft.h"
+#include "bran14.h"
 // RR_WEIGHTS_N, for the static_assert that the generated table below matches
 // the layout the kernel reads, and the compiled-in weights themselves.
 #include "robustness_refine_shared.h"
@@ -1241,7 +1242,7 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
                                  const float site_wb[4],
                                  int src_y0, int src_x0, int out_h, int out_w,
                                  int gpu_slot, bool keep_host,
-                                 Image& out) {
+                                 Image& out, bool bran14) {
     if (!metal_gpu_init() || !raw_data || h <= 0 || w <= 0 ||
         bytes_per_row < w * (int)sizeof(uint16_t) || (bytes_per_row & 1))
         return false;
@@ -1274,6 +1275,7 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
     p.stride_shorts = (uint32_t)(bytes_per_row / (int)sizeof(uint16_t));
     p.src_y0 = (uint32_t)src_y0;
     p.src_x0 = (uint32_t)src_x0;
+    p.pad0 = bran14 ? 1u : 0u;
     for (int i = 0; i < 4; ++i) {
         p.black[i] = site_black[i];
         p.denom[i] = site_denom[i];
@@ -6308,6 +6310,275 @@ bool align_metal_14(const Pyramid& ref_pyr, const Image& moving_grey, const Conf
                     int tile_size, FlowField& flow_out) {
     @autoreleasepool {
         return align_metal_14_impl(ref_pyr, moving_grey, cfg, tile_size, flow_out);
+    }
+}
+
+
+// ============================================================================
+// bran (Handheld-Multi-Frame-Super-Resolution-1.4) pipeline on the GPU -- host side of
+// the bran14_* kernels in HHSRKernels.metal. See process_burst_bran14.
+struct Bran14ParamsCPU {
+    uint32_t h, w, gh, gw;
+    uint32_t fny, fnx, ts2, n_curve;
+    uint32_t noise_corr, iso, hard, guard;
+    float t, s1, s2, mt2;
+    float kd, kn, dth, dtr;
+    float kst, ksh, p0, p1;
+    float alpha[4];
+    float beta[4];
+};
+static_assert(sizeof(Bran14ParamsCPU) == 128, "Bran14ParamsCPU layout");
+
+struct Bran14GpuState {
+    __strong id<MTLBuffer> ref_mean = nil, ref_var = nil;
+    int gh = 0, gw = 0;
+    __strong id<MTLBuffer> lut_sig = nil, lut_d = nil;
+    const float* lut_key = nullptr;
+    int lut_n = 0;
+    __strong id<MTLBuffer> enc_out = nil;
+    size_t enc_out_b = 0;
+};
+static Bran14GpuState g_b14;
+
+void bran14_metal_release() {
+    g_b14 = Bran14GpuState();
+}
+
+static Bran14ParamsCPU bran14_params(const Image& raw, const FlowField* flow,
+                                     const Robustness14Params* rp, const Config& cfg) {
+    Bran14ParamsCPU p{};
+    p.h = (uint32_t)raw.h; p.w = (uint32_t)raw.w;
+    p.gh = (uint32_t)(raw.h / 2); p.gw = (uint32_t)(raw.w / 2);
+    p.fny = flow ? (uint32_t)flow->ny : 0u;
+    p.fnx = flow ? (uint32_t)flow->nx : 0u;
+    p.ts2 = rp ? (uint32_t)std::max(1, rp->tile_size / 2) : 1u;
+    p.n_curve = rp ? (uint32_t)std::max(0, rp->n_curve) : 0u;
+    p.noise_corr = (rp && rp->noise_correction && rp->n_curve >= 2) ? 1u : 0u;
+    p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
+    p.hard = (cfg.selection == SelectionLaw::HardThreshold) ? 1u : 0u;
+    p.guard = cfg.bran14_flat_kernel_guard ? 1u : 0u;
+    if (rp) {
+        p.t = (float)rp->t; p.s1 = (float)rp->s1; p.s2 = (float)rp->s2;
+        p.mt2 = (float)(rp->Mt * rp->Mt);
+    }
+    p.kd = (float)cfg.bran14_k_detail; p.kn = (float)cfg.bran14_k_denoise;
+    p.dth = (float)cfg.bran14_D_th; p.dtr = (float)cfg.bran14_D_tr;
+    p.kst = cfg.k_stretch; p.ksh = cfg.k_shrink;
+    for (int i = 0; i < 4; ++i) {
+        p.alpha[i] = (float)cfg.noise14_alpha[i];
+        p.beta[i] = (float)cfg.noise14_beta[i];
+    }
+    return p;
+}
+
+static bool bran14_analyze_metal_impl(const Image& raw, bool is_ref, const FlowField* flow,
+                                      const Robustness14Params* rp, const Config& cfg,
+                                      Image* r_out, CovField* covs_out) {
+    if (!metal_gpu_init() || raw.h < 4 || raw.w < 4 || raw.data.empty()) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> p_guide = c.pipe("bran14_guide");
+    id<MTLComputePipelineState> p_stats = c.pipe("bran14_stats");
+    id<MTLComputePipelineState> p_s = c.pipe("bran14_s");
+    id<MTLComputePipelineState> p_rob = c.pipe("bran14_robust");
+    id<MTLComputePipelineState> p_min = c.pipe("bran14_localmin");
+    id<MTLComputePipelineState> p_gat = c.pipe("bran14_gat_grey");
+    id<MTLComputePipelineState> p_cov = c.pipe("bran14_cov");
+    if (!p_guide || !p_stats || !p_s || !p_rob || !p_min || !p_gat || !p_cov) return false;
+
+    const bool robust = (rp != nullptr);
+    if (robust && !is_ref && (!flow || flow->ny <= 0 || flow->nx <= 0)) return false;
+    Bran14ParamsCPU p = bran14_params(raw, is_ref ? nullptr : flow, rp, cfg);
+    const int gh = (int)p.gh, gw = (int)p.gw;
+    const size_t plane = (size_t)gh * (size_t)gw;
+    if (robust && !is_ref && (g_b14.gh != gh || g_b14.gw != gw || !g_b14.ref_mean)) return false;
+
+    id<MTLBuffer> b_raw = buf(raw.data.data(), raw.data.size() * sizeof(float));
+    id<MTLBuffer> b_grey = buf(nullptr, plane * sizeof(float));
+    id<MTLBuffer> b_cov = covs_out ? buf(nullptr, plane * 4u * sizeof(float)) : nil;
+    if (!b_raw || !b_grey || (covs_out && !b_cov)) return false;
+
+    id<MTLBuffer> b_g = nil, b_cm = nil, b_cv = nil, b_flow = nil, b_S = nil, b_R = nil, b_r = nil;
+    if (robust) {
+        b_g = buf(nullptr, 3u * plane * sizeof(float));
+        if (is_ref) {
+            g_b14.ref_mean = buf(nullptr, 3u * plane * sizeof(float));
+            g_b14.ref_var = buf(nullptr, 3u * plane * sizeof(float));
+            g_b14.gh = gh; g_b14.gw = gw;
+            if (!g_b14.ref_mean || !g_b14.ref_var) return false;
+        } else {
+            b_cm = buf(nullptr, 3u * plane * sizeof(float));
+            b_cv = buf(nullptr, 3u * plane * sizeof(float));
+            b_flow = buf(flow->flow.data(), flow->flow.size() * sizeof(float));
+            b_S = buf(nullptr, (size_t)flow->ny * (size_t)flow->nx * sizeof(float));
+            b_R = buf(nullptr, plane * sizeof(float));
+            b_r = buf(nullptr, plane * sizeof(float));
+            if (!b_cm || !b_cv || !b_flow || !b_S || !b_R || !b_r) return false;
+            if (p.n_curve >= 2u && (g_b14.lut_key != rp->sigma_sq_curve ||
+                                    g_b14.lut_n != rp->n_curve || !g_b14.lut_sig)) {
+                g_b14.lut_sig = buf(rp->sigma_sq_curve, (size_t)rp->n_curve * sizeof(float));
+                g_b14.lut_d = buf(rp->d_sq_curve, (size_t)rp->n_curve * sizeof(float));
+                g_b14.lut_key = rp->sigma_sq_curve;
+                g_b14.lut_n = rp->n_curve;
+            }
+        }
+        if (!b_g) return false;
+    }
+    // A 1-float stand-in so every declared binding is set when the LUT is unused.
+    id<MTLBuffer> lut_sig = (robust && p.n_curve >= 2u) ? g_b14.lut_sig : nil;
+    id<MTLBuffer> lut_d = (robust && p.n_curve >= 2u) ? g_b14.lut_d : nil;
+    if (!lut_sig || !lut_d) {
+        float zero = 0.f;
+        lut_sig = buf(&zero, sizeof(float));
+        lut_d = lut_sig;
+        p.n_curve = 0u;
+        p.noise_corr = 0u;
+    }
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    if (robust) {
+        [enc setBuffer:b_raw offset:0 atIndex:0];
+        [enc setBuffer:b_g offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, p_guide, (NSUInteger)gw, (NSUInteger)gh);
+        [enc setBuffer:b_g offset:0 atIndex:0];
+        [enc setBuffer:(is_ref ? g_b14.ref_mean : b_cm) offset:0 atIndex:1];
+        [enc setBuffer:(is_ref ? g_b14.ref_var : b_cv) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch2(enc, p_stats, (NSUInteger)gw, (NSUInteger)gh);
+        if (!is_ref) {
+            [enc setBuffer:b_flow offset:0 atIndex:0];
+            [enc setBuffer:b_S offset:0 atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            dispatch2(enc, p_s, (NSUInteger)p.fnx, (NSUInteger)p.fny);
+            [enc setBuffer:b_cm offset:0 atIndex:0];
+            [enc setBuffer:g_b14.ref_mean offset:0 atIndex:1];
+            [enc setBuffer:g_b14.ref_var offset:0 atIndex:2];
+            [enc setBuffer:b_flow offset:0 atIndex:3];
+            [enc setBuffer:b_S offset:0 atIndex:4];
+            [enc setBuffer:lut_sig offset:0 atIndex:5];
+            [enc setBuffer:lut_d offset:0 atIndex:6];
+            [enc setBuffer:b_R offset:0 atIndex:7];
+            [enc setBytes:&p length:sizeof(p) atIndex:8];
+            dispatch2(enc, p_rob, (NSUInteger)gw, (NSUInteger)gh);
+            [enc setBuffer:b_R offset:0 atIndex:0];
+            [enc setBuffer:b_r offset:0 atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            dispatch2(enc, p_min, (NSUInteger)gw, (NSUInteger)gh);
+        }
+    }
+    if (covs_out) {
+        [enc setBuffer:b_raw offset:0 atIndex:0];
+        [enc setBuffer:b_grey offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, p_gat, (NSUInteger)gw, (NSUInteger)gh);
+        [enc setBuffer:b_grey offset:0 atIndex:0];
+        [enc setBuffer:b_cov offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, p_cov, (NSUInteger)gw, (NSUInteger)gh);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, is_ref ? "bran14:ref" : "bran14:frame");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    if (r_out && robust && !is_ref) {
+        Image r(gh, gw, 1);
+        memcpy(r.data.data(), [b_r contents], plane * sizeof(float));
+        *r_out = std::move(r);
+    }
+    if (covs_out) {
+        CovField k(gh, gw);
+        memcpy(k.cov.data(), [b_cov contents], plane * 4u * sizeof(float));
+        *covs_out = std::move(k);
+    }
+    return true;
+}
+
+bool bran14_analyze_metal(const Image& raw, bool is_ref, const FlowField* flow,
+                          const Robustness14Params* rp, const Config& cfg,
+                          Image* r_out, CovField* covs_out) {
+    @autoreleasepool {
+        return bran14_analyze_metal_impl(raw, is_ref, flow, rp, cfg, r_out, covs_out);
+    }
+}
+
+bool bran14_flip_metal(Image& img, int mode) {
+    if (mode <= 0) return true;
+    @autoreleasepool {
+        if (!metal_gpu_init() || img.data.empty()) return false;
+        auto& c = ctx();
+        id<MTLComputePipelineState> pf = c.pipe("bran14_flip");
+        if (!pf) return false;
+        const size_t bytes = img.data.size() * sizeof(float);
+        id<MTLBuffer> src = buf(img.data.data(), bytes);
+        id<MTLBuffer> dst = buf(nullptr, bytes);
+        if (!src || !dst) return false;
+        struct { uint32_t h, w, c, mode; } fp = {(uint32_t)img.h, (uint32_t)img.w,
+                                                 (uint32_t)img.c, (uint32_t)mode};
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!cmd || !enc) return false;
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&fp length:sizeof(fp) atIndex:2];
+        dispatch2(enc, pf, (NSUInteger)img.w, (NSUInteger)img.h);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+        memcpy(img.data.data(), [dst contents], bytes);
+        return true;
+    }
+}
+
+bool bran14_encode_online_rows_metal(int y0, int bh, int Hs, int Ws, int flip,
+                                     const Config& cfg, const uint16_t** rows) {
+    if (!rows) return false;
+    *rows = nullptr;
+    @autoreleasepool {
+        if (!g_merge_online || !metal_gpu_init()) return false;
+        MergeAccSlot& slot = g_merge_acc[0];
+        if (!slot.num || !slot.den || g_online_nch != 3) return false;
+        auto& c = ctx();
+        id<MTLComputePipelineState> pe = c.pipe("bran14_encode");
+        if (!pe) return false;
+        const size_t need = (size_t)bh * (size_t)Ws * 3u * sizeof(uint16_t);
+        id<MTLBuffer> out = c.scratch(g_b14.enc_out, g_b14.enc_out_b, need);
+        if (!out) return false;
+        struct EncP {
+            uint32_t Hs, Ws, y0, bh, flip, bake, p0, p1;
+            float wb[4];
+            float m0[4], m1[4], m2[4];
+        } ep{};
+        static_assert(sizeof(EncP) == 96, "Bran14EncodeParams layout");
+        ep.Hs = (uint32_t)Hs; ep.Ws = (uint32_t)Ws; ep.y0 = (uint32_t)y0; ep.bh = (uint32_t)bh;
+        ep.flip = (uint32_t)std::max(0, flip);
+        ep.bake = cfg.bake_srgb ? 1u : 0u;
+        for (int k = 0; k < 3; ++k) {
+            ep.wb[k] = cfg.white_balance[k];
+            ep.m0[k] = cfg.cam_to_srgb[k];
+            ep.m1[k] = cfg.cam_to_srgb[3 + k];
+            ep.m2[k] = cfg.cam_to_srgb[6 + k];
+        }
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!cmd || !enc) return false;
+        [enc setBuffer:slot.num offset:0 atIndex:0];
+        [enc setBuffer:slot.den offset:0 atIndex:1];
+        [enc setBuffer:out offset:0 atIndex:2];
+        [enc setBytes:&ep length:sizeof(ep) atIndex:3];
+        dispatch2(enc, pe, (NSUInteger)Ws, (NSUInteger)bh);
+        [enc endEncoding];
+        prof_tag_gpu(cmd, "bran14:encode");
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+        *rows = (const uint16_t*)[out contents];
+        return true;
     }
 }
 

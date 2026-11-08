@@ -1143,6 +1143,22 @@ struct CameraView: View {
                     }
                 }
 
+                Section(header: Text("bran (1.4) Pipeline")) {
+                    Toggle("Match bran Pipeline", isOn: $cam.tuningParams.bran14_pipeline)
+                    Text("""
+                         ON (default, used whenever GCam robustness is off): the whole Handheld-Multi-Frame-Super-Resolution-1.4 pipeline from Downloads/bran — frame 0 as reference, no white balance or exposure matching before the merge, the burst flipped to RGGB (BGGR = 180°) and back, SNR-based tile size (16/32/64) and kernel parameters, 1.4 alignment, kernels, robustness with the Monte Carlo noise LUT (generated once per noise profile, then cached) and merge. The other alignment / robustness / kernel settings are ignored while it is on.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Exact float64 (CPU, slow)", isOn: $cam.tuningParams.bran14_exact_cpu)
+                        .disabled(!cam.tuningParams.bran14_pipeline)
+                    Text("OFF (default): every per-frame stage runs on the GPU (Metal is float32-only, so 1.4's float64 steps are float32 there). ON: decode, flip, alignment, robustness, kernels and merge run on the CPU with 1.4's float64 arithmetic, bit-exact against bran, much slower.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Flat-patch kernel guard", isOn: $cam.tuningParams.bran14_flat_kernel_guard)
+                        .disabled(!cam.tuningParams.bran14_pipeline)
+                    Text("OFF = 1.4 exactly (a perfectly flat patch gets a NaN kernel, which the merge turns into equal weights). ON = isotropic kernel there.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Steerable Kernels")) {
                     Toggle("Match 1.4 Merge", isOn: $cam.tuningParams.merge_match_14)
                     Text("""

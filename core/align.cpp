@@ -2452,7 +2452,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // its opt-in extras and the global pre-alignment seed, which 1.4 does not have.
     if (cfg.align_match_14) {
 #ifdef __APPLE__
-        if (!env_flag_on("HHSR_ALIGN_CPU")) {
+        if (!env_flag_on("HHSR_ALIGN_CPU") && !(cfg.bran14_kernels && cfg.bran14_exact_cpu)) {
             FlowField fg;
             if (align_metal_14(ref_pyr, moving_grey, cfg, tile_size, fg)) {
                 mark_aperture_limited_tiles(fg, nullptr, cfg);

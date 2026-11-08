@@ -100,6 +100,13 @@ struct TuningParams: Equatable, Codable {
     /// Merge with 1.4 merge.py's conventions (pixel-centre mapping, kmap, int centre,
     /// robustness index, iso kernel; reference merged as a zero-flow frame). Default on.
     var merge_match_14: Bool = true
+    /// Run the whole Handheld-Multi-Frame-Super-Resolution-1.4 ("bran") pipeline
+    /// (Config::bran14_pipeline) whenever GCam robustness is off. Default on.
+    var bran14_pipeline: Bool = true
+    /// bran pipeline: give exactly-flat patches the isotropic kernel instead of 1.4's NaN.
+    var bran14_flat_kernel_guard: Bool = false
+    /// bran pipeline: all per-frame stages on the CPU in 1.4's float64 (slow, bit-exact); off = GPU.
+    var bran14_exact_cpu: Bool = false
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
@@ -566,6 +573,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case k_detail_override, k_detail_override_value
         case merge_match_14
+        case bran14_pipeline, bran14_flat_kernel_guard, bran14_exact_cpu
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -644,6 +652,9 @@ struct TuningParams: Equatable, Codable {
         k_detail_override = try c.decodeIfPresent(Bool.self, forKey: .k_detail_override) ?? k_detail_override
         k_detail_override_value = try c.decodeIfPresent(Float.self, forKey: .k_detail_override_value) ?? k_detail_override_value
         merge_match_14 = try c.decodeIfPresent(Bool.self, forKey: .merge_match_14) ?? merge_match_14
+        bran14_pipeline = try c.decodeIfPresent(Bool.self, forKey: .bran14_pipeline) ?? bran14_pipeline
+        bran14_flat_kernel_guard = try c.decodeIfPresent(Bool.self, forKey: .bran14_flat_kernel_guard) ?? bran14_flat_kernel_guard
+        bran14_exact_cpu = try c.decodeIfPresent(Bool.self, forKey: .bran14_exact_cpu) ?? bran14_exact_cpu
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
@@ -2530,6 +2541,9 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail_override": NSNumber(value: tuningParams.k_detail_override),
             "k_detail_override_value": NSNumber(value: tuningParams.k_detail_override_value),
             "merge_match_14": NSNumber(value: tuningParams.merge_match_14),
+            "bran14_pipeline": NSNumber(value: tuningParams.bran14_pipeline),
+            "bran14_flat_kernel_guard": NSNumber(value: tuningParams.bran14_flat_kernel_guard),
+            "bran14_exact_cpu": NSNumber(value: tuningParams.bran14_exact_cpu),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),

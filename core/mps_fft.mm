@@ -56,8 +56,9 @@ static bool spectrum_zeroed(int y, int x, int h, int w) {
                                 : ((x < 2 * half_w) ? (x - half_w) : x);
     const int ys = (y < half_h) ? (y + half_h)
                                 : ((y < 2 * half_h) ? (y - half_h) : y);
-    const int y0 = h / 4, x0 = w / 4;
-    return (ys < y0 || ys >= h - y0 || xs < x0 || xs >= w - x0);
+    // [-h//4:] = (-h)//4 = -ceil(h/4): the far band is ceil(h/4) wide.
+    const int y0 = h / 4, x0 = w / 4, y1 = (h + 3) / 4, x1 = (w + 3) / 4;
+    return (ys < y0 || ys >= h - y1 || xs < x0 || xs >= w - x1);
 }
 
 // Mask weight for the Hermitean-domain multiply. Not 0/1 -- 0.5 appears, and

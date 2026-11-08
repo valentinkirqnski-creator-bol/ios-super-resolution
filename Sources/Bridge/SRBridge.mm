@@ -18,6 +18,7 @@
 #include "core/finish_hdr.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
+#include "core/bran14.h"
 
 using namespace hhsr;
 
@@ -479,6 +480,18 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_detail_override"]) cfg.k_detail_override = tuning[@"k_detail_override"].boolValue;
     if (tuning[@"merge_match_14"]) cfg.merge_match_14 = tuning[@"merge_match_14"].boolValue;
+    if (tuning[@"bran14_pipeline"]) cfg.bran14_pipeline = tuning[@"bran14_pipeline"].boolValue;
+    if (tuning[@"bran14_flat_kernel_guard"])
+        cfg.bran14_flat_kernel_guard = tuning[@"bran14_flat_kernel_guard"].boolValue;
+    if (tuning[@"bran14_exact_cpu"]) cfg.bran14_exact_cpu = tuning[@"bran14_exact_cpu"].boolValue;
+    {
+        // Monte Carlo noise LUTs (bran pipeline) persist in Caches, one file per profile.
+        NSArray<NSString *> *caches =
+            NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        if (caches.count > 0)
+            cfg.noise_lut14_cache_dir =
+                std::string([[caches[0] stringByAppendingPathComponent:@"noise_lut14"] UTF8String]);
+    }
     if (tuning[@"k_detail_override_value"])
         cfg.k_detail_override_value = tuning[@"k_detail_override_value"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
@@ -890,6 +903,15 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
         cfg.black_levels[0] = cfg.black_levels[1] = cfg.black_levels[2] = 0.f;
         cfg.has_black_levels = true;
     }
+    // bran (1.4): black per CFA site, not averaged per colour (get_raw_arrays).
+    cfg.black14_valid = false;
+    if (black.size() >= 4) {
+        for (int s14 = 0; s14 < 4; ++s14) cfg.black14_site[s14] = (float)black[(size_t)s14];
+        cfg.black14_valid = true;
+    } else if (black.size() == 1) {
+        for (int s14 = 0; s14 < 4; ++s14) cfg.black14_site[s14] = (float)black[0];
+        cfg.black14_valid = true;
+    }
     cfg.white_level = FirstNumber(FirstValueForKeys(dng, @[@"WhiteLevel"]), 65535.f);
     if (!(cfg.white_level > 0.f) || !std::isfinite(cfg.white_level))
         cfg.white_level = 65535.f;
@@ -911,6 +933,8 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
                 ok = false;
         }
         cfg.has_noise_profile = ok;
+        // 1.4 (bran) reads the tag as float64 pairs expanded to R, G1, B, G2.
+        bran14_set_noise_profile(cfg, noise.data(), (int)noise.size());
         if (ok) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
@@ -1048,7 +1072,50 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     const int decode_slot = frames_resident ? gpu_slot : -1;
 
     const uint8_t *base = (const uint8_t *)data.bytes;
-    if (!metal_decode_raw16_to_float(base, (size_t)data.length, h, w, bytes_per_row,
+    // bran (1.4) pipeline: get_raw_arrays exactly -- (raw - black[site]) / (white -
+    // black[site]) computed from the integer raw in float64 (NumPy 2 promotion), stored
+    // float32, with NO white balance and NO clip. The Metal decode bakes white balance
+    // and clamps at 0, so this path always decodes on the CPU (host pixels).
+    const bool bran14 = cfg.bran14_active();
+    bool bran14_gpu = false;
+    if (bran14 && !cfg.bran14_exact_cpu) {
+        // GPU decode, bran mode (the kernel's bran14 flag: no WB, no clip, no +1e-4).
+        float b14[4], d14[4], one[4] = {1.f, 1.f, 1.f, 1.f};
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                const int s14 = i * 2 + j;
+                b14[s14] = cfg.black14_valid ? cfg.black14_site[s14] : site_black[i][j];
+                d14[s14] = maxv - b14[s14];
+                if (!(d14[s14] > 0.f)) { b14[s14] = 0.f; d14[s14] = maxv; }
+            }
+        bran14_gpu = metal_decode_raw16_to_float(base, (size_t)data.length, h, w, bytes_per_row,
+                                                 b14, d14, one, src_y0, src_x0, out_h, out_w,
+                                                 /*slot*/ -1, /*keep_host*/ true, img,
+                                                 /*bran14*/ true);
+    }
+    if (bran14_gpu) {
+        // decoded (and cropped) on the GPU
+    } else if (bran14) {
+        double bl14[2][2], den14[2][2];
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                bl14[i][j] = cfg.black14_valid ? (double)cfg.black14_site[i * 2 + j]
+                                               : (double)site_black[i][j];
+                den14[i][j] = (double)maxv - bl14[i][j];
+                if (!(den14[i][j] > 0.0)) { bl14[i][j] = 0.0; den14[i][j] = (double)maxv; }
+            }
+        img = Image(h, w, 1);
+        parallel_rows(h, 0, [&](int y) {
+            const uint8_t *row = base + (size_t)y * (size_t)bytes_per_row;
+            const int fi = y & 1;
+            for (int x = 0; x < w; ++x) {
+                uint16_t rawv = 0;
+                std::memcpy(&rawv, row + (size_t)x * 2u, sizeof(rawv));
+                const int fj = x & 1;
+                img.at(y, x) = (float)(((double)rawv - bl14[fi][fj]) / den14[fi][fj]);
+            }
+        });
+    } else if (!metal_decode_raw16_to_float(base, (size_t)data.length, h, w, bytes_per_row,
                                      flat_black, flat_denom, flat_wb,
                                      src_y0, src_x0, out_h, out_w,
                                      decode_slot, /*keep_host*/is_reference, img)) {
@@ -1068,7 +1135,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             }
         });
     }
-    cfg.raw_prewhitened = true;
+    cfg.raw_prewhitened = !bran14;
 
     // The Metal path cropped inside the kernel, so `img` is already the final
     // extent (or dimensions-only). Only the CPU fallback, which decodes the whole

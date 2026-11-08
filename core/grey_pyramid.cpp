@@ -245,11 +245,13 @@ Image compute_grey_fft(const Image& raw) {
     fft2d(buf, h, w, false);
     fftshift2d(buf, h, w);
 
-    // Python: zero [:h//4,:], [:,:w//4], [-h//4:,:], [:,-w//4:]
+    // Python: zero [:h//4,:], [:,:w//4], [-h//4:,:], [:,-w//4:]. -h//4 is (-h)//4 =
+    // -ceil(h/4), so the far band is ceil(h/4) wide (differs from h//4 when h % 4 != 0).
     const int y0 = h / 4, x0 = w / 4;
+    const int y1 = (h + 3) / 4, x1 = (w + 3) / 4;
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            if (y < y0 || y >= h - y0 || x < x0 || x >= w - x0)
+            if (y < y0 || y >= h - y1 || x < x0 || x >= w - x1)
                 buf[(size_t)y * w + x] = {0.f, 0.f};
         }
     }

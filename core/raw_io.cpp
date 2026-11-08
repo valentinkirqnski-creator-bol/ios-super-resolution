@@ -1,4 +1,5 @@
 #include "raw_io.h"
+#include "bran14.h"
 #include "parallel.h"
 #include <random>
 #include <cmath>
@@ -62,7 +63,8 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
 // Walks IFD0 + SubIFDs (330) + IFD chain. Supports II (LE) and MM (BE) — Apple
 // ProRAW/DNG is often MM; old LE-only path silently fell back to Pixel α/β.
 // alpha_rgb and beta_rgb are output arrays of 3 floats each.
-static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[3], float beta_rgb[3]) {
+static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[3], float beta_rgb[3],
+                                       std::vector<double>* all_values = nullptr) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     uint8_t hdr[8];
@@ -100,6 +102,18 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
         if (std::fseek(f, (long)data_off, SEEK_SET) != 0) return false;
         if (std::fread(bytes.data(), 8, cnt, f) != cnt) return false;
         const uint32_t nplanes = cnt / 2u;
+        if (all_values) {   // every (alpha, beta) pair as float64, in tag order
+            all_values->clear();
+            for (uint32_t i = 0; i < cnt; ++i) {
+                uint8_t raw8[8];
+                const uint8_t* src = bytes.data() + (size_t)i * 8u;
+                if (le) std::memcpy(raw8, src, 8);
+                else for (int k = 0; k < 8; ++k) raw8[k] = src[7 - k];
+                double d;
+                std::memcpy(&d, raw8, 8);
+                all_values->push_back(d);
+            }
+        }
         // Read per-channel noise values [R, G, B]. If fewer than 3 planes,
         // replicate the available value to all three channels.
         // The DNG NoiseProfile describes the sensor BEFORE white balance multiplication.
@@ -302,7 +316,12 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             na[c] = cfg.alpha_dng[c];
             nb[c] = cfg.beta_dng[c];
         }
-        if (try_read_dng_noise_profile(path, na, nb)) {
+        std::vector<double> np_values;
+        const bool np_found = try_read_dng_noise_profile(path, na, nb, &np_values);
+        // 1.4 (bran) reads the tag as float64 pairs expanded to R, G1, B, G2.
+        if (np_found) bran14_set_noise_profile(cfg, np_values.data(), (int)np_values.size());
+        else cfg.noise14_valid = false;
+        if (np_found) {
             for (int c = 0; c < 3; ++c) {
                 cfg.alpha_dng[c] = na[c];
                 cfg.beta_dng[c] = nb[c];
@@ -337,6 +356,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         // Python: black_level_per_channel[R,G,B,(G2)]; index by CFA color.
         float black_ch[4];
         rawpy_black_level_per_channel(raw, black_ch);
+        bran14_set_black_per_channel(cfg, black_ch);   // per site, as 1.4 indexes it
         cfg.black_levels[0] = black_ch[0];
         cfg.black_levels[1] = black_ch[1];
         cfg.black_levels[2] = black_ch[2];
@@ -385,6 +405,28 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     // sample, so this is bit-identical to the serial loop — no reduction, no
     // cross-row dependency. Single-threaded here cost a full 12MP pass per frame.
     const uint16_t* raw_image = raw.imgdata.rawdata.raw_image;
+    if (cfg.bran14_active()) {
+        // 1.4 get_raw_arrays: (raw - black[site]) / (white - black[site]) computed from
+        // the integer raw (NumPy 2 promotes float32 - int64 to float64, stored float32),
+        // WITHOUT white balance, clipping, or GCam's +1e-4 -- negatives are kept.
+        double bl14[2][2], den14[2][2];
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                bl14[i][j] = cfg.black14_valid ? (double)cfg.black14_site[i * 2 + j]
+                                               : (double)site_black[i][j];
+                den14[i][j] = (double)maxv - bl14[i][j];
+                if (!(den14[i][j] > 0.0)) { bl14[i][j] = 0.0; den14[i][j] = (double)maxv; }
+            }
+        parallel_rows(img.h, 0, [&](int y) {
+            const int fi = y & 1;
+            for (int x = 0; x < img.w; ++x) {
+                const int fj = x & 1;
+                const double v = (double)raw_image[(top + y) * stride + (left + x)];
+                img.at(y, x) = (float)((v - bl14[fi][fj]) / den14[fi][fj]);
+            }
+        });
+        cfg.raw_prewhitened = false;
+    } else {
     parallel_rows(img.h, 0, [&](int y) {
         const int fi = y & 1;
         for (int x = 0; x < img.w; ++x) {
@@ -416,6 +458,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         }
     });
     cfg.raw_prewhitened = true;
+    }
 
     if (cfg.input_crop_zoom > 1.f) {
         const float z = cfg.input_crop_zoom;
