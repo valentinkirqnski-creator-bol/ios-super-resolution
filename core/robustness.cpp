@@ -1423,7 +1423,18 @@ static Image local_min_5x5(const Image& R) {
 // safety margin is Wronski's own, on Wronski's own grid.
 static Image local_min_5x5_on_guide(const Image& R);
 
+static RefStats init_robustness_base(const Image& ref_raw, const Config& cfg);
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
+    RefStats st = init_robustness_base(ref_raw, cfg);
+    // Multi-signal model: its reference maps are built on the host from the reference raw
+    // (the GPU init above returns dimensions only).
+    if (cfg.robustness_enabled && cfg.robustness_multisignal && !ref_raw.data.empty())
+        ms_init_reference(ref_raw, cfg, st);
+    return st;
+}
+
+static RefStats init_robustness_base(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
     // Metal GPU only — same math as the CPU path below (golden reference).
@@ -1776,6 +1787,19 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         std::fill(r.data.begin(), r.data.end(), 0.f);
         if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
+    }
+
+    // Multi-signal alignment confidence (Config::robustness_multisignal) replaces Eq. 5-9.
+    if (cfg.robustness_multisignal && ref_stats.ms.gh > 0) {
+        Image r;
+#ifdef __APPLE__
+        r = ms_compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
+#endif
+        if (r.h <= 0) r = ms_compute_robustness(comp_raw, ref_stats, flow, tile_size, cfg);
+        if (r.h > 0 && r.w > 0) {
+            if (s_select_out) *s_select_out = Image(r.h, r.w, 1);
+            return r;
+        }
     }
 
     // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both

@@ -310,4 +310,9 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
 void metal_merge_end_online();
 bool metal_merge_flush_online();
 
+// Multi-signal robustness (Config::robustness_multisignal) on the GPU, twin of
+// ms_compute_robustness. Empty Image -> the caller runs the CPU version.
+Image ms_compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                                  const FlowField& flow, int tile_size, const Config& cfg);
+
 } // namespace hhsr

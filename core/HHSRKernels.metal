@@ -3562,3 +3562,208 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
         }
     }
 }
+
+// ============================================================================
+// Multi-signal alignment-confidence robustness (Config::robustness_multisignal).
+// Twin of core/robustness_ms.cpp: guide, separable Gaussian low pass, the per-pixel
+// confidence (photometric z against V = V_noise + g^T Sigma_u g, per-tile R_fb / R_flow,
+// R_unc, flatness blend) and the separable local min. Same formulas, same order.
+struct MsParams {
+    uint gh, gw, w, fny;
+    uint fnx, ts, ntaps, win_r;
+    uint cfa00, cfa01, cfa10, cfa11;
+    uint cnt0, cnt1, cnt2, _p0;
+    float itp2, ku, exp_p, sfl;    // ku = 1/(2 tau_u^2); sfl: ms_shift_floor^2 / 4 (guide px^2)
+    float kfb, kfl, g0, _p3;       // exp_fb/(2 tau_fb^2), exp_flow/(2 tau_flow^2), noise G
+    float taps[16];            // centre first, symmetric
+};
+
+inline uint ms_cfa(constant MsParams& p, uint i, uint j) {
+    uint c = (i == 0u) ? ((j == 0u) ? p.cfa00 : p.cfa01) : ((j == 0u) ? p.cfa10 : p.cfa11);
+    return min(c, 2u);
+}
+
+kernel void ms_guide(device const float* raw [[buffer(0)]],
+                     device float* g [[buffer(1)]],
+                     constant MsParams& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+    for (uint i = 0u; i < 2u; ++i)
+        for (uint j = 0u; j < 2u; ++j) {
+            const float v = raw[(2u * gid.y + i) * p.w + 2u * gid.x + j];
+            const uint c = ms_cfa(p, i, j);
+            if (c == 0u) s0 += v; else if (c == 1u) s1 += v; else s2 += v;
+        }
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    g[o]              = p.cnt0 ? s0 / float(p.cnt0) : 0.f;
+    g[plane + o]      = p.cnt1 ? s1 / float(p.cnt1) : 0.f;
+    g[2u * plane + o] = p.cnt2 ? s2 / float(p.cnt2) : 0.f;
+}
+
+kernel void ms_blur_h(device const float* in [[buffer(0)]],
+                      device float* out [[buffer(1)]],
+                      constant MsParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw;
+    const int r = int(p.ntaps) - 1, W = int(p.gw), x = int(gid.x);
+    for (uint c = 0u; c < 3u; ++c) {
+        device const float* src = in + c * plane + gid.y * p.gw;
+        float s = p.taps[0] * src[x];
+        for (int i = 1; i <= r; ++i) s += p.taps[i] * (src[max(0, x - i)] + src[min(W - 1, x + i)]);
+        out[c * plane + gid.y * p.gw + gid.x] = s;
+    }
+}
+
+kernel void ms_blur_v(device const float* in [[buffer(0)]],
+                      device float* out [[buffer(1)]],
+                      constant MsParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw;
+    const int r = int(p.ntaps) - 1, H = int(p.gh), y = int(gid.y);
+    for (uint c = 0u; c < 3u; ++c) {
+        device const float* src = in + c * plane + gid.x;
+        float s = p.taps[0] * src[uint(y) * p.gw];
+        for (int i = 1; i <= r; ++i)
+            s += p.taps[i] * (src[uint(max(0, y - i)) * p.gw] + src[uint(min(H - 1, y + i)) * p.gw]);
+        out[c * plane + gid.y * p.gw + gid.x] = s;
+    }
+}
+
+kernel void ms_robust(device const float* Lc [[buffer(0)]],
+                      device const float* L [[buffer(1)]],
+                      device const float* gxm [[buffer(2)]],
+                      device const float* gym [[buffer(3)]],
+                      device const float* vn [[buffer(4)]],
+                      device const float* sig [[buffer(5)]],
+                      device const float* flat [[buffer(6)]],
+                      device const float* flow [[buffer(7)]],
+                      device const float* tfb [[buffer(8)]],
+                      device const float* tflow [[buffer(9)]],
+                      device float* R [[buffer(10)]],
+                      constant MsParams& p [[buffer(11)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    const int gh = int(p.gh), gw = int(p.gw);
+    const uint pty = min(p.fny - 1u, uint((2.f * float(gid.y) + 0.5f) / float(p.ts)));
+    const uint ptx = min(p.fnx - 1u, uint((2.f * float(gid.x) + 0.5f) / float(p.ts)));
+    const uint to = pty * p.fnx + ptx;
+    const float sy = float(gid.y) + 0.5f * flow[to * 2u + 1u];
+    const float sx = float(gid.x) + 0.5f * flow[to * 2u + 0u];
+    if (!(sy >= 0.f && sy <= float(gh - 1) && sx >= 0.f && sx <= float(gw - 1))) {
+        R[o] = -1.f;         // pass 1 writes z; -1 = leaves the frame -> R = 0
+        return;
+    }
+    const int y0 = min(gh - 2, int(sy)), x0 = min(gw - 2, int(sx));
+    const float fy = sy - float(y0), fx = sx - float(x0);
+    const float s00 = sig[o], s01 = sig[plane + o], s11 = sig[2u * plane + o];
+    const float wxi = 0.5f * fx * (1.f - fx), wyi = 0.5f * fy * (1.f - fy);
+    const uint xm = uint(max(0, int(gid.x) - 1)), xp = uint(min(gw - 1, int(gid.x) + 1));
+    const uint ym = uint(max(0, int(gid.y) - 1)), yp = uint(min(gh - 1, int(gid.y) + 1));
+    float z = 0.f;
+    for (uint c = 0u; c < 3u; ++c) {
+        device const float* Lp = Lc + c * plane;
+        device const float* Lr = L + c * plane;
+        const uint q = uint(y0) * p.gw + uint(x0);
+        const float top = Lp[q] + (Lp[q + 1u] - Lp[q]) * fx;
+        const float bot = Lp[q + p.gw] + (Lp[q + p.gw + 1u] - Lp[q + p.gw]) * fx;
+        const float e = Lr[o] - (top + (bot - top) * fy);
+        const float gxv = gxm[c * plane + o], gyv = gym[c * plane + o];
+        const float dxx = Lr[gid.y * p.gw + xp] + Lr[gid.y * p.gw + xm] - 2.f * Lr[o];
+        const float dyy = Lr[yp * p.gw + gid.x] + Lr[ym * p.gw + gid.x] - 2.f * Lr[o];
+        const float ei = wxi * dxx + wyi * dyy;
+        const float V = vn[c * plane + o] + gxv * gxv * (s00 + p.sfl) + 2.f * gxv * gyv * s01 +
+                        gyv * gyv * (s11 + p.sfl) + ei * ei + 1e-10f;
+        z += e * e / V;
+    }
+    R[o] = z * p.itp2 / 3.f;   // pass 1 output: per-pixel z (see ms_combine)
+}
+
+// Pass 2: 3x3 mean of z (in-frame samples only), then the confidence combination.
+kernel void ms_combine(device const float* Z [[buffer(0)]],
+                       device const float* sig [[buffer(1)]],
+                       device const float* flat [[buffer(2)]],
+                       device const float* efb2 [[buffer(3)]],
+                       device const float* eflow [[buffer(4)]],
+                       device float* R [[buffer(5)]],
+                       constant MsParams& p [[buffer(6)]],
+                       device const float* gxm [[buffer(7)]],
+                       device const float* gym [[buffer(8)]],
+                       device const float* vn [[buffer(9)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const uint plane = p.gh * p.gw, o = gid.y * p.gw + gid.x;
+    if (!(Z[o] >= 0.f)) { R[o] = 0.f; return; }
+    const uint pty = min(p.fny - 1u, uint((2.f * float(gid.y) + 0.5f) / float(p.ts)));
+    const uint ptx = min(p.fnx - 1u, uint((2.f * float(gid.x) + 0.5f) / float(p.ts)));
+    const uint to = pty * p.fnx + ptx;
+    float zs = 0.f;
+    float n = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        const int yy = int(gid.y) + i;
+        if (yy < 0 || yy >= int(p.gh)) continue;
+        for (int j = -1; j <= 1; ++j) {
+            const int xx = int(gid.x) + j;
+            if (xx < 0 || xx >= int(p.gw)) continue;
+            const float v = Z[uint(yy) * p.gw + uint(xx)];
+            if (v >= 0.f) { zs += v; n += 1.f; }
+        }
+    }
+    const float z = zs / n;
+    const float s00 = sig[o], s01 = sig[plane + o], s11 = sig[2u * plane + o];
+    float G = 0.f, Du = 0.f;
+    for (uint c = 0u; c < 3u; ++c) {
+        const float gxv = gxm[c * plane + o], gyv = gym[c * plane + o];
+        const float iv = 1.f / (vn[c * plane + o] + 1e-10f);
+        G += (gxv * gxv + gyv * gyv) * iv;
+        Du += (gxv * gxv * s00 + 2.f * gxv * gyv * s01 + gyv * gyv * s11) * iv;
+    }
+    G /= 3.f;
+    Du /= 3.f;
+    const float Gs = max(0.f, G - 3.f * p.g0);   // signal gradient only (see robustness_ms.cpp)
+    Du *= (G > 0.f) ? Gs / G : 0.f;
+    G = Gs;
+    const float Rp = exp(-0.5f * z * p.exp_p);
+    float tyf = clamp((2.f * float(gid.y) + 0.5f) / float(p.ts) - 0.5f, 0.f, float(p.fny - 1u));
+    float txf = clamp((2.f * float(gid.x) + 0.5f) / float(p.ts) - 0.5f, 0.f, float(p.fnx - 1u));
+    const uint ty0 = uint(tyf), tx0 = uint(txf);
+    const uint ty1 = min(p.fny - 1u, ty0 + 1u), tx1 = min(p.fnx - 1u, tx0 + 1u);
+    const float wy = tyf - float(ty0), wx = txf - float(tx0);
+    const float fb0 = efb2[ty0 * p.fnx + tx0] + (efb2[ty0 * p.fnx + tx1] - efb2[ty0 * p.fnx + tx0]) * wx;
+    const float fb1 = efb2[ty1 * p.fnx + tx0] + (efb2[ty1 * p.fnx + tx1] - efb2[ty1 * p.fnx + tx0]) * wx;
+    const float fl0 = eflow[ty0 * p.fnx + tx0] + (eflow[ty0 * p.fnx + tx1] - eflow[ty0 * p.fnx + tx0]) * wx;
+    const float fl1 = eflow[ty1 * p.fnx + tx0] + (eflow[ty1 * p.fnx + tx1] - eflow[ty1 * p.fnx + tx0]) * wx;
+    (void)to;
+    const float Rfb = exp(-G * 0.25f * (fb0 + (fb1 - fb0) * wy) * p.kfb);
+    const float Rfl = exp(-G * 0.25f * (fl0 + (fl1 - fl0) * wy) * p.kfl);
+    const float Run = exp(-Du * p.ku);
+    const float Rdn = Rp * Rfb;
+    const float Rsr = Rdn * Rfl * Run;
+    R[o] = clamp(Rsr + (Rdn - Rsr) * flat[o], 0.f, 1.f);
+}
+
+kernel void ms_min_h(device const float* in [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant MsParams& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int r = int(p.win_r), W = int(p.gw), x = int(gid.x);
+    device const float* row = in + gid.y * p.gw;
+    float m = row[x];
+    for (int j = -r; j <= r; ++j) m = min(m, row[min(W - 1, max(0, x + j))]);
+    out[gid.y * p.gw + gid.x] = m;
+}
+
+kernel void ms_min_v(device const float* in [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant MsParams& p [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int r = int(p.win_r), H = int(p.gh), y = int(gid.y);
+    float m = in[gid.y * p.gw + gid.x];
+    for (int i = -r; i <= r; ++i) m = min(m, in[uint(min(H - 1, max(0, y + i))) * p.gw + gid.x]);
+    out[gid.y * p.gw + gid.x] = m;
+}

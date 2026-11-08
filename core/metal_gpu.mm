@@ -1011,6 +1011,9 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     // merge outright, so that path keeps the pre-residency behaviour -- slower,
     // but it is not the shipped configuration (it requires the Decimate grey).
     if (cfg.robustness_raw_resolution_active()) return false;
+    // Multi-signal robustness builds its mask from host-side reference maps and per-tile
+    // forward-backward data; it uses the same non-resident path.
+    if (cfg.robustness_multisignal && cfg.robustness_enabled) return false;
 
     auto& c = ctx();
     g_bf.n = n_frames;
@@ -4993,6 +4996,142 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
     @autoreleasepool {
         return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
                                 flow_out, initial_dx, initial_dy, initial_rotation_rad);
+    }
+}
+
+
+// ============================================================================
+// Multi-signal robustness on the GPU (twin of robustness_ms.cpp; kernels ms_*).
+struct MsParamsCPU {
+    uint32_t gh, gw, w, fny;
+    uint32_t fnx, ts, ntaps, win_r;
+    uint32_t cfa00, cfa01, cfa10, cfa11;
+    uint32_t cnt0, cnt1, cnt2, p0;
+    float itp2, ku, exp_p, sfl;
+    float kfb, kfl, g0, p3;
+    float taps[16];
+};
+static_assert(sizeof(MsParamsCPU) == 160, "MsParamsCPU layout");
+
+struct MsRefGpu {
+    const float* key = nullptr;
+    size_t n = 0;
+    __strong id<MTLBuffer> L = nil, gx = nil, gy = nil, vn = nil, sig = nil, flat = nil;
+};
+static MsRefGpu g_ms_ref;
+
+static Image ms_compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
+                                              const FlowField& flow, int ts, const Config& cfg) {
+    const RefStats::Ms& m = ref_stats.ms;
+    if (!metal_gpu_init() || m.gh <= 0 || comp_raw.data.empty() || flow.ny <= 0 || flow.nx <= 0 ||
+        ts <= 0 || comp_raw.h / 2 != m.gh || comp_raw.w / 2 != m.gw || m.blur.size() > 16)
+        return Image();
+    auto& c = ctx();
+    id<MTLComputePipelineState> pg = c.pipe("ms_guide"), pbh = c.pipe("ms_blur_h"),
+        pbv = c.pipe("ms_blur_v"), pr = c.pipe("ms_robust"), pmh = c.pipe("ms_min_h"),
+        pmv = c.pipe("ms_min_v"), pc = c.pipe("ms_combine");
+    if (!pg || !pbh || !pbv || !pr || !pmh || !pmv || !pc) return Image();
+    const size_t plane = (size_t)m.gh * m.gw;
+    // Reference maps: uploaded once per burst.
+    if (g_ms_ref.key != m.L.data() || g_ms_ref.n != plane) {
+        g_ms_ref.L = buf(m.L.data(), m.L.size() * sizeof(float));
+        g_ms_ref.gx = buf(m.gx.data(), m.gx.size() * sizeof(float));
+        g_ms_ref.gy = buf(m.gy.data(), m.gy.size() * sizeof(float));
+        g_ms_ref.vn = buf(m.vn.data(), m.vn.size() * sizeof(float));
+        g_ms_ref.sig = buf(m.sig.data(), m.sig.size() * sizeof(float));
+        g_ms_ref.flat = buf(m.flat.data(), m.flat.size() * sizeof(float));
+        g_ms_ref.key = m.L.data();
+        g_ms_ref.n = plane;
+    }
+    if (!g_ms_ref.L || !g_ms_ref.gx || !g_ms_ref.gy || !g_ms_ref.vn || !g_ms_ref.sig || !g_ms_ref.flat)
+        return Image();
+    std::vector<float> t_fb, t_flow;   // per-tile E_fb^2 and E_flow (raw px^2)
+    ms_tile_errors(flow, t_fb, t_flow);
+
+    MsParamsCPU p{};
+    p.gh = (uint32_t)m.gh; p.gw = (uint32_t)m.gw; p.w = (uint32_t)comp_raw.w;
+    p.fny = (uint32_t)flow.ny; p.fnx = (uint32_t)flow.nx; p.ts = (uint32_t)ts;
+    p.ntaps = (uint32_t)m.blur.size();
+    p.win_r = (uint32_t)std::max(0, cfg.ms_min_window / 2);
+    p.cfa00 = cfg.cfa.p[0][0]; p.cfa01 = cfg.cfa.p[0][1]; p.cfa10 = cfg.cfa.p[1][0]; p.cfa11 = cfg.cfa.p[1][1];
+    uint32_t cnt[3] = {0, 0, 0};
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) ++cnt[std::min(2, (int)cfg.cfa.p[i][j])];
+    p.cnt0 = cnt[0]; p.cnt1 = cnt[1]; p.cnt2 = cnt[2];
+    p.itp2 = 1.f / std::max(1e-6f, cfg.ms_tau_p * cfg.ms_tau_p);
+    p.ku = 1.f / (2.f * std::max(1e-6f, cfg.ms_tau_u * cfg.ms_tau_u));
+    p.kfb = cfg.ms_exp_fb / (2.f * std::max(1e-6f, cfg.ms_tau_fb * cfg.ms_tau_fb));
+    p.kfl = cfg.ms_exp_flow / (2.f * std::max(1e-6f, cfg.ms_tau_flow * cfg.ms_tau_flow));
+    p.g0 = m.g0;
+    p.exp_p = cfg.ms_exp_p;
+    p.sfl = 0.25f * cfg.ms_shift_floor * cfg.ms_shift_floor;
+    for (size_t i = 0; i < m.blur.size(); ++i) p.taps[i] = m.blur[i];
+
+    id<MTLBuffer> b_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
+    id<MTLBuffer> b_g = buf(nullptr, 3 * plane * sizeof(float));
+    id<MTLBuffer> b_t = buf(nullptr, 3 * plane * sizeof(float));
+    id<MTLBuffer> b_Lc = buf(nullptr, 3 * plane * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    id<MTLBuffer> b_tfb = buf(t_fb.data(), t_fb.size() * sizeof(float));
+    id<MTLBuffer> b_tfl = buf(t_flow.data(), t_flow.size() * sizeof(float));
+    id<MTLBuffer> b_R = buf(nullptr, plane * sizeof(float));
+    id<MTLBuffer> b_R2 = buf(nullptr, plane * sizeof(float));
+    if (!b_raw || !b_g || !b_t || !b_Lc || !b_flow || !b_tfb || !b_tfl || !b_R || !b_R2) return Image();
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return Image();
+    const NSUInteger W = p.gw, Hh = p.gh;
+    [enc setBuffer:b_raw offset:0 atIndex:0]; [enc setBuffer:b_g offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pg, W, Hh);
+    [enc setBuffer:b_g offset:0 atIndex:0]; [enc setBuffer:b_t offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pbh, W, Hh);
+    [enc setBuffer:b_t offset:0 atIndex:0]; [enc setBuffer:b_Lc offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pbv, W, Hh);
+    [enc setBuffer:b_Lc offset:0 atIndex:0];
+    [enc setBuffer:g_ms_ref.L offset:0 atIndex:1];
+    [enc setBuffer:g_ms_ref.gx offset:0 atIndex:2];
+    [enc setBuffer:g_ms_ref.gy offset:0 atIndex:3];
+    [enc setBuffer:g_ms_ref.vn offset:0 atIndex:4];
+    [enc setBuffer:g_ms_ref.sig offset:0 atIndex:5];
+    [enc setBuffer:g_ms_ref.flat offset:0 atIndex:6];
+    [enc setBuffer:b_flow offset:0 atIndex:7];
+    [enc setBuffer:b_tfb offset:0 atIndex:8];
+    [enc setBuffer:b_tfl offset:0 atIndex:9];
+    [enc setBuffer:b_R2 offset:0 atIndex:10];          // pass 1: z
+    [enc setBytes:&p length:sizeof(p) atIndex:11];
+    dispatch2(enc, pr, W, Hh);
+    [enc setBuffer:b_R2 offset:0 atIndex:0];
+    [enc setBuffer:g_ms_ref.sig offset:0 atIndex:1];
+    [enc setBuffer:g_ms_ref.flat offset:0 atIndex:2];
+    [enc setBuffer:b_tfb offset:0 atIndex:3];
+    [enc setBuffer:b_tfl offset:0 atIndex:4];
+    [enc setBuffer:b_R offset:0 atIndex:5];             // pass 2: R
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    [enc setBuffer:g_ms_ref.gx offset:0 atIndex:7];
+    [enc setBuffer:g_ms_ref.gy offset:0 atIndex:8];
+    [enc setBuffer:g_ms_ref.vn offset:0 atIndex:9];
+    dispatch2(enc, pc, W, Hh);
+    if (p.win_r > 0u) {
+        [enc setBuffer:b_R offset:0 atIndex:0]; [enc setBuffer:b_R2 offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pmh, W, Hh);
+        [enc setBuffer:b_R2 offset:0 atIndex:0]; [enc setBuffer:b_R offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2]; dispatch2(enc, pmv, W, Hh);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:multisignal");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+    Image r(m.gh, m.gw, 1);
+    memcpy(r.data.data(), [b_R contents], plane * sizeof(float));
+    return r;
+}
+
+Image ms_compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                                  const FlowField& flow, int tile_size, const Config& cfg) {
+    @autoreleasepool {
+        return ms_compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg);
     }
 }
 

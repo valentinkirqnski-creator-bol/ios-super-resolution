@@ -283,6 +283,17 @@ struct TuningParams: Equatable, Codable {
     /// Algorithm 6: noise-correction sigma from the reference (no warp) instead of the
     /// warped n-th frame (line 25 as written).
     var robustness_alg6_sigma_ref: Bool = false
+    /// Multi-signal alignment-confidence robustness (photometric low-pass + forward-backward
+    /// + local affine flow + LK uncertainty), replacing Eq. 5-9 when on.
+    var robustness_multisignal: Bool = false
+    var ms_fb_enabled: Bool = true
+    var ms_lowpass_sigma: Float = 0.75
+    var ms_tau_p: Float = 1.5
+    var ms_tau_fb: Float = 3.0
+    var ms_tau_flow: Float = 3.0
+    var ms_tau_u: Float = 3.0
+    var ms_flat_k: Float = 4.0
+    var ms_min_window: Int = 5
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -350,6 +361,7 @@ struct TuningParams: Equatable, Codable {
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case robustness_ipol_alg6, robustness_alg6_sigma_ref
+        case robustness_multisignal, ms_fb_enabled, ms_lowpass_sigma, ms_tau_p, ms_tau_fb, ms_tau_flow, ms_tau_u, ms_flat_k, ms_min_window
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
@@ -454,6 +466,15 @@ struct TuningParams: Equatable, Codable {
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         robustness_ipol_alg6 = try c.decodeIfPresent(Bool.self, forKey: .robustness_ipol_alg6) ?? robustness_ipol_alg6
         robustness_alg6_sigma_ref = try c.decodeIfPresent(Bool.self, forKey: .robustness_alg6_sigma_ref) ?? robustness_alg6_sigma_ref
+        robustness_multisignal = try c.decodeIfPresent(Bool.self, forKey: .robustness_multisignal) ?? robustness_multisignal
+        ms_fb_enabled = try c.decodeIfPresent(Bool.self, forKey: .ms_fb_enabled) ?? ms_fb_enabled
+        ms_lowpass_sigma = try c.decodeIfPresent(Float.self, forKey: .ms_lowpass_sigma) ?? ms_lowpass_sigma
+        ms_tau_p = try c.decodeIfPresent(Float.self, forKey: .ms_tau_p) ?? ms_tau_p
+        ms_tau_fb = try c.decodeIfPresent(Float.self, forKey: .ms_tau_fb) ?? ms_tau_fb
+        ms_tau_flow = try c.decodeIfPresent(Float.self, forKey: .ms_tau_flow) ?? ms_tau_flow
+        ms_tau_u = try c.decodeIfPresent(Float.self, forKey: .ms_tau_u) ?? ms_tau_u
+        ms_flat_k = try c.decodeIfPresent(Float.self, forKey: .ms_flat_k) ?? ms_flat_k
+        ms_min_window = try c.decodeIfPresent(Int.self, forKey: .ms_min_window) ?? ms_min_window
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -2247,6 +2268,15 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "robustness_ipol_alg6": NSNumber(value: tuningParams.robustness_ipol_alg6),
             "robustness_alg6_sigma_ref": NSNumber(value: tuningParams.robustness_alg6_sigma_ref),
+            "robustness_multisignal": NSNumber(value: tuningParams.robustness_multisignal),
+            "ms_fb_enabled": NSNumber(value: tuningParams.ms_fb_enabled),
+            "ms_lowpass_sigma": NSNumber(value: tuningParams.ms_lowpass_sigma),
+            "ms_tau_p": NSNumber(value: tuningParams.ms_tau_p),
+            "ms_tau_fb": NSNumber(value: tuningParams.ms_tau_fb),
+            "ms_tau_flow": NSNumber(value: tuningParams.ms_tau_flow),
+            "ms_tau_u": NSNumber(value: tuningParams.ms_tau_u),
+            "ms_flat_k": NSNumber(value: tuningParams.ms_flat_k),
+            "ms_min_window": NSNumber(value: tuningParams.ms_min_window),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),

@@ -118,6 +118,11 @@ struct FlowField {
         aperture_limited((size_t)ny_ * nx_, 0u),
         match_ambiguous((size_t)ny_ * nx_, 0u) {}
 
+    // Multi-signal robustness (Config::robustness_multisignal): forward-backward error
+    // per tile, || u_0->i(c) + u_i->0(c + u_0->i(c)) || in raw pixels at the tile centre c.
+    // Empty = not measured (R_fb = 1).
+    std::vector<float> fb_error;
+
     // True when motion_irregular carries a measurement for this grid.
     inline bool has_motion_prior() const {
         return motion_irregular.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
@@ -973,6 +978,33 @@ struct Config {
     //            upscaled + warped; the reference mean mu_p is upscaled (no warp) and
     //            indexes the noise curves (lines 28-29).
     bool robustness_ipol_alg6 = true;
+    // ---- Multi-signal alignment-confidence robustness (replaces Eq. 5-9 when on) ----
+    // R from four independent signals at guide resolution (robustness_ms.cpp):
+    //   R_p    photometric: low-passed guides, z = mean_c e_c^2 / (tau_p^2 V_c),
+    //          V_c = V_noise + grad L^T Sigma_u grad L, R_p = exp(-z / 2)
+    //   R_fb   forward-backward flow consistency      } each as the reconstruction DAMAGE
+    //   R_flow local affine motion-model residual      } its displacement error would do,
+    //   R_unc  LK alignment uncertainty                } D = mean_c grad^T E grad / V_noise,c,
+    //          R = exp(-D / (2 tau^2)), tau in noise standard deviations: a large error in a
+    //          flat area does no damage (kept for denoising), the same error on an edge does.
+    // R_denoise = R_p^a R_fb^b, R_SR = R_denoise R_flow^c R_unc, and the single map the
+    // merge uses is R = R_SR + (R_denoise - R_SR) * flatness (flat areas only need the
+    // denoising confidence), then a local min.
+    bool  robustness_multisignal = false;
+    float ms_lowpass_sigma = 0.75f;   // Gaussian low pass of the guides, guide px (~1.5 raw px)
+    float ms_tau_p = 1.5f;            // photometric tolerance (in noise-normalised std units)
+    bool  ms_fb_enabled = true;       // run the backward alignment (doubles alignment cost)
+    float ms_tau_fb = 3.f;            // noise std of tolerated damage
+    float ms_tau_flow = 3.f;          // noise std of tolerated damage
+    float ms_tau_u = 3.f;             // noise std of tolerated damage
+    float ms_unc_cap = 4.f;           // raw px: lambda bounds sigma_u at this in flat areas
+    // Legitimate sampling disagreement allowed in the photometric test, as an isotropic
+    // alignment-uncertainty floor (raw px): each guide channel samples the scene every
+    // 2 raw px, so two correctly aligned frames still differ by an interpolation residual.
+    float ms_shift_floor = 0.1f;
+    float ms_flat_k = 4.f;            // detail SNR at which flatness = 1/e
+    float ms_exp_p = 1.f, ms_exp_fb = 1.f, ms_exp_flow = 1.f;   // a, b, c
+    int   ms_min_window = 5;          // final local-min window (1 = off)
     bool robustness_alg6_sigma_ref = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
@@ -1003,7 +1035,8 @@ struct Config {
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
-        if (robustness_ipol_alg6 && bayer_mode) return true;   // IPOL Algorithm 6
+        if (robustness_ipol_alg6 && bayer_mode && !robustness_multisignal)
+            return true;   // IPOL Algorithm 6 (the multi-signal model replaces it when on)
         return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
                grey_method == GreyMethod::Decimate;
     }

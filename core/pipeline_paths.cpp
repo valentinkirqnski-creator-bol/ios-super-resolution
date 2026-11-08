@@ -1619,6 +1619,31 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(cons_ts));
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
+        // Multi-signal robustness: forward-backward consistency needs the comparison ->
+        // reference flow on the same grid. Aligned with the roles swapped; the reference
+        // derivative cache and the GPU's sticky moving grey are both keyed on "the" current
+        // pair, so they are dropped around the backward pass. (Residency is off with this
+        // model, so both greys carry host pixels.)
+        if (work.robustness_enabled && work.robustness_multisignal && work.ms_fb_enabled &&
+            !comp_grey.data.empty() && !ref_grey.data.empty() && flow.ny > 0) {
+            const double t_bwd = prof_now_ms();
+            clear_align_ref_ica_cache();
+#if defined(__APPLE__)
+            metal_invalidate_sticky_grey();
+#endif
+            Pyramid comp_pyr = build_pyramid(
+                pad_image_circular(comp_grey, work.grey_tile_size(tile_size)), work.bm_factors);
+            FlowField bwd = align(comp_pyr, comp_grey, ref_grey, work, tile_size);
+            bwd = flow_to_raw_tile_grid(bwd, comp.h, comp.w, ref_grey.h, ref_grey.w, cons_ts,
+                                        work.r_Mt, work.num_threads,
+                                        work.grey_tile_size(cons_ts));
+            clear_align_ref_ica_cache();
+#if defined(__APPLE__)
+            metal_invalidate_sticky_grey();
+#endif
+            if (bwd.ny == flow.ny && bwd.nx == flow.nx) ms_fill_fb_error(flow, bwd, cons_ts);
+            prof_add_cpu("comp:align-backward", prof_now_ms() - t_bwd);
+        }
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());

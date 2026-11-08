@@ -1119,6 +1119,21 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_enabled {
+                        Toggle("Multi-Signal Robustness", isOn: $cam.tuningParams.robustness_multisignal)
+                        Text("Replaces the s·exp(−d²/σ²)−t mask with four alignment-confidence signals: low-passed photometric residual against noise + alignment-uncertainty variance, forward-backward flow consistency, local affine flow residual, and LK alignment uncertainty. Flat areas use the denoising confidence, detailed areas the stricter super-resolution confidence. Runs a backward alignment per frame.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.robustness_multisignal {
+                            Toggle("Forward-Backward Check", isOn: $cam.tuningParams.ms_fb_enabled)
+                            ispRow("Photometric tolerance τp", $cam.tuningParams.ms_tau_p, 0.5...5.0, "%.2f")
+                            ispRow("Low-pass σ (guide px)", $cam.tuningParams.ms_lowpass_sigma, 0.0...3.0, "%.2f")
+                            ispRow("FB tolerance τfb", $cam.tuningParams.ms_tau_fb, 0.25...20.0, "%.2f")
+                            ispRow("Flow-model tolerance τflow", $cam.tuningParams.ms_tau_flow, 0.25...20.0, "%.2f")
+                            ispRow("Uncertainty tolerance τu", $cam.tuningParams.ms_tau_u, 0.25...20.0, "%.2f")
+                            ispRow("Flatness detail SNR", $cam.tuningParams.ms_flat_k, 0.5...20.0, "%.1f")
+                            Stepper("Local-min window: \(cam.tuningParams.ms_min_window)", value: $cam.tuningParams.ms_min_window, in: 1...9, step: 2)
+                            Text("Lower τ rejects more. All τ are in noise standard deviations: the geometric signals are judged by the image damage their displacement error would cause (∇L·δ), so a large error in a flat area costs nothing and the same error on an edge is rejected.")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
                         Toggle("IPOL Algorithm 6 (raw-res)", isOn: $cam.tuningParams.robustness_ipol_alg6)
                         Text("ON (default): the local statistics are Dodgson ×2 upscaled and warped to the raw frame, R is computed per raw pixel and the 5×5 minimum runs at raw resolution — IPOL Algorithm 6 as written. OFF: 460-main's guide-resolution mask.")
                             .font(.footnote).foregroundColor(.secondary)

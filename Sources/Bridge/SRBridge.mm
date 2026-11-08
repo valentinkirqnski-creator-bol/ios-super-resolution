@@ -578,6 +578,15 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_ipol_alg6 = tuning[@"robustness_ipol_alg6"].boolValue;
     if (tuning[@"robustness_alg6_sigma_ref"])
         cfg.robustness_alg6_sigma_ref = tuning[@"robustness_alg6_sigma_ref"].boolValue;
+    if (tuning[@"robustness_multisignal"]) cfg.robustness_multisignal = tuning[@"robustness_multisignal"].boolValue;
+    if (tuning[@"ms_fb_enabled"]) cfg.ms_fb_enabled = tuning[@"ms_fb_enabled"].boolValue;
+    if (tuning[@"ms_lowpass_sigma"]) cfg.ms_lowpass_sigma = tuning[@"ms_lowpass_sigma"].floatValue;
+    if (tuning[@"ms_tau_p"]) cfg.ms_tau_p = tuning[@"ms_tau_p"].floatValue;
+    if (tuning[@"ms_tau_fb"]) cfg.ms_tau_fb = tuning[@"ms_tau_fb"].floatValue;
+    if (tuning[@"ms_tau_flow"]) cfg.ms_tau_flow = tuning[@"ms_tau_flow"].floatValue;
+    if (tuning[@"ms_tau_u"]) cfg.ms_tau_u = tuning[@"ms_tau_u"].floatValue;
+    if (tuning[@"ms_flat_k"]) cfg.ms_flat_k = tuning[@"ms_flat_k"].floatValue;
+    if (tuning[@"ms_min_window"]) cfg.ms_min_window = std::max(1, tuning[@"ms_min_window"].intValue);
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])

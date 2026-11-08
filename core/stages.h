@@ -80,6 +80,18 @@ struct RefStats {
     Image means;
     Image stds;
     Image hf_loss;   // 1-channel high-frequency variance-loss map
+    // Multi-signal robustness (Config::robustness_multisignal), reference side, built once
+    // per burst on the host: guide-resolution planar maps.
+    struct Ms {
+        int gh = 0, gw = 0;
+        std::vector<float> L;      // low-passed guide, [3][gh][gw]
+        std::vector<float> gx, gy; // its central-difference gradients, [3][gh][gw]
+        std::vector<float> vn;     // noise variance of a low-passed difference, [3][gh][gw]
+        std::vector<float> sig;    // alignment uncertainty Sigma_u (guide px^2): sxx, sxy, syy, [3][gh][gw]
+        std::vector<float> flat;   // flatness in [0, 1], [gh][gw]
+        std::vector<float> blur;   // the separable Gaussian taps (centre first)
+        float g0 = 0.f;            // noise-only expectation of G = mean_c |grad L_c|^2 / V_n,c
+    } ms;
     // Dodgson-quadratic upscale of means/stds to raw resolution (Algorithm
     // 6's literal R <- Zeros(H,W) path -- see Config::
     // robustness_raw_resolution_enabled). Computed once per burst here
@@ -98,6 +110,25 @@ Image robustness_local_min_on_guide(const Image& R);
 // Plain 5x5 minimum (clamped edges) at R's own resolution -- IPOL Algorithm 6 lines
 // 33-35 / Eq. 21 on the raw-resolution R (Config::robustness_ipol_alg6).
 Image robustness_local_min_5x5(const Image& R);
+
+// ---- robustness_ms.cpp: multi-signal alignment confidence ---------------
+// Reference preparation (once per burst) into ref_stats.ms.
+void ms_init_reference(const Image& ref_raw, const Config& cfg, RefStats& st);
+// Per-tile forward-backward error into fwd.fb_error (raw px). bwd: the comparison ->
+// reference flow on the same tile grid.
+void ms_fill_fb_error(FlowField& fwd, const FlowField& bwd, int tile_size);
+// Per-tile geometric errors in raw px^2: E_fb^2 (0 when not measured) and the affine
+// flow-model residual E_flow, [ny][nx] each.
+void ms_tile_errors(const FlowField& flow, std::vector<float>& efb2, std::vector<float>& eflow);
+// The multi-signal R at guide resolution (after the local min). CPU; the Metal twin is
+// ms_compute_robustness_metal.
+Image ms_compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
+                            const FlowField& flow, int tile_size, const Config& cfg);
+// Shared helpers (CPU and Metal host).
+void ms_guide(const Image& raw, const Config& cfg, std::vector<float>& g, int& gh, int& gw);
+void ms_blur(const std::vector<float>& in, int gh, int gw, const std::vector<float>& taps,
+             std::vector<float>& out, int num_threads);
+Image ms_local_min(const Image& R, int window);
 
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
 // mode). Exposed so callers besides robustness.cpp (neural_flow's caller)
