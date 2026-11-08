@@ -1298,6 +1298,28 @@ static Image process_burst_bran14(int n, const RawFrameLoaderFn& loader, const C
     work.k_shrink = 2.f;
     work.gcam_sabre_kernel = false;
     work.affine_flow_enabled = false;
+    // Every other switch the GPU merge / alignment would read. They belong to the regular
+    // pipeline's experiments, but a saved preset can carry them in: the Metal merge, for
+    // one, samples R BILINEARLY at (lr - 0.5) / 2 when merge_robustness_bilinear,
+    // robustness_guide_res_bilinear, gcam_sabre_merge_res or gcam_sabre_bilinear_upscale is
+    // set -- not 1.4's int(lr // 2 - 0.5) -- which re-admits misaligned samples (measured
+    // on burst12: 6.7% of output values off by > 1e-3, up to 0.38).
+    work.merge_robustness_bilinear = false;
+    work.robustness_guide_res_bilinear = false;
+    work.gcam_sabre_merge_res = false;
+    work.gcam_sabre_bilinear_upscale = false;
+    work.gcam_sabre_flow_bilinear = false;
+    work.dense_flow_enabled = false;
+    work.global_homography_enabled = false;
+    work.isa_prealign_enabled = false;
+    work.gyro_prealign_enabled = false;
+    work.halftile_refine_enabled = false;
+    work.feat_metric_refine_enabled = false;
+    work.robustness_per_channel = false;
+    work.flow_fb_consistency_enabled = false;
+    work.flow_consensus_enabled = false;
+    work.rob_mask_nn_enabled = false;
+    work.robustness_raw_resolution_enabled = false;
     work.merge_backend_d3d11 = false;
     work.exposure_match_enabled = false;
     work.burst_frame_count = n;
@@ -1377,6 +1399,8 @@ static Image process_burst_bran14(int n, const RawFrameLoaderFn& loader, const C
     rp.tile_size = ts;
     rp.noise_correction = true;
     rp.t = r_t; rp.s1 = r_s1; rp.s2 = r_s2; rp.Mt = r_Mt;
+    rp.sigma_mult = (std::isfinite(work.bran14_sigma_mult) && work.bran14_sigma_mult > 0.f)
+                        ? (double)work.bran14_sigma_mult : 1.0;
     if (lut) {
         rp.sigma_sq_curve = lut->sigma_noise_sq.data();
         rp.d_sq_curve = lut->d_noise_sq.data();

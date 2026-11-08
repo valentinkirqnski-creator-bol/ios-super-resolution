@@ -346,6 +346,7 @@ Image bran14_compute_robustness_debug(const Image& comp, const RefStats14& ref,
                     d *= shrink * shrink;
                 }
             }
+            if (p.sigma_mult != 1.0) s *= p.sigma_mult * p.sigma_mult;   // (k sigma)^2; skipped at 1
             dsq[o] = (float)d;
             ssq[o] = (float)s;
         }

@@ -5423,7 +5423,7 @@ struct Bran14Params {
     uint noise_corr, iso, hard, guard;
     float t, s1, s2, mt2;       // robustness; mt2 = float(Mt * Mt)
     float kd, kn, dth, dtr;     // update_snr_config lerps
-    float kst, ksh, _p0, _p1;   // k_stretch, k_shrink
+    float kst, ksh, sm2, _p1;   // k_stretch, k_shrink, (sigma multiplier)^2
     float4 alpha;               // R, G1, B, G2
     float4 beta;
 };
@@ -5559,6 +5559,7 @@ kernel void bran14_robust(device const float* cmean [[buffer(0)]],
             d *= shrink * shrink;
         }
     }
+    sg *= p.sm2;                      // Config::bran14_sigma_mult squared (1 = 1.4)
     float r;
     if (sg == 0.f) {
         r = 0.f;                        // 1.4: 0/0 -> NaN -> 0, or exp(-inf) - t -> 0

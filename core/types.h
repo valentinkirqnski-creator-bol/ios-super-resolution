@@ -499,6 +499,10 @@ struct Config {
     // covariance, a NaN merge and a black output pixel (process() zeroes NaN pixels).
     // false = exactly that. true = the port's guard (isotropic kernel on a flat patch).
     bool  bran14_flat_kernel_guard = false;
+    // bran robustness: multiplier k on sigma (after 1.4's noise correction, i.e. after
+    // sigma^2 = max(sigma^2, LUT)): R = S * exp(-d^2 / (k sigma)^2) - t. k < 1 rejects
+    // more, k > 1 less. 1 = 1.4 exactly.
+    float bran14_sigma_mult = 1.f;
     // NoiseProfile as 1.4 reads it: float64, expanded to R, G1, B, G2
     // (expand_noise_profile_to_rgbg). noise14_valid false = tag absent / malformed.
     double noise14_alpha[4] = {0, 0, 0, 0};

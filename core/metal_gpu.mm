@@ -6323,7 +6323,7 @@ struct Bran14ParamsCPU {
     uint32_t noise_corr, iso, hard, guard;
     float t, s1, s2, mt2;
     float kd, kn, dth, dtr;
-    float kst, ksh, p0, p1;
+    float kst, ksh, sm2, p1;
     float alpha[4];
     float beta[4];
 };
@@ -6357,7 +6357,9 @@ static Bran14ParamsCPU bran14_params(const Image& raw, const FlowField* flow,
     p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
     p.hard = (cfg.selection == SelectionLaw::HardThreshold) ? 1u : 0u;
     p.guard = cfg.bran14_flat_kernel_guard ? 1u : 0u;
+    p.sm2 = 1.f;
     if (rp) {
+        p.sm2 = (float)(rp->sigma_mult * rp->sigma_mult);
         p.t = (float)rp->t; p.s1 = (float)rp->s1; p.s2 = (float)rp->s2;
         p.mt2 = (float)(rp->Mt * rp->Mt);
     }

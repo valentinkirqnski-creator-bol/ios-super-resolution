@@ -107,6 +107,8 @@ struct TuningParams: Equatable, Codable {
     var bran14_flat_kernel_guard: Bool = false
     /// bran pipeline: all per-frame stages on the CPU in 1.4's float64 (slow, bit-exact); off = GPU.
     var bran14_exact_cpu: Bool = false
+    /// bran robustness: multiplier on sigma in exp(-d^2/sigma^2) (< 1 rejects more). 1 = 1.4.
+    var bran14_sigma_mult: Float = 1.0
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
@@ -573,7 +575,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case k_detail_override, k_detail_override_value
         case merge_match_14
-        case bran14_pipeline, bran14_flat_kernel_guard, bran14_exact_cpu
+        case bran14_pipeline, bran14_flat_kernel_guard, bran14_exact_cpu, bran14_sigma_mult
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -655,6 +657,7 @@ struct TuningParams: Equatable, Codable {
         bran14_pipeline = try c.decodeIfPresent(Bool.self, forKey: .bran14_pipeline) ?? bran14_pipeline
         bran14_flat_kernel_guard = try c.decodeIfPresent(Bool.self, forKey: .bran14_flat_kernel_guard) ?? bran14_flat_kernel_guard
         bran14_exact_cpu = try c.decodeIfPresent(Bool.self, forKey: .bran14_exact_cpu) ?? bran14_exact_cpu
+        bran14_sigma_mult = try c.decodeIfPresent(Float.self, forKey: .bran14_sigma_mult) ?? bran14_sigma_mult
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
@@ -2544,6 +2547,7 @@ final class CameraModel: NSObject, ObservableObject {
             "bran14_pipeline": NSNumber(value: tuningParams.bran14_pipeline),
             "bran14_flat_kernel_guard": NSNumber(value: tuningParams.bran14_flat_kernel_guard),
             "bran14_exact_cpu": NSNumber(value: tuningParams.bran14_exact_cpu),
+            "bran14_sigma_mult": NSNumber(value: tuningParams.bran14_sigma_mult),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
