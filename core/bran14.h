@@ -61,6 +61,7 @@ struct Robustness14Params {
     bool noise_correction = true;
     double t = 0.12, s1 = 2.0, s2 = 12.0, Mt = 0.8;
     double sigma_mult = 1.0;         // Config::bran14_sigma_mult (1 = 1.4 exactly)
+    double d_mult = 1.0;             // Config::bran14_d_mult (1 = 1.4 exactly)
     const float* sigma_sq_curve = nullptr;   // LUT, n_curve entries
     const float* d_sq_curve = nullptr;
     int n_curve = 0;

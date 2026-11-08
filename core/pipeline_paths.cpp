@@ -1401,6 +1401,8 @@ static Image process_burst_bran14(int n, const RawFrameLoaderFn& loader, const C
     rp.t = r_t; rp.s1 = r_s1; rp.s2 = r_s2; rp.Mt = r_Mt;
     rp.sigma_mult = (std::isfinite(work.bran14_sigma_mult) && work.bran14_sigma_mult > 0.f)
                         ? (double)work.bran14_sigma_mult : 1.0;
+    rp.d_mult = (std::isfinite(work.bran14_d_mult) && work.bran14_d_mult > 0.f)
+                    ? (double)work.bran14_d_mult : 1.0;
     if (lut) {
         rp.sigma_sq_curve = lut->sigma_noise_sq.data();
         rp.d_sq_curve = lut->d_noise_sq.data();

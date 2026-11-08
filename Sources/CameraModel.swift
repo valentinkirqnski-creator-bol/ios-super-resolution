@@ -109,6 +109,8 @@ struct TuningParams: Equatable, Codable {
     var bran14_exact_cpu: Bool = false
     /// bran robustness: multiplier on sigma in exp(-d^2/sigma^2) (< 1 rejects more). 1 = 1.4.
     var bran14_sigma_mult: Float = 1.0
+    /// bran robustness: multiplier on d in exp(-d^2/sigma^2) (> 1 rejects more). 1 = 1.4.
+    var bran14_d_mult: Float = 1.0
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
@@ -575,7 +577,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case k_detail_override, k_detail_override_value
         case merge_match_14
-        case bran14_pipeline, bran14_flat_kernel_guard, bran14_exact_cpu, bran14_sigma_mult
+        case bran14_pipeline, bran14_flat_kernel_guard, bran14_exact_cpu, bran14_sigma_mult, bran14_d_mult
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -658,6 +660,7 @@ struct TuningParams: Equatable, Codable {
         bran14_flat_kernel_guard = try c.decodeIfPresent(Bool.self, forKey: .bran14_flat_kernel_guard) ?? bran14_flat_kernel_guard
         bran14_exact_cpu = try c.decodeIfPresent(Bool.self, forKey: .bran14_exact_cpu) ?? bran14_exact_cpu
         bran14_sigma_mult = try c.decodeIfPresent(Float.self, forKey: .bran14_sigma_mult) ?? bran14_sigma_mult
+        bran14_d_mult = try c.decodeIfPresent(Float.self, forKey: .bran14_d_mult) ?? bran14_d_mult
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
@@ -2548,6 +2551,7 @@ final class CameraModel: NSObject, ObservableObject {
             "bran14_flat_kernel_guard": NSNumber(value: tuningParams.bran14_flat_kernel_guard),
             "bran14_exact_cpu": NSNumber(value: tuningParams.bran14_exact_cpu),
             "bran14_sigma_mult": NSNumber(value: tuningParams.bran14_sigma_mult),
+            "bran14_d_mult": NSNumber(value: tuningParams.bran14_d_mult),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
@@ -2981,9 +2985,14 @@ final class CameraModel: NSObject, ObservableObject {
             self.isProcessing = false
             self.progress = success ? 1 : 0
             // On failure show the detailed pipeline error in the status line
-            // (the separate noise/diagnostic line was removed from the UI).
-            self.statusText = (!success && !self.lastPipelineError.isEmpty)
-                ? self.lastPipelineError : message
+            // (the separate noise/diagnostic line was removed from the UI). On
+            // success show nothing: the "Saved super-res DNG to Photos" line above
+            // the shutter was removed at the user's request.
+            if success {
+                self.statusText = ""
+            } else {
+                self.statusText = !self.lastPipelineError.isEmpty ? self.lastPipelineError : message
+            }
         }
         sessionQueue.async {
             self.resumeZSLAfterProcessing()

@@ -503,6 +503,9 @@ struct Config {
     // sigma^2 = max(sigma^2, LUT)): R = S * exp(-d^2 / (k sigma)^2) - t. k < 1 rejects
     // more, k > 1 less. 1 = 1.4 exactly.
     float bran14_sigma_mult = 1.f;
+    // bran robustness: multiplier m on the colour distance d (after the noise correction's
+    // shrink): R = S * exp(-(m d)^2 / (k sigma)^2) - t. m > 1 rejects more. 1 = 1.4.
+    float bran14_d_mult = 1.f;
     // NoiseProfile as 1.4 reads it: float64, expanded to R, G1, B, G2
     // (expand_noise_profile_to_rgbg). noise14_valid false = tag absent / malformed.
     double noise14_alpha[4] = {0, 0, 0, 0};

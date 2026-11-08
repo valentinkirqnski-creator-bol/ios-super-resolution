@@ -486,6 +486,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"bran14_exact_cpu"]) cfg.bran14_exact_cpu = tuning[@"bran14_exact_cpu"].boolValue;
     if (tuning[@"bran14_sigma_mult"])
         cfg.bran14_sigma_mult = std::max(0.05f, std::min(10.f, tuning[@"bran14_sigma_mult"].floatValue));
+    if (tuning[@"bran14_d_mult"])
+        cfg.bran14_d_mult = std::max(0.05f, std::min(20.f, tuning[@"bran14_d_mult"].floatValue));
     {
         // Monte Carlo noise LUTs (bran pipeline) persist in Caches, one file per profile.
         NSArray<NSString *> *caches =
