@@ -4832,6 +4832,8 @@ static_assert(sizeof(MergeRefParamsCPU) == 128, "MergeRefParamsCPU layout");
 static id<MTLBuffer> g_ref_demo = nil;
 static int g_ref_demo_h = 0, g_ref_demo_w = 0;
 
+}  // namespace -- the two entry points below are public (metal_gpu.h)
+
 bool metal_set_ref_demosaic(const Image& rgb) {
     g_ref_demo = nil; g_ref_demo_h = g_ref_demo_w = 0;
     if (!metal_gpu_init() || rgb.c != 3 || rgb.h <= 0 || rgb.w <= 0 ||
@@ -4848,6 +4850,8 @@ bool metal_set_ref_demosaic(const Image& rgb) {
 }
 
 void metal_clear_ref_demosaic() { g_ref_demo = nil; g_ref_demo_h = g_ref_demo_w = 0; }
+
+namespace {
 
 // Fills the fallback fields of a reference-merge params block; returns the buffer
 // to bind (the demosaic, or `placeholder` when the fallback is off).
