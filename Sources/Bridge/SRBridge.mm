@@ -531,6 +531,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.fb_conf_full = tuning[@"fb_conf_full"].boolValue;
     if (tuning[@"fb_conf_tau_px"])
         cfg.fb_conf_tau_px = tuning[@"fb_conf_tau_px"].floatValue;
+    if (tuning[@"fb_conf_subdiv"])
+        cfg.fb_conf_subdiv = std::max(1, std::min(8, tuning[@"fb_conf_subdiv"].intValue));
     if (tuning[@"ref_demosaic_fallback"])
         cfg.ref_demosaic_fallback = tuning[@"ref_demosaic_fallback"].boolValue;
     if (tuning[@"ref_demosaic_share_lo"])

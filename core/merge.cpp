@@ -138,6 +138,35 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     // read 1:1 at the output pixel (v/255). Avoids a 48MP fp32 mask in memory.
     const bool use_m8 = (rob8 && !rob8->empty());
 
+    // Tile seam: the nearest flow tile is taken from the MASK PIXEL this output pixel
+    // reads below, not int(lr / tile_size). At 2x lr is half-integer: for lr in
+    // [k*ts - 0.5, k*ts) the mask fetch round(lr) lands in tile k while int(lr/ts) is
+    // k-1, so the last output row/column of every tile was merged with tile k-1's vector
+    // but weighted by a mask value (and any confidence folded into it) computed for
+    // tile k -- a thin line of a wrongly placed tile survived exactly at the tile end.
+    // Raw-res mask: tile of round(lr); guide mask: of raw 2g+0.5, g = round((lr-0.5)/2);
+    // merge-res mask (1:1 output pixel): of raw (hr+0.5)/scale - 0.5. A bilinear mask
+    // fetch blends pixels, so it keeps int(lr/ts). (Port + generalisation of 3f8b669.)
+    // Metal twin: merge_comp_contrib in HHSRKernels.metal.
+    const bool rob_nearest = use_m8 ||
+        !(cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
+          (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res));
+    const bool rob_raw_dims = !use_m8 && robustness.h == lr_h && robustness.w == lr_w;
+    const bool rob_guide = !use_m8 && !rob_raw_dims && cfg.bayer_mode;
+    auto seam_tile = [&](f32 lr, int hr, int rob_n, int nt) -> int {
+        if (!rob_nearest) return (int)(lr / (f32)tile_size);   // Python int(lr // ts)
+        f32 raw;
+        if (use_m8) {
+            raw = ((f32)hr + 0.5f) / scale - 0.5f;
+        } else if (rob_guide) {
+            const int g = std::min(rob_n - 1, std::max(0, (int)std::floor((lr - 0.5f) / 2.f + 0.5f)));
+            raw = 2.f * (f32)g + 0.5f;
+        } else {
+            raw = (f32)std::min(rob_n - 1, std::max(0, (int)std::floor(lr + 0.5f)));
+        }
+        return std::min(nt - 1, std::max(0, (int)std::floor(raw / (f32)tile_size)));
+    };
+    const int rob_nh = use_m8 ? rob8->h : robustness.h, rob_nw = use_m8 ? rob8->w : robustness.w;
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
@@ -145,9 +174,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 lr_x = (f32)hr_j / scale;
             const f32 lr_y = (f32)hr_i / scale;
 
-            // Python: px = int(lr_x // tile_size); no clamp on flow tile index
-            const int px = (int)(lr_x / (f32)tile_size);
-            const int py = (int)(lr_y / (f32)tile_size);
+            const int px = seam_tile(lr_x, hr_j, rob_nw, flow.nx);
+            const int py = seam_tile(lr_y, hr_i, rob_nh, flow.ny);
             // Bilinear between tile centres: block matching gives one vector
             // per tile, and consuming it nearest makes the warp piecewise
             // constant, which rotation turns into a visible tile grid. The

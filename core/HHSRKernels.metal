@@ -1195,9 +1195,31 @@ static inline void merge_comp_contrib(device const float* img,
     float lr_x = float(hr_j) / p.scale;
     float lr_y = float(hr_i) / p.scale;
 
-    // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
-    int px = int(lr_x / float(p.tile_size));
-    int py = int(lr_y / float(p.tile_size));
+    // Tile seam (CPU twin: seam_tile in merge.cpp accumulate_comp): the nearest flow
+    // tile is the tile of the MASK PIXEL read below, so the last output row/column of a
+    // tile is merged with the same vector its mask value (and FB confidence) graded.
+    // A bilinear mask fetch keeps int(lr / tile_size).
+    int px, py;
+    if (p.rob_bilinear != 0u && p.rob_output_res == 0u) {
+        px = int(lr_x / float(p.tile_size));
+        py = int(lr_y / float(p.tile_size));
+    } else {
+        float rawx, rawy;
+        if (p.rob_output_res != 0u) {
+            rawx = (float(hr_j) + 0.5f) / p.scale - 0.5f;
+            rawy = (float(hr_i) + 0.5f) / p.scale - 0.5f;
+        } else if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+            int gx = clamp(int(floor((lr_x - 0.5f) / 2.f + 0.5f)), 0, int(p.rob_w) - 1);
+            int gy = clamp(int(floor((lr_y - 0.5f) / 2.f + 0.5f)), 0, int(p.rob_h) - 1);
+            rawx = 2.f * float(gx) + 0.5f;
+            rawy = 2.f * float(gy) + 0.5f;
+        } else {
+            rawx = float(clamp(int(floor(lr_x + 0.5f)), 0, int(p.rob_w) - 1));
+            rawy = float(clamp(int(floor(lr_y + 0.5f)), 0, int(p.rob_h) - 1));
+        }
+        px = clamp(int(floor(rawx / float(p.tile_size))), 0, int(p.flow_nx) - 1);
+        py = clamp(int(floor(rawy / float(p.tile_size))), 0, int(p.flow_ny) - 1);
+    }
     float flowx, flowy;
     if (p.dense_flow != 0u) {
         // Dense per-pixel flow takes precedence (the mask warp below samples

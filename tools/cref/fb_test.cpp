@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
     Image ref = crop(full, 0, 0);
     tune_config_snr(ref, cfg);
     if (const char* f = std::getenv("FULL")) cfg.fb_conf_full = f[0] == '1';
+    if (const char* f = std::getenv("SUB")) cfg.fb_conf_subdiv = std::atoi(f);
     const int ts = cfg.bm_tile_sizes.empty() ? 16 : cfg.bm_tile_sizes[0];
     Image rg = compute_grey(ref, cfg.bayer_mode, cfg.grey_method);
     Pyramid pyr = build_pyramid(pad_image_circular(rg, cfg.grey_tile_size(ts)), cfg.bm_factors);
@@ -86,9 +87,14 @@ int main(int argc, char** argv) {
                 coh.push_back((float)((l1 - l2) / (l1 + l2)));
             }
             std::vector<float> e = fb_tile_error(rg, cg, g, S, S, ts, cfg), es, es_edge;
+            const int sub = std::max(1, cfg.fb_conf_subdiv), pnx = g.nx * sub;
             for (size_t i = 0; i < tiles.size(); ++i) {
-                es.push_back(e[tiles[i]]);
-                if (coh[i] > 0.6f) es_edge.push_back(e[tiles[i]]);
+                const int ty = tiles[i] / g.nx, tx = tiles[i] % g.nx;
+                float mx = 0.f;   // the tile's worst piece
+                for (int a2 = 0; a2 < sub; ++a2)
+                    for (int b2 = 0; b2 < sub; ++b2) mx = std::max(mx, e[(size_t)(ty * sub + a2) * pnx + tx * sub + b2]);
+                es.push_back(mx);
+                if (coh[i] > 0.6f) es_edge.push_back(mx);
             }
             char tag[96];
             std::snprintf(tag, sizeof tag, "slip %.1f px %s, all tiles", m, along ? "ALONG edge " : "ACROSS edge");

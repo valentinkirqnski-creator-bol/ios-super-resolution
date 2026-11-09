@@ -1475,6 +1475,13 @@ struct CameraView: View {
                         ispRow("Tolerance τ (px)", $cam.tuningParams.fb_conf_tau_px, 0.0...2.0, "%.2f")
                         Text("Round-trip error at which the confidence falls to 61%. Lower = stricter. Default 0.75. At 0 every tile with any measurable round-trip error is rejected; only tiles that come back exactly (or whose error is within the noise) are kept.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Picker("Check Resolution", selection: $cam.tuningParams.fb_conf_subdiv) {
+                            Text("Whole tile (16 px)").tag(1)
+                            Text("2×2 pieces (8 px)").tag(2)
+                            Text("4×4 pieces (4 px)").tag(4)
+                        }
+                        Text("How finely each tile is checked. Each piece is checked with its tile's motion vector, so finer pieces catch the parts of a tile the vector does not fit (a shifted edge at the end of a tile). Finer = more sensitive, slightly noisier. Default 4×4.")
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("Full Backward Alignment", isOn: $cam.tuningParams.fb_conf_full)
                         Text("Measures the backward motion with a complete second alignment (comparison → reference) instead of the local check. Also catches wrong matches that look consistent locally (e.g. a slip by one period on a fence), at about twice the alignment time and extra memory.")
                             .font(.footnote).foregroundColor(.secondary)

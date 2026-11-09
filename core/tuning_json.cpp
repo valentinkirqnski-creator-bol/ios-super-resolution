@@ -166,6 +166,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("fb_conf_enabled")) cfg.fb_conf_enabled = bv("fb_conf_enabled");
     if (has("fb_conf_full")) cfg.fb_conf_full = bv("fb_conf_full");
     if (has("fb_conf_tau_px")) cfg.fb_conf_tau_px = fv("fb_conf_tau_px");
+    if (has("fb_conf_subdiv")) cfg.fb_conf_subdiv = std::max(1, std::min(8, iv("fb_conf_subdiv")));
     if (has("ref_demosaic_share_lo")) cfg.ref_demosaic_share_lo = fv("ref_demosaic_share_lo");
     if (has("ref_demosaic_share_hi")) cfg.ref_demosaic_share_hi = fv("ref_demosaic_share_hi");
     if (has("dng_lossless_compress"))

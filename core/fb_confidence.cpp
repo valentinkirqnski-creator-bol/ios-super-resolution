@@ -205,8 +205,11 @@ double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
     // or bilinear between tile centres when the merge fetches a bilinear flow.
     auto conf_at = [&](float ry, float rx) {
         if (!bil) {
-            const int ty = std::min(ny - 1, std::max(0, (int)(ry / (float)ts)));
-            const int tx = std::min(nx - 1, std::max(0, (int)(rx / (float)ts)));
+            // Mask pixel centre in raw coords (raw y; guide 2g+0.5; merge-res
+            // (t+0.5)/s-0.5) -> its patch: the same tile the merge now fetches the flow
+            // of for this mask pixel (merge.cpp seam_tile).
+            const int ty = std::min(ny - 1, std::max(0, (int)std::floor(ry / ts)));
+            const int tx = std::min(nx - 1, std::max(0, (int)std::floor(rx / ts)));
             return C[(size_t)ty * nx + tx];
         }
         float u = (ry + 0.5f) / (float)ts - 0.5f, v = (rx + 0.5f) / (float)ts - 0.5f;
@@ -223,7 +226,7 @@ double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
         const float ky = (float)raw_h / (float)R->h, kx = (float)raw_w / (float)R->w;
         parallel_rows(R->h, cfg.num_threads, [&](int y) {
             for (int x = 0; x < R->w; ++x) {
-                const float c = conf_at((float)y * ky, (float)x * kx);
+                const float c = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
                 if (c >= 1.f) continue;
                 for (int ch = 0; ch < R->c; ++ch) R->at(y, x, ch) *= c;
             }
@@ -233,7 +236,7 @@ double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
         const float ky = (float)raw_h / (float)m8->h, kx = (float)raw_w / (float)m8->w;
         parallel_rows(m8->h, cfg.num_threads, [&](int y) {
             for (int x = 0; x < m8->w; ++x) {
-                const float c = conf_at((float)y * ky, (float)x * kx);
+                const float c = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
                 if (c >= 1.f) continue;
                 uint8_t& v = m8->data[(size_t)y * m8->w + x];
                 v = (uint8_t)std::lround((float)v * c);
