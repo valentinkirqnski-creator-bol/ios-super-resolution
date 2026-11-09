@@ -67,7 +67,13 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
     // Grey <-> raw: grey g sits at raw (g + 0.5) / s - 0.5 (s = 1 FFT grey, 0.5 quad grey).
     const float s = (float)ref_grey.w / (float)raw_w;
     auto to_g = [&](float r) { return (r + 0.5f) * s - 0.5f; };
-    const int hw = std::max(2, (int)std::lround(0.5f * (float)ts * s));   // half template (grey px)
+    // Checked in sub-patches of the tile (fb_conf_subdiv^2 per tile), each with the TILE's
+    // vector: a whole-tile check agrees with itself wherever the forward fit converged;
+    // a sub-patch exposes the parts of the tile the single vector does not fit.
+    const int sub = std::max(1, std::min(8, cfg.fb_conf_subdiv));
+    const float ps = (float)ts / (float)sub;
+    const int pny = ny * sub, pnx = nx * sub;
+    const int hw = std::max(2, (int)std::lround(0.5f * ps * s));   // half template (grey px)
     const int n_iter = std::max(1, cfg.fb_conf_iters);
     const float na = std::max(0.f, cfg.alpha_dng[1]), nb = std::max(1e-12f, cfg.beta_dng[1]);
 
@@ -102,16 +108,17 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
         if (bwd.ny <= 0 || bwd.nx <= 0 || bwd.flow.empty()) bgts = 0;
     }
 
-    std::vector<float> err((size_t)ny * nx, 0.f);
-    parallel_rows(ny, cfg.num_threads, [&](int ty) {
+    std::vector<float> err((size_t)pny * pnx, 0.f);
+    parallel_rows(pny, cfg.num_threads, [&](int pyi) {
         const int n = 2 * hw;
         std::vector<float> T((size_t)n * n), GX((size_t)n * n), GY((size_t)n * n);
-        for (int tx = 0; tx < nx; ++tx) {
-            const size_t t = (size_t)ty * nx + tx;
+        for (int pxi = 0; pxi < pnx; ++pxi) {
+            const size_t t = (size_t)(pyi / sub) * nx + (size_t)(pxi / sub);   // the patch's tile
+            const size_t pi = (size_t)pyi * pnx + pxi;
             const float fx = flow.flow[2 * t], fy = flow.flow[2 * t + 1];
-            if (!std::isfinite(fx) || !std::isfinite(fy)) { err[t] = 1e3f; continue; }
-            // Tile centre (raw pixel-centre coordinates) and its forward destination.
-            const float cy = ((float)ty + 0.5f) * (float)ts - 0.5f, cx = ((float)tx + 0.5f) * (float)ts - 0.5f;
+            if (!std::isfinite(fx) || !std::isfinite(fy)) { err[pi] = 1e3f; continue; }
+            // Patch centre (raw pixel-centre coordinates) and its forward destination.
+            const float cy = ((float)pyi + 0.5f) * ps - 0.5f, cx = ((float)pxi + 0.5f) * ps - 0.5f;
             float dy, dx;
             forward_dest(flow, cy, cx, fx, fy, dy, dx);
             const float cgy = to_g(cy), cgx = to_g(cx), dgy = to_g(dy), dgx = to_g(dx);
@@ -162,7 +169,7 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
                     if (std::hypot(Bx - (cgx - dgx), By - (cgy - dgy)) > 8.f * s + 4.f) { diverged = true; break; }
                     if (ddx * ddx + ddy * ddy < 1e-6f) break;
                 }
-                if (diverged) { err[t] = 1e3f; continue; }   // no consistent backward match: reject
+                if (diverged) { err[pi] = 1e3f; continue; }   // no consistent backward match: reject
             }
             // Round-trip error (grey px -> raw px): back-projected position minus the start.
             const float ey = (dgy + By - cgy) / s, ex = (dgx + Bx - cgx) / s;
@@ -172,7 +179,7 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
             // (both frames), in grey px^2 -> raw px^2.
             const double noise_e2 = 8.0 * nv / l1 / ((double)s * s);
             const double e2 = std::max(0.0, w2 - (double)cfg.fb_conf_noise_k * noise_e2);
-            err[t] = (float)std::sqrt(e2);
+            err[pi] = (float)std::sqrt(e2);
         }
     });
     return err;
@@ -181,7 +188,9 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
 double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
                            const FlowField& flow, int raw_h, int raw_w,
                            int tile_size, const Config& cfg) {
-    const int ny = flow.ny, nx = flow.nx, ts = std::max(1, tile_size);
+    const int sub = std::max(1, std::min(8, cfg.fb_conf_subdiv));
+    const int ny = flow.ny * sub, nx = flow.nx * sub;   // patch grid
+    const float ts = (float)std::max(1, tile_size) / (float)sub;   // patch size (raw px)
     if (err.size() != (size_t)ny * nx || ny <= 0 || nx <= 0) return 1.0;
     const float tau = std::max(1e-3f, cfg.fb_conf_tau_px);
     std::vector<float> C(err.size());

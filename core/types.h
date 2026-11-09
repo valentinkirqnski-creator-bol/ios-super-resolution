@@ -2027,6 +2027,7 @@ struct Config {
     float fb_conf_tau_px = 0.75f;
     int   fb_conf_iters = 6;
     float fb_conf_noise_k = 2.0f;    // x the noise-only expected error^2 subtracted
+    int   fb_conf_subdiv = 2;        // check each tile in subdiv x subdiv patches (1 = whole tile)
     bool  ref_demosaic_fallback = false;
     float ref_demosaic_share_lo = 0.5f;
     float ref_demosaic_share_hi = 0.9f;

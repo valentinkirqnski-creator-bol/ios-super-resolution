@@ -34,7 +34,8 @@
 
 namespace hhsr {
 
-// Per-tile round-trip error (raw px, weighted + noise-corrected) for the merge flow
+// Per-patch round-trip error (raw px, weighted + noise-corrected) on the patch grid
+// (flow.ny * fb_conf_subdiv) x (flow.nx * fb_conf_subdiv), for the merge flow
 // `flow` (raw px, raw tile grid of tile_size). ref_grey / comp_grey: the alignment greys
 // (raw or half resolution; scale inferred from raw_w). Empty on bad input.
 std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,

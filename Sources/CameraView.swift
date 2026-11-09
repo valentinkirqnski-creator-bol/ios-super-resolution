@@ -1472,8 +1472,8 @@ struct CameraView: View {
                     Text("For every tile it measures the motion back from the comparison frame to the reference and checks that the round trip returns to where it started. The round-trip error e becomes a confidence exp(-e²/2τ²) that multiplies the rejection mask after everything else (Wronski or GCam, and the NNs): 0.05 px keeps everything, 0.3 px keeps ~92%, 1.5 px drops to ~14%, 4 px rejects. Only the error ACROSS edges counts (a slide along a straight edge is invisible), and the error sensor noise alone would cause is subtracted, so flat or dim areas are not rejected. Fast: a few sub-pixel steps per tile from the comparison side, no extra images.")
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.fb_conf_enabled {
-                        ispRow("Tolerance τ (px)", $cam.tuningParams.fb_conf_tau_px, 0.2...2.0, "%.2f")
-                        Text("Round-trip error at which the confidence falls to 61%. Lower = stricter. Default 0.75.")
+                        ispRow("Tolerance τ (px)", $cam.tuningParams.fb_conf_tau_px, 0.0...2.0, "%.2f")
+                        Text("Round-trip error at which the confidence falls to 61%. Lower = stricter. Default 0.75. At 0 every tile with any measurable round-trip error is rejected; only tiles that come back exactly (or whose error is within the noise) are kept.")
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Full Backward Alignment", isOn: $cam.tuningParams.fb_conf_full)
                         Text("Measures the backward motion with a complete second alignment (comparison → reference) instead of the local check. Also catches wrong matches that look consistent locally (e.g. a slip by one period on a fence), at about twice the alignment time and extra memory.")
