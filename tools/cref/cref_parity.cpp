@@ -86,10 +86,11 @@ int main(int argc, char** argv) {
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) Rg.at(y, x) = R.at(std::min(R.h - 1, y * R.h / H), std::min(R.w - 1, x * R.w / W));
     std::vector<float> F;
-    cref_features(ref_grey, al[1], cons, N - 1, Rg, cfg, 0, H, 0, F);
+    const std::vector<float> tdis = cref_flow_disagreement(fl[1]);
+    cref_features(ref_grey, al[1], cons, N - 1, Rg, tdis, fl[1].ny, fl[1].nx, ts, cfg, 0, H, 0, F);
     dump(out + "/feats.f32", F);
     Image Rc = Rg;
-    if (!cref_refine(Rc, ref_grey, al[1], cons, N - 1, cfg)) { std::printf("cref_refine failed\n"); return 1; }
+    if (!cref_refine(Rc, ref_grey, al[1], cons, N - 1, fl[1], ts, cfg)) { std::printf("cref_refine failed\n"); return 1; }
     dump(out + "/rcpu.f32", Rc.data);
 
     // ---- Metal kernels through the shim, with the host's banding ----
@@ -104,9 +105,10 @@ int main(int argc, char** argv) {
         p.slo = slo; p.srows = shi - slo + 1; p.out_rows = y1 - y0;
         p.vlo = std::max(0, halo - y0); p.vhi = std::min((int)p.rows - 1, halo + (H - 1 - y0));
         p.na = std::max(0.f, cfg.alpha_dng[1]); p.nb = std::max(1e-12f, cfg.beta_dng[1]); p.nfr = (float)(N - 1);
-        std::vector<float> stg((size_t)4 * p.srows * W), Fb((size_t)6 * p.rows * W), A((size_t)8 * p.rows * W), B(A.size()), O((size_t)p.out_rows * W);
+        std::vector<float> stg((size_t)6 * p.srows * W), Fb((size_t)kCrefIn * p.rows * W), A((size_t)8 * p.rows * W), B(A.size()), O((size_t)p.out_rows * W);
         for (int pl = 0; pl < 4; ++pl)
             std::copy(src[pl]->data.begin() + (size_t)slo * W, src[pl]->data.begin() + (size_t)(slo + p.srows) * W, stg.begin() + (size_t)pl * p.srows * W);
+        cref_aux_rows(ref_grey, tdis, fl[1].ny, fl[1].nx, ts, cfg, slo, slo + (int)p.srows, stg.data() + (size_t)4 * p.srows * W, stg.data() + (size_t)5 * p.srows * W);
         for (uint32_t y = 0; y < p.rows; ++y) for (uint32_t x = 0; x < p.w; ++x) msl::cref_feat(stg.data(), Fb.data(), p, msl::uint2{x, y});
         const float* Ws[4] = {kCrefW0, kCrefW1, kCrefW2, kCrefW3};
         const float* Bs[4] = {kCrefB0, kCrefB1, kCrefB2, kCrefB3};

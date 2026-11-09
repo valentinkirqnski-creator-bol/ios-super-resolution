@@ -947,9 +947,23 @@ struct MergeRefParams {
     uint raw_res_robustness;
     uint cov_stride;    // see MergeCompParams::cov_stride
     uint gcam_kernel;   // 1 = GCam merge kernel (precision cov, floor anchor, +eps). was _pad1
-    uint _pad2;
-    uint _pad3;         // 112 bytes, a multiple of 16 for setBytes
+    // Demosaiced-reference fallback (Config::ref_demosaic_fallback; core/ref_demosaic.h):
+    // 1 = blend the reference's contribution toward the kernel-weighted demosaiced RGB
+    // (half RGB plane, lr_h x lr_w x 3) by smoothstep(fb_lo, fb_hi, reference share).
+    uint ref_fallback;  // was _pad2
+    float fb_lo;        // was _pad3
+    float fb_hi;
+    uint _pad4;
+    uint _pad5;
+    uint _pad6;         // 128 bytes, a multiple of 16 for setBytes
 };
+
+// smoothstep(lo, hi, share) -- twin of ref_fallback_t in core/ref_demosaic.h.
+inline float ref_fallback_t(float share, float lo, float hi) {
+    if (!(hi > lo)) return share >= lo ? 1.f : 0.f;
+    float t = clamp((share - lo) / (hi - lo), 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
 
 // std::lround half-away-from-zero.
 inline int lround_away(float x) {
@@ -1438,6 +1452,9 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
 //
 // overwrite_out carries accumulate_ref's overwrite rule back to the caller; it
 // can only be true when p.robustness_denoise != 0, which the host never sets.
+// demo / dc0..dc2 (demosaiced-reference fallback, p.ref_fallback): the half RGB
+// demosaic of the reference and the comparison frames' den totals at this pixel
+// (the reference is always merged last). Unread when p.ref_fallback == 0.
 static inline void merge_ref_contrib(device const float* img,
                                      device const float* covs,
                                      device const float* acc_rob,
@@ -1445,7 +1462,9 @@ static inline void merge_ref_contrib(device const float* img,
                                      uint hr_j, uint local_i,
                                      thread float& n0, thread float& n1, thread float& n2,
                                      thread float& d0, thread float& d1, thread float& d2,
-                                     thread bool& overwrite_out) {
+                                     thread bool& overwrite_out,
+                                     device const half* demo,
+                                     float dc0, float dc1, float dc2) {
     int hr_i = int(p.y0 + local_i);
     float coarse_x = float(hr_j) / p.scale;
     float coarse_y = float(hr_i) / p.scale;
@@ -1517,6 +1536,8 @@ static inline void merge_ref_contrib(device const float* img,
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    float ds0 = 0.f, ds1 = 0.f, ds2 = 0.f, wsum = 0.f;   // demosaiced-reference fallback
+    const bool fb = (p.ref_fallback != 0u);
     for (int di = -rad; di <= rad; ++di) {
         for (int dj = -rad; dj <= rad; ++dj) {
             int j = center_j + dj;
@@ -1537,6 +1558,29 @@ static inline void merge_ref_contrib(device const float* img,
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
             else                   { val2 += c * w; acc2 += w; }
+            if (fb) {
+                uint o3 = (uint(i) * p.lr_w + uint(j)) * 3u;
+                ds0 += w * float(demo[o3 + 0u]);
+                ds1 += w * float(demo[o3 + 1u]);
+                ds2 += w * float(demo[o3 + 2u]);
+                wsum += w;
+            }
+        }
+    }
+
+    // Demosaiced-reference fallback -- twin of the block in merge.cpp accumulate_ref.
+    if (fb && p.nch == 3u && wsum > 0.f) {
+        float sacc = acc0 + acc1 + acc2;
+        float share = sacc / max(1e-30f, dc0 + dc1 + dc2 + sacc);
+        float t = ref_fallback_t(share, p.fb_lo, p.fb_hi);
+        if (t > 0.f) {
+            float A = sacc / 3.f;
+            val0 = (1.f - t) * val0 + t * A * (ds0 / wsum);
+            val1 = (1.f - t) * val1 + t * A * (ds1 / wsum);
+            val2 = (1.f - t) * val2 + t * A * (ds2 / wsum);
+            acc0 = (1.f - t) * acc0 + t * A;
+            acc1 = (1.f - t) * acc1 + t * A;
+            acc2 = (1.f - t) * acc2 + t * A;
         }
     }
 
@@ -1554,18 +1598,24 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
                                  device const float* covs [[buffer(3)]],
                                  device const float* acc_rob [[buffer(4)]],
                                  constant MergeRefParams& p [[buffer(5)]],
+                                 device const half* demo [[buffer(6)]],
                                  uint2 gid [[thread_position_in_grid]]) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
 
+    uint base = (local_i * p.Ws + hr_j) * p.nch;
+    float dc0 = 0.f, dc1 = 0.f, dc2 = 0.f;   // comparison frames' den so far
+    if (p.ref_fallback != 0u && p.nch >= 3u) {
+        dc0 = den[base + 0]; dc1 = den[base + 1]; dc2 = den[base + 2];
+    }
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
     bool overwrite = false;
     merge_ref_contrib(img, covs, acc_rob, p, hr_j, local_i,
-                      val0, val1, val2, acc0, acc1, acc2, overwrite);
+                      val0, val1, val2, acc0, acc1, acc2, overwrite,
+                      demo, dc0, dc1, dc2);
 
-    uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (overwrite) {
         if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
         if (p.nch >= 2) { num[base + 1] = val1; den[base + 1] = acc1; }
@@ -2078,6 +2128,9 @@ struct GcamSabreParams {
     // gcam_sabre_flow_bilinear: 1 = bilinear tile flow + motion extent (the merge reads
     // the same field); 0 = the containing tile's vector (= the merge's nearest fetch).
     uint  flow_bilinear;
+    // SABRE Unblocker: 1 = buffer 7 holds the per-tile map (host gcam_unblocker_map);
+    // fused as min(1 - unblocker, weight) where motion_extent > motion_thresh.
+    uint  unblocker;    // 128 bytes
 };
 
 // §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
@@ -2169,6 +2222,7 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
                            device const float* irr [[buffer(4)]],    // 1 per tile (local motion extent, raw px)
                            constant GcamSabreParams& p [[buffer(5)]],
                            device const float* lut [[buffer(6)]],    // §3 MC noise LUT (2x10x4); dummy if noise_model==0
+                           device const float* unb [[buffer(7)]],    // SABRE Unblocker per tile; dummy if unblocker==0
                            uint2 gid [[thread_position_in_grid]]) {
     uint out_h = (p.raw_res != 0u) ? p.out_h : p.h;
     uint out_w = (p.raw_res != 0u) ? p.out_w : p.w;
@@ -2287,7 +2341,15 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     float arg = -distance; if (arg > 0.f) arg = 0.f;
     float wv = exp2(arg);
     if (!isfinite(wv)) wv = 0.f;
-    R[ty * out_w + tx] = clamp(wv, 0.f, 1.f);          // keep weight (unblocker = 0)
+    wv = clamp(wv, 0.f, 1.f);                          // keep weight
+    // SABRE Unblocker (twin of the CPU operator): off where the flow is smooth (the boost's
+    // flow.z threshold); elsewhere min(1 - unblocker, w), unblocker of the CONTAINING tile.
+    if (p.unblocker != 0u && motion_extent > p.motion_thresh) {
+        int uy = clamp(int((2.f * gy + 0.5f) / float(max(p.tile_size, 1u))), 0, ny1);
+        int ux = clamp(int((2.f * gx + 0.5f) / float(max(p.tile_size, 1u))), 0, nx1);
+        wv = min(wv, 1.f - unb[uint(uy) * p.flow_nx + uint(ux)]);
+    }
+    R[ty * out_w + tx] = wv;
 }
 
 // §7 GCam DilateMask reject-grow, GPU twin of robustness_gcam_dilate (robustness.cpp).
@@ -4617,6 +4679,7 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
                              device float* prev            [[buffer(13)]],
                              device const float* affines   [[buffer(14)]],
                              device const half* denses     [[buffer(15)]],
+                             device const half* ref_demo   [[buffer(16)]],
                              uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= np.Ws || gid.y >= np.bh) return;
     const uint hr_j = gid.x;
@@ -4637,8 +4700,10 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
     }
 
     bool overwrite = false;
+    // d0..d2 are the comparison frames' totals at this point (reference is last).
     merge_ref_contrib(ref_img, ref_cov, ref_acc, rp, hr_j, local_i,
-                      n0, n1, n2, d0, d1, d2, overwrite);
+                      n0, n1, n2, d0, d1, d2, overwrite,
+                      ref_demo, d0, d1, d2);
 
     merge_diag_count(diag, np.nch, n0, n1, n2, d0, d1, d2);
 
@@ -5279,6 +5344,10 @@ kernel void cref_feat(device const float* stg [[buffer(0)]],
     F[3u * plane + o] = cref_clip((rf - loo) * isd);
     F[4u * plane + o] = cref_clip(cref_hp(stg, p, 0u, Y, x) * is1);
     F[5u * plane + o] = cref_clip(cref_hp(stg, p, 1u, Y, x) * is1);
+    // 6, 7: flow disagreement and HF variance loss, computed on the host
+    // (cref_aux_rows) for the staged rows.
+    F[6u * plane + o] = cref_stg(stg, p, 4u, Y, x);
+    F[7u * plane + o] = cref_stg(stg, p, 5u, Y, x);
 }
 
 // One 3x3 dilated conv (cin -> 8) + ReLU over the band; weights [8][cin][3][3].

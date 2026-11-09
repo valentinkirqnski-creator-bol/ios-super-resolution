@@ -1820,8 +1820,10 @@ struct GcamSabreParamsCPU {
     uint32_t rejection_only = 0;
     // gcam_sabre_flow_bilinear: 1 = bilinear tile flow (the merge reads the same field).
     uint32_t flow_bilinear = 0;
+    // SABRE Unblocker: 1 = buffer 7 holds the per-tile map (gcam_unblocker_map).
+    uint32_t unblocker = 0;
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 124, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 128, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -3052,7 +3054,12 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const bool noise_model = cfg.gcam_sabre_noise_model;
     GcamNoiseLut nlut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
     id<MTLBuffer> b_lut = noise_model ? buf(nlut.v, sizeof(nlut.v)) : buf(nullptr, sizeof(float));
-    if (!b_refg || !b_compg || !b_flow || !b_irr || !b_R || !b_lut) return Image();
+    // SABRE Unblocker per tile (host; the comparison raw is on the host here).
+    const std::vector<f32> unb = cfg.gcam_unblocker_enabled
+        ? gcam_unblocker_map(comp_raw, flow, tile_size, cfg) : std::vector<f32>();
+    const bool use_unb = unb.size() == (size_t)flow.ny * flow.nx && !unb.empty();
+    id<MTLBuffer> b_unb = use_unb ? buf(unb.data(), unb.size() * sizeof(float)) : buf(nullptr, sizeof(float));
+    if (!b_refg || !b_compg || !b_flow || !b_irr || !b_R || !b_lut || !b_unb) return Image();
 
     GcamSabreParamsCPU mp{};
     mp.h = (uint32_t)gh; mp.w = (uint32_t)gw;
@@ -3078,6 +3085,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.raw_res = resample ? 1u : 0u;   // "resample" flag: raw OR merge grid (Dodgson)
     mp.flow_bilinear = cfg.gcam_flow_bilinear_active() ? 1u : 0u;
     mp.rejection_only = rej_only ? 1u : 0u;
+    mp.unblocker = use_unb ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -3090,6 +3098,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     [enc setBuffer:b_irr   offset:0 atIndex:4];
     [enc setBytes:&mp length:sizeof(mp) atIndex:5];
     [enc setBuffer:b_lut   offset:0 atIndex:6];
+    [enc setBuffer:b_unb   offset:0 atIndex:7];
     dispatch2(enc, pipe, (NSUInteger)tw, (NSUInteger)th);
     [enc endEncoding];
     prof_tag_gpu(cmd, "robustness:gcam-sabre");
@@ -4811,9 +4820,46 @@ struct MergeRefParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t cov_stride = 4;      // see MergeCompParamsCPU::cov_stride
     uint32_t gcam_kernel = 0;     // 1 = GCam merge kernel (precision cov, floor anchor, +eps)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    uint32_t ref_fallback = 0;    // demosaiced-reference fallback (was _pad2)
+    float fb_lo = 0.5f, fb_hi = 0.9f;
+    uint32_t _pad4 = 0, _pad5 = 0, _pad6 = 0;
 };
-static_assert(sizeof(MergeRefParamsCPU) == 112, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 128, "MergeRefParamsCPU layout");
+
+// Demosaiced-reference fallback (Config::ref_demosaic_fallback): the reference's
+// demosaic as half RGB (lr_h x lr_w x 3), uploaded once per burst by
+// metal_set_ref_demosaic and read by merge_ref_contrib.
+static id<MTLBuffer> g_ref_demo = nil;
+static int g_ref_demo_h = 0, g_ref_demo_w = 0;
+
+bool metal_set_ref_demosaic(const Image& rgb) {
+    g_ref_demo = nil; g_ref_demo_h = g_ref_demo_w = 0;
+    if (!metal_gpu_init() || rgb.c != 3 || rgb.h <= 0 || rgb.w <= 0 ||
+        rgb.data.size() != (size_t)rgb.h * rgb.w * 3)
+        return false;
+    const size_t n = rgb.data.size();
+    id<MTLBuffer> b = buf(nullptr, n * sizeof(__fp16));
+    if (!b) return false;
+    __fp16* d = (__fp16*)[b contents];
+    const float* s = rgb.data.data();
+    for (size_t i = 0; i < n; ++i) d[i] = (__fp16)std::min(s[i], 65504.f);
+    g_ref_demo = b; g_ref_demo_h = rgb.h; g_ref_demo_w = rgb.w;
+    return true;
+}
+
+void metal_clear_ref_demosaic() { g_ref_demo = nil; g_ref_demo_h = g_ref_demo_w = 0; }
+
+// Fills the fallback fields of a reference-merge params block; returns the buffer
+// to bind (the demosaic, or `placeholder` when the fallback is off).
+static id<MTLBuffer> ref_fallback_bind(MergeRefParamsCPU& p, const Config& cfg,
+                                       id<MTLBuffer> placeholder) {
+    const bool on = cfg.ref_demosaic_fallback && cfg.bayer_mode && g_ref_demo &&
+                    p.nch == 3u && g_ref_demo_h == (int)p.lr_h && g_ref_demo_w == (int)p.lr_w;
+    p.ref_fallback = on ? 1u : 0u;
+    p.fb_lo = cfg.ref_demosaic_share_lo;
+    p.fb_hi = cfg.ref_demosaic_share_hi;
+    return on ? g_ref_demo : placeholder;
+}
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -5695,6 +5741,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     rp.raw_res_robustness = 0u;
     rp.cov_stride = g_bf.cov_stride;
     rp.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
+    id<MTLBuffer> b_ref_demo = ref_fallback_bind(rp, cfg, g_bf.affines);
 
     MergeNormParamsCPU np = merge_norm_params(bh, Ws, nch, cfg);
     np.y0 = (uint32_t)y0;
@@ -5742,6 +5789,8 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     // infeasible), and residency is off whenever dense is on (force-host), so
     // ps[].dense_flow stays 0 here and this buffer is a never-read placeholder.
     [enc setBuffer:g_bf.affines offset:0 atIndex:15];
+    // Demosaiced-reference fallback plane (placeholder when off; unread then).
+    [enc setBuffer:b_ref_demo offset:0 atIndex:16];
     dispatch2(enc, pipe, (NSUInteger)Ws, (NSUInteger)bh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "merge:band-fused");
@@ -6057,6 +6106,9 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     // accumulate_ref in merge.cpp.
     p.raw_res_robustness =
         (denoise && p.acc_h == p.lr_h && p.acc_w == p.lr_w) ? 1u : 0u;
+    // The resident-raw ref keeps lr dims in ref_raw.h/w (header shell), so the size
+    // check inside matches the demosaic built from the same frame.
+    id<MTLBuffer> b_demo = ref_fallback_bind(p, cfg, b_img);
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
@@ -6070,6 +6122,7 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     [enc setBuffer:b_cov offset:0 atIndex:3];
     [enc setBuffer:b_acc offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
+    [enc setBuffer:b_demo offset:0 atIndex:6];
     dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
     merge_enc_close();
 
@@ -6333,7 +6386,8 @@ struct CrefParamsCPU {
 static_assert(sizeof(CrefParamsCPU) == 64, "CrefParamsCPU layout");
 
 bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
-                             const Image& Rg, int n_frames, const Config& cfg, Image& Rout) {
+                             const Image& Rg, int n_frames, const std::vector<float>& tdis,
+                             int ny, int nx, int tile_size, const Config& cfg, Image& Rout) {
   @autoreleasepool {
     if (!kCrefTrained || !metal_gpu_init()) return false;
     const int h = ref_grey.h, w = ref_grey.w;
@@ -6345,8 +6399,9 @@ bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, c
     const int band = 256, halo = kCrefHalo;
     const int max_rows = band + 2 * halo, max_srows = band + 2 * halo + 2;
     const size_t W = (size_t)w;
-    id<MTLBuffer> b_stg = buf(nullptr, 4 * (size_t)max_srows * W * sizeof(float));
-    id<MTLBuffer> b_F = buf(nullptr, 6 * (size_t)max_rows * W * sizeof(float));
+    // Staged planes: ref, comp, cons, R (copies) + flow disagreement, HF loss (cref_aux_rows).
+    id<MTLBuffer> b_stg = buf(nullptr, 6 * (size_t)max_srows * W * sizeof(float));
+    id<MTLBuffer> b_F = buf(nullptr, (size_t)kCrefIn * (size_t)max_rows * W * sizeof(float));
     id<MTLBuffer> b_A = buf(nullptr, 8 * (size_t)max_rows * W * sizeof(float));
     id<MTLBuffer> b_B = buf(nullptr, 8 * (size_t)max_rows * W * sizeof(float));
     id<MTLBuffer> b_out = buf(nullptr, (size_t)band * W * sizeof(float));
@@ -6374,6 +6429,8 @@ bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, c
         for (int pl = 0; pl < 4; ++pl)
             memcpy(stg + (size_t)pl * p.srows * W, src[pl]->data.data() + (size_t)slo * W,
                    (size_t)p.srows * W * sizeof(float));
+        cref_aux_rows(ref_grey, tdis, ny, nx, tile_size, cfg, slo, slo + (int)p.srows,
+                      stg + (size_t)4 * p.srows * W, stg + (size_t)5 * p.srows * W);
         id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!cmd || !enc) return false;

@@ -1,0 +1,40 @@
+diff --git a/C:/Users/valen/AppData/Local/Temp/claude/b742f57fdf29e2e2/75d997e5-7f0e-41b3-bcd6-cbef711f0996/scratchpad/wt_8a28f74/tools/robust_nn/real_protocol.py b/gen/real_protocol.py
+index 193aa69..78cd529 100644
+--- a/C:/Users/valen/AppData/Local/Temp/claude/b742f57fdf29e2e2/75d997e5-7f0e-41b3-bcd6-cbef711f0996/scratchpad/wt_8a28f74/tools/robust_nn/real_protocol.py
++++ b/gen/real_protocol.py
+@@ -198,7 +198,7 @@ from rnn.model import RobustNet                                   # noqa: E402
+ from target_protocol import combine, err_map, r_index, region_psnr, SCALE, CLIP   # noqa: E402
+ 
+ TP_REAL = os.environ.get("RNN_TP_REAL", os.path.join(HERE, "build", "pipe", "tp_real.exe"))
+-REAL = os.path.join(HERE, "data", "real")
++REAL = os.environ.get("RNN_REAL", os.path.join(HERE, "data", "real"))
+ TRAIN_SCENES = ["APC_1186"]                             # --scenes overrides; val scene: a different capture
+ VAL_SCENE = "APC_1211"
+ SIZE = int(os.environ.get("RNN_SIZE", "384"))         # raw crop per burst (v24: 768 at camera pixel scale)
+@@ -313,6 +313,17 @@ def build_burst(seed, val, scenes):
+             text_bg = np.ascontiguousarray(np.concatenate([tb[:hh], cb[hh:]], 0))
+         else:
+             text_bg = text_scene(rng, n_tex, n_tex, tt, wb, cap_raw=cap)
++    # cref v2 (RNN_PATTERN=1): the real scene at camera scale with repeated-pattern patches (gratings near the sensor
++    # limit, fences / grids, brick, weave, fine text; rnn/pattern_scene.py) at 2 texels per raw px, light lens blur so
++    # the sensor aliases. Patterns drawn from a DERIVED rng, so every other draw of the burst is unchanged.
++    pattern_tex = None
++    if os.environ.get("RNN_PATTERN") == "1":
++        from rnn.pattern_scene import pattern_scene
++        prng = np.random.default_rng(seed + 424242)
++        pattern_tex = 2.0
++        n_tex = int(pattern_tex * (SIZE + 2 * 96)) + 64
++        text_bg = pattern_scene(prng, sc_rgb, n_tex, pattern_tex, wb)
++        sc.update(optics_sigma=float(prng.uniform(0.3, 0.6)), highlights=False)
+     if os.environ.get("RNN_SMALL_DISP"):  # v28: "lo,hi,anywhere,pframe" - uniform-displacement slips (rnn/burst.py)
+         dlo_, dhi_, anyw_, pf_ = (float(x) for x in os.environ["RNN_SMALL_DISP"].split(","))
+         sc.update(small_disp=(dlo_, dhi_), small_anywhere=anyw_, small_pframe=pf_, small_size=(24.0, 96.0))
+@@ -342,6 +353,8 @@ def build_burst(seed, val, scenes):
+         sc.update(motion_table=[[r[0] * sgn, r[1], r[2], r[3]] for r in tab], motion_gain=float(rng.uniform(0.7, 1.3)),
+                   persp=0.0, n_rot_patches=0, n_rot_patches_edge=0)   # the small edge patches (RNN_ROT_SMALL) stay
+     tex = float(os.environ.get("RNN_TEX_SCALE", "2" if text_bg is None else "4"))
++    if pattern_tex is not None:
++        tex = pattern_tex
+     b = Burst(sc, rng, Hr=SIZE, Wr=SIZE_W, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
+               tex_scale=tex, allow_flip=text_bg is None)
+     return b, rng, name, cfa, wb, alpha0 * k, beta0 * k * k

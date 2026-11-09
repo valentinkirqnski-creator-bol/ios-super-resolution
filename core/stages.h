@@ -231,6 +231,11 @@ void median3x3_tile_flow(FlowField& flow);
 // of the flow vectors over the 3x3 tile neighbourhood (raw px). Drives the motion
 // boost. Exposed so the Metal host can build the same buffer the CPU operator uses.
 std::vector<f32> compute_flow_irregularity(const FlowField& flow);
+// SABRE Unblocker (Config::gcam_unblocker_enabled): per flow tile of the comparison
+// frame, in [0,1] (ny x nx). Not yet gated by the flow spread -- the operator applies
+// that gate (same flow.z threshold as the motion boost) per pixel.
+std::vector<f32> gcam_unblocker_map(const Image& comp_raw, const FlowField& flow, int tile_size,
+                                    const Config& cfg);
 // GCam SABRE (§5+§7): the full CPU ComputeFrameWeight operator -> guide-resolution
 // keep mask (dilated). The verified reference and the device default; also the
 // fallback when the GPU twin is unavailable. Empty if the reference guide

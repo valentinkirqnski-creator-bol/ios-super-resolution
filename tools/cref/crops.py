@@ -4,7 +4,7 @@ import glob
 import os
 import numpy as np
 
-NF = 6
+NF = 8   # v2: + flow disagreement, HF variance loss
 
 
 def read_crops(path, S=80):
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     a = load_dir(sys.argv[1]) if os.path.isdir(sys.argv[1]) else read_crops(sys.argv[1])
     x = a["x"].astype(np.float32)
     var = a["hd"][:, 0]
-    R, hp, z = x[:, 0], x[:, 4], x[:, 6]
+    R, hp, z = x[:, 0], x[:, 4], x[:, NF]
     det = np.abs(hp) > 0.1
     print("crops", len(a), "variant counts", np.bincount(var))
     for v, name in ((0, "Alg.6/Wronski"), (1, "GCam")):

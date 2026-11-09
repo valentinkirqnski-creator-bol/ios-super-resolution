@@ -15,6 +15,7 @@
 #include "flow_consensus.h"
 #include "isa_prealign.h"
 #include "structure_map.h"
+#include "ref_demosaic.h"
 #include "cref.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1239,6 +1240,8 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
                                      cons_ts, work.r_Mt, work.num_threads,
                                      work.grey_tile_size(cons_ts));
         if (gw.warped) { for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i]; flow.has_global_h = true; }
+        // The consensus is built from the flow the merge will use (GCam: 3x3 median).
+        if (work.robustness_gcam_enabled) median3x3_tile_flow(flow);
         Image aligned = warp_comp_grey_to_ref(comp_grey, flow, cons_ts, work.num_threads);
         if (aligned.h != ref_grey.h || aligned.w != ref_grey.w) continue;
         for (size_t i = 0; i < sum.size(); ++i) sum[i] += (double)aligned.data[i];
@@ -1672,6 +1675,32 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         const double t_sm = prof_now_ms();
         write_structure_map(ref, work, dng_path, ref_index, true, structure_map_scale);
         prof_add_cpu("debug:structure-map", prof_now_ms() - t_sm);
+    }
+    // Demosaiced-reference fallback (Config::ref_demosaic_fallback): demosaic the
+    // reference once, here -- after the active-frame switch, because on the capture
+    // path the frame lives only in its GPU slot. The merge's reference step reads it.
+    merge_clear_ref_demosaic();
+#if defined(__APPLE__)
+    metal_clear_ref_demosaic();
+#endif
+    if (work.ref_demosaic_fallback && work.bayer_mode) {
+        const double t_dm = prof_now_ms();
+        const Image* src = &ref;
+        Image ref_host;
+#if defined(__APPLE__)
+        if (ref.data.size() < (size_t)ref.h * (size_t)ref.w &&
+            metal_fetch_host_raw(ref_host) && ref_host.h == ref.h && ref_host.w == ref.w)
+            src = &ref_host;
+#endif
+        if (src->data.size() >= (size_t)src->h * (size_t)src->w) {
+            Image dm = demosaic_ref_rgb(*src, work);
+#if defined(__APPLE__)
+            if (dm.h > 0) metal_set_ref_demosaic(dm);   // half RGB on the GPU; no host copy
+#else
+            if (dm.h > 0) merge_set_ref_demosaic(std::move(dm));
+#endif
+        }
+        prof_add_cpu("ref:demosaic-fallback", prof_now_ms() - t_dm);
     }
     if (full_res) {
         ref_stats = init_robustness(ref, work);
@@ -2207,6 +2236,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // fetches) BEFORE comp_grey is freed; the refine consumes it against the
         // consensus below. Empty consensus (pre-pass skipped/failed, incl. the
         // device path) leaves it empty and the refine no-ops.
+        // GCam SABRE (§4.1): clean the finalized per-tile flow with a 3x3
+        // per-component median before anyone reads it. Both robustness AND merge
+        // consume the median-filtered field (nothing downstream reads the raw
+        // flow), which is what rejects the tile-edge / rotation / parallax
+        // outliers. Applied to the shared flow by design, gated on the gcam
+        // toggle so every other path keeps its exact flow. Done before the GPU
+        // upload below so the resident merge reads the same median field, and
+        // before the aligned-grey capture so the refiners see the merged flow.
+        if (work.robustness_gcam_enabled && flow.ny > 0 && flow.nx > 0 && !flow.flow.empty())
+            median3x3_tile_flow(flow);
         Image mask_nn_aligned_grey;
         if ((work.rob_mask_nn_enabled || work.cref_enabled) && mask_nn_consensus.h > 0 &&
             !comp_grey.data.empty())
@@ -2221,15 +2260,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             continue;
         }
 
-        // GCam SABRE (§4.1): clean the finalized per-tile flow with a 3x3
-        // per-component median before anyone reads it. Both robustness AND merge
-        // consume the median-filtered field (nothing downstream reads the raw
-        // flow), which is what rejects the tile-edge / rotation / parallax
-        // outliers. Applied to the shared flow by design, gated on the gcam
-        // toggle so every other path keeps its exact flow. Done before the GPU
-        // upload below so the resident merge reads the same median field.
-        if (work.robustness_gcam_enabled)
-            median3x3_tile_flow(flow);
+        // (The GCam 3x3 flow median ran above, before the aligned-grey capture.)
 
 #if defined(__APPLE__)
         // The flow is the one per-frame analysis result the host still owns: the
@@ -2301,7 +2332,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob.h > 0 && rob.data.size() == (size_t)rob.h * rob.w * rob.c) {
             const double t_cref = prof_now_ms();
             if (cref_refine(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus,
-                            (int)comp_indices.size(), work))
+                            (int)comp_indices.size(), flow, merge_ts, work))
                 rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
                                                           work.frame_discard_enabled);
             prof_add_cpu("comp:cref", prof_now_ms() - t_cref);
@@ -3042,6 +3073,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const double t_close = prof_now_ms();
     writer.close();
     prof_add_cpu("out:dng-close(flush)", prof_now_ms() - t_close);
+    merge_clear_ref_demosaic();
+#if defined(__APPLE__)
+    metal_clear_ref_demosaic();
+#endif
     const double t_tail = prof_now_ms();
     if (work.robustness_save_mask && have_acc_rob) {
         // Save at raw resolution (nearest-upsampled from the guide grid),

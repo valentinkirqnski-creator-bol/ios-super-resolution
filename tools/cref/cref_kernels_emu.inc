@@ -1,8 +1,3 @@
-// Consensus refiner (core/cref.cpp twin): features, 3x3 dilated conv + ReLU,
-// 1x1 head + logit refine. Banded: a band holds `rows` = band rows + 2 halo
-// feature rows (plane-major, rows x w); the staging buffer holds image rows
-// [slo, slo + srows) of ref, comp, cons and R (4 planes) so every edge-clamped
-// read of the CPU twin is reproduced exactly.
 struct CrefParams {
     uint w, h, rows, cin;      // image width/height; band feature rows; conv input channels
     uint dil, y0, halo, slo;   // dilation; band's first output row; halo; first staged image row
@@ -45,6 +40,10 @@ kernel void cref_feat(device const float* stg [[buffer(0)]],
     F[3u * plane + o] = cref_clip((rf - loo) * isd);
     F[4u * plane + o] = cref_clip(cref_hp(stg, p, 0u, Y, x) * is1);
     F[5u * plane + o] = cref_clip(cref_hp(stg, p, 1u, Y, x) * is1);
+    // 6, 7: flow disagreement and HF variance loss, computed on the host
+    // (cref_aux_rows) for the staged rows.
+    F[6u * plane + o] = cref_stg(stg, p, 4u, Y, x);
+    F[7u * plane + o] = cref_stg(stg, p, 5u, Y, x);
 }
 
 // One 3x3 dilated conv (cin -> 8) + ReLU over the band; weights [8][cin][3][3].

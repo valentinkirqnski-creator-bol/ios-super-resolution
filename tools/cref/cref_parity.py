@@ -7,6 +7,7 @@ import sys
 import numpy as np
 import torch
 from train_cref import CrefNet
+from crops import NF
 
 mode, d = sys.argv[1], sys.argv[2]
 if mode == "make":
@@ -23,7 +24,7 @@ else:
     H, W = int(sys.argv[3]), int(sys.argv[4])
     m = CrefNet()
     m.load_state_dict(torch.load(os.path.join(d, "rand.pt")))
-    F = np.fromfile(os.path.join(d, "feats.f32"), np.float32).reshape(1, 6, H, W)
+    F = np.fromfile(os.path.join(d, "feats.f32"), np.float32).reshape(1, NF, H, W)
     with torch.no_grad():
         R = m(torch.from_numpy(F))[0, 0].numpy()
     rc = np.fromfile(os.path.join(d, "rcpu.f32"), np.float32).reshape(H, W)

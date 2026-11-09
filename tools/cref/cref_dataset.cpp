@@ -193,19 +193,78 @@ int main(int argc, char** argv) {
                 }
             }
     }
-    // Warped greys + consensus (mean of all comparison frames).
-    std::vector<Image> aligned(N);
-    Image cons(H, W, 1);
-    for (int k = 1; k < N; ++k) {
-        aligned[k] = warp_grey(greys[k], flows[k], ts);
-        for (size_t i = 0; i < cons.data.size(); ++i) cons.data[i] += aligned[k].data[i];
+    // v2: period slips -- on repeated-pattern tiles, the wrong-period lock block matching makes (the
+    // aperture problem, paper S.3). The reference's HF variance loss (feature 7) picks pattern tiles; the
+    // period is the strongest secondary peak of the tile's normalised autocorrelation (24x24 window, shifts
+    // up to 12 px, |shift| >= 2). Per frame with p 0.6, each pattern tile slips by +-P (sometimes 2P) with
+    // p 0.3, half the time together with a neighbour (blocky clusters).
+    size_t n_pattern_tiles = 0, n_period_slips = 0;
+    {
+        std::vector<float> hf_plane((size_t)H * W), dis_dummy((size_t)H * W);
+        cref_aux_rows(ref_grey, std::vector<float>(), 0, 0, ts, cfg, 0, H, dis_dummy.data(), hf_plane.data());
+        std::vector<float> Px((size_t)ny * nx, 0.f), Py((size_t)ny * nx, 0.f);
+        #pragma omp parallel for schedule(dynamic, 8) reduction(+ : n_pattern_tiles)
+        for (int t = 0; t < ny * nx; ++t) {
+            const int ty = t / nx, tx = t % nx;
+            double hs = 0; int hc = 0;
+            for (int y = ty * ts; y < std::min(H, (ty + 1) * ts); ++y)
+                for (int x = tx * ts; x < std::min(W, (tx + 1) * ts); ++x) { hs += hf_plane[(size_t)y * W + x]; ++hc; }
+            if (!hc || hs / hc < 0.35) continue;
+            const int cy = ty * ts + ts / 2, cx = tx * ts + ts / 2, R = 12, Wn = 12;
+            auto G = [&](int y, int x) { return ref_grey.at(std::min(H - 1, std::max(0, y)), std::min(W - 1, std::max(0, x))); };
+            std::vector<float> ncc((2 * R + 1) * (2 * R + 1), -1.f);
+            float peak = -1.f;
+            for (int sy = -R; sy <= R; ++sy)
+                for (int sx = -R; sx <= R; ++sx) {
+                    if (std::max(std::abs(sx), std::abs(sy)) < 2) continue;
+                    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0; int n = 0;
+                    for (int y = cy - Wn; y < cy + Wn; ++y)
+                        for (int x = cx - Wn; x < cx + Wn; ++x) {
+                            const double va = G(y, x), vb = G(y + sy, x + sx);
+                            sa += va; sb += vb; saa += va * va; sbb += vb * vb; sab += va * vb; ++n;
+                        }
+                    const double cov = sab / n - (sa / n) * (sb / n);
+                    const double den = std::sqrt(std::max(1e-20, (saa / n - (sa / n) * (sa / n)) * (sbb / n - (sb / n) * (sb / n))));
+                    const float v = (float)(cov / den);
+                    ncc[(sy + R) * (2 * R + 1) + sx + R] = v;
+                    peak = std::max(peak, v);
+                }
+            // The period: the SHORTEST shift whose correlation is within 0.05 of the best (a grating
+            // repeats at P, 2P, ...; a wrong lock is usually the nearest repeat). Needs a clear repeat.
+            int bx = 0, by = 0, bd = 1 << 30;
+            if (peak > 0.6f)
+                for (int sy = -R; sy <= R; ++sy)
+                    for (int sx = -R; sx <= R; ++sx) {
+                        const float v = ncc[(sy + R) * (2 * R + 1) + sx + R];
+                        if (v >= peak - 0.05f && sx * sx + sy * sy < bd) { bd = sx * sx + sy * sy; bx = sx; by = sy; }
+                    }
+            if (bx || by) { Px[t] = (float)bx; Py[t] = (float)by; ++n_pattern_tiles; }
+        }
+        for (int k = 1; k < N; ++k) {
+            if (U(rng) >= 0.6f) continue;
+            FlowField& f = flows[k];
+            for (int t = 0; t < ny * nx; ++t) {
+                if ((Px[t] == 0.f && Py[t] == 0.f) || U(rng) >= 0.3f) continue;
+                const float sgn = U(rng) < 0.5f ? -1.f : 1.f, mult = U(rng) < 0.2f ? 2.f : 1.f;
+                const float ddx = sgn * mult * Px[t], ddy = sgn * mult * Py[t];
+                f.flow[2 * t] += ddx; f.flow[2 * t + 1] += ddy; ++n_period_slips;
+                if (U(rng) < 0.5f) {   // a neighbour with the same pattern locks the same way
+                    const int ty = t / nx, tx = t % nx;
+                    const int qy = std::min(ny - 1, std::max(0, ty + (U(rng) < 0.5f ? -1 : 1) * (U(rng) < 0.5f)));
+                    const int qx = std::min(nx - 1, std::max(0, tx + (U(rng) < 0.5f ? -1 : 1)));
+                    const int q = qy * nx + qx;
+                    if (q != t && (Px[q] != 0.f || Py[q] != 0.f)) { f.flow[2 * q] += ddx; f.flow[2 * q + 1] += ddy; }
+                }
+            }
+        }
     }
-    for (float& v : cons.data) v /= (float)(N - 1);
 
-    // Ghost size z per raw pixel and frame (same for both variants: the flow is shared).
+    // Ghost size z per raw pixel and frame, for a given set of merged flows.
     const float a = hf[0], b = hf[1];
-    std::vector<std::vector<float>> Z(N);
+    auto ghost = [&](const std::vector<FlowField>& fl, std::vector<std::vector<float>>& Z) {
+    Z.assign(N, std::vector<float>());
     for (int k = 1; k < N; ++k) {
+        const std::vector<FlowField>& flows = fl;
         Z[k].assign((size_t)H * W, 0.f);
         const float* ck = clean.data() + (size_t)k * Hg * Wg;
         const float* gk = gt.data() + (size_t)k * 2 * Hg * Wg;
@@ -232,7 +291,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    std::fprintf(stderr, "burst %s N=%d %dx%d ts=%d mean |flow-gt| %.3f raw px\n", argv[1], N, W, H, ts, err_sum / std::max<size_t>(1, err_n));
+    };
 
     FILE* fo = std::fopen(argv[2], "wb");
     if (!fo) return 4;
@@ -241,10 +300,26 @@ int main(int argc, char** argv) {
     for (int variant = 0; variant < 2; ++variant) {
         Config cv = cfg;
         cv.robustness_gcam_enabled = (variant == 1);
+        // The flows this variant MERGES with (GCam: the pipeline's 3x3 median), and everything derived
+        // from them: the warped greys, the consensus, the ghost labels, the flow-disagreement feature.
+        std::vector<FlowField> fv = flows;
+        if (cv.robustness_gcam_enabled)
+            for (int k = 1; k < N; ++k) median3x3_tile_flow(fv[k]);
+        std::vector<Image> aligned(N);
+        Image cons(H, W, 1);
+        for (int k = 1; k < N; ++k) {
+            aligned[k] = warp_grey(greys[k], fv[k], ts);
+            for (size_t i = 0; i < cons.data.size(); ++i) cons.data[i] += aligned[k].data[i];
+        }
+        for (float& v : cons.data) v /= (float)(N - 1);
+        std::vector<std::vector<float>> Z;
+        err_sum = 0; err_n = 0;
+        ghost(fv, Z);
+        std::fprintf(stderr, "burst %s variant %d N=%d %dx%d ts=%d mean |flow-gt| %.3f raw px pattern tiles %zu period slips %zu\n",
+                     argv[1], variant, N, W, H, ts, err_sum / std::max<size_t>(1, err_n), n_pattern_tiles, n_period_slips);
         RefStats rs = init_robustness(ref, cv);
         for (int k = 1; k < N; ++k) {
-            FlowField f = flows[k];
-            if (cv.robustness_gcam_enabled) median3x3_tile_flow(f);   // as the pipeline does on the GCam path
+            const FlowField& f = fv[k];
             Image R = compute_robustness(raw[k], rs, f, ts, cv);
             if (R.h <= 0) continue;
             Image Rg(H, W, 1);
@@ -252,12 +327,13 @@ int main(int argc, char** argv) {
                 for (int x = 0; x < W; ++x)
                     Rg.at(y, x) = R.at(std::min(R.h - 1, (int)((int64_t)y * R.h / H)), std::min(R.w - 1, (int)((int64_t)x * R.w / W)));
             std::vector<float> F;
-            cref_features(ref_grey, aligned[k], cons, N - 1, Rg, cv, 0, H, 0, F);
+            const std::vector<float> tdis = cref_flow_disagreement(f);
+            cref_features(ref_grey, aligned[k], cons, N - 1, Rg, tdis, f.ny, f.nx, ts, cv, 0, H, 0, F);
             const size_t plane = (size_t)H * W;
-            // Crops: half uniform, half centred on harmful (z > 2) or detailed pixels.
+            // Crops: half uniform, half centred on harmful (z > 2), detailed or pattern pixels.
             std::vector<size_t> hot;
             for (size_t i = 0; i < plane; i += 7)
-                if (Z[k][i] > 2.f || std::fabs(F[4 * plane + i]) > 0.25f) hot.push_back(i);
+                if (Z[k][i] > 2.f || std::fabs(F[4 * plane + i]) > 0.25f || F[7 * plane + i] > 0.5f) hot.push_back(i);
             for (int c = 0; c < per_frame; ++c) {
                 int y0, x0;
                 if ((c & 1) && !hot.empty()) {

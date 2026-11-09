@@ -204,6 +204,12 @@ bool metal_fetch_host_raw(Image& out);
 // init_robustness_metal when hf_artifact_removal_enabled) to the host. The GCam
 // path applies HF rejection on the host, once per burst. False if absent.
 bool metal_fetch_ref_hf_loss(Image& out);
+
+// Demosaiced-reference fallback (Config::ref_demosaic_fallback): upload the
+// reference's demosaic (H x W x 3 float) as half RGB for the reference merge, and
+// release it. One burst at a time; the merge checks dimensions before using it.
+bool metal_set_ref_demosaic(const Image& rgb);
+void metal_clear_ref_demosaic();
 // Upload a host robustness mask into slot's resident rob slice and mark it ready.
 // The GCam SABRE path returns a host guide-resolution mask; the fused merge reads
 // the GPU rob slot, so this pushes it in (mirrors what the standard resident mask
@@ -246,8 +252,11 @@ Image structure_tensor_metal(const Image& raw, const Config& cfg, float sigma);
 // Consensus refiner (core/cref.h) on the GPU: cref_feat / cref_conv / cref_head over
 // 256-row bands with an 8-row halo. Rg / Rout are on the grey grid (host). False when
 // Metal or the kernels are unavailable (the CPU twin then runs).
+// tdis / ny / nx / tile_size: the per-tile flow disagreement (cref_flow_disagreement)
+// for features 6-7, which the host computes per band (cref_aux_rows) and stages.
 bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
-                             const Image& Rg, int n_frames, const Config& cfg, Image& Rout);
+                             const Image& Rg, int n_frames, const std::vector<float>& tdis,
+                             int ny, int nx, int tile_size, const Config& cfg, Image& Rout);
 uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma);
 bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
                            int tile_size, const Config& cfg, std::vector<float>& S_out,

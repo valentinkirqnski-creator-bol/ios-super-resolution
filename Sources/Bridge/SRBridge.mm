@@ -513,6 +513,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.structure_map_save = tuning[@"structure_map_save"].boolValue;
     if (tuning[@"cref_enabled"])
         cfg.cref_enabled = tuning[@"cref_enabled"].boolValue;
+    if (tuning[@"ref_demosaic_fallback"])
+        cfg.ref_demosaic_fallback = tuning[@"ref_demosaic_fallback"].boolValue;
+    if (tuning[@"ref_demosaic_share_lo"])
+        cfg.ref_demosaic_share_lo = tuning[@"ref_demosaic_share_lo"].floatValue;
+    if (tuning[@"ref_demosaic_share_hi"])
+        cfg.ref_demosaic_share_hi = tuning[@"ref_demosaic_share_hi"].floatValue;
     // dng_codec is the current knob (0 = none, 1 = lossless JPEG, 2 = Deflate).
     // dng_lossless_compress is the older boolean and still honoured for saved
     // tuning presets; "lossless" now means the codec that actually earns it.
@@ -649,6 +655,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_rejection_only"]) cfg.gcam_sabre_rejection_only = tuning[@"gcam_sabre_rejection_only"].boolValue;
     if (tuning[@"gcam_sabre_flow_bilinear"]) cfg.gcam_sabre_flow_bilinear = tuning[@"gcam_sabre_flow_bilinear"].boolValue;
     if (tuning[@"gcam_structure_match"]) cfg.gcam_structure_match = tuning[@"gcam_structure_match"].boolValue;
+    if (tuning[@"gcam_unblocker_enabled"]) cfg.gcam_unblocker_enabled = tuning[@"gcam_unblocker_enabled"].boolValue;
+    if (tuning[@"gcam_unblocker_scale"]) cfg.gcam_unblocker_scale = tuning[@"gcam_unblocker_scale"].floatValue;
+    if (tuning[@"gcam_unblocker_offset"]) cfg.gcam_unblocker_offset = tuning[@"gcam_unblocker_offset"].floatValue;
     if (tuning[@"gcam_structure_tau_strength"]) cfg.gcam_structure_tau_strength = tuning[@"gcam_structure_tau_strength"].floatValue;
     if (tuning[@"gcam_structure_tau_angle"]) cfg.gcam_structure_tau_angle = tuning[@"gcam_structure_tau_angle"].floatValue;
     if (tuning[@"gcam_structure_noise_k"]) cfg.gcam_structure_noise_k = tuning[@"gcam_structure_noise_k"].floatValue;

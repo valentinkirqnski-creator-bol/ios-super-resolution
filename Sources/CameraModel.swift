@@ -116,6 +116,12 @@ struct TuningParams: Equatable, Codable {
     var structure_map_save: Bool = false
     /// Consensus refiner NN (core/cref.h): refines the Wronski / GCam mask using the other frames.
     var cref_enabled: Bool = false
+    /// Demosaiced-reference fallback (core/ref_demosaic.h): where every comparison frame
+    /// is rejected, blend the reference toward its own edge-directed demosaic.
+    var ref_demosaic_fallback: Bool = false
+    /// Reference share of a pixel's merge weight where the blend starts / is complete.
+    var ref_demosaic_share_lo: Float = 0.5
+    var ref_demosaic_share_hi: Float = 0.9
     /// Codec for the output DNG image strip. Every option is lossless -- the
     /// decoded 16-bit samples are identical to the bit -- so this trades file
     /// size against write cost, never quality.
@@ -328,6 +334,11 @@ struct TuningParams: Equatable, Codable {
     var gcam_sabre_flow_bilinear: Bool = false
     /// GCam add-on: multiply the mask by a reference-vs-comparison structure-tensor match.
     var gcam_structure_match: Bool = false
+    /// SABRE Unblocker (GCam path; exclusive with HF artifact rejection). Defaults 8.0 / 0.15 make it act
+    /// (GCam's build constants 0.2 / 0.45 are inert: m never exceeds 0.265).
+    var gcam_unblocker_enabled: Bool = false
+    var gcam_unblocker_scale: Float = 8.0
+    var gcam_unblocker_offset: Float = 0.15
     var gcam_structure_tau_strength: Float = 0.7
     var gcam_structure_tau_angle: Float = 0.35
     var gcam_structure_noise_k: Float = 1.0
@@ -573,6 +584,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
         case robustness_enabled, robustness_save_mask, structure_map_save, cref_enabled
+        case ref_demosaic_fallback, ref_demosaic_share_lo, ref_demosaic_share_hi
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -590,6 +602,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
+             gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
@@ -659,6 +672,9 @@ struct TuningParams: Equatable, Codable {
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         structure_map_save = try c.decodeIfPresent(Bool.self, forKey: .structure_map_save) ?? structure_map_save
         cref_enabled = try c.decodeIfPresent(Bool.self, forKey: .cref_enabled) ?? cref_enabled
+        ref_demosaic_fallback = try c.decodeIfPresent(Bool.self, forKey: .ref_demosaic_fallback) ?? ref_demosaic_fallback
+        ref_demosaic_share_lo = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_lo) ?? ref_demosaic_share_lo
+        ref_demosaic_share_hi = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_hi) ?? ref_demosaic_share_hi
         // Older presets carry the boolean. Only an explicit `true` is honoured,
         // and it maps to the codec that actually earns the name "lossless".
         //
@@ -745,6 +761,9 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_rejection_only = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_rejection_only) ?? gcam_sabre_rejection_only
         gcam_sabre_flow_bilinear = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_flow_bilinear) ?? gcam_sabre_flow_bilinear
         gcam_structure_match = try c.decodeIfPresent(Bool.self, forKey: .gcam_structure_match) ?? gcam_structure_match
+        gcam_unblocker_enabled = try c.decodeIfPresent(Bool.self, forKey: .gcam_unblocker_enabled) ?? gcam_unblocker_enabled
+        gcam_unblocker_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_unblocker_scale) ?? gcam_unblocker_scale
+        gcam_unblocker_offset = try c.decodeIfPresent(Float.self, forKey: .gcam_unblocker_offset) ?? gcam_unblocker_offset
         gcam_structure_tau_strength = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_tau_strength) ?? gcam_structure_tau_strength
         gcam_structure_tau_angle = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_tau_angle) ?? gcam_structure_tau_angle
         gcam_structure_noise_k = try c.decodeIfPresent(Float.self, forKey: .gcam_structure_noise_k) ?? gcam_structure_noise_k
@@ -2537,6 +2556,9 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "structure_map_save": NSNumber(value: tuningParams.structure_map_save),
             "cref_enabled": NSNumber(value: tuningParams.cref_enabled),
+            "ref_demosaic_fallback": NSNumber(value: tuningParams.ref_demosaic_fallback),
+            "ref_demosaic_share_lo": NSNumber(value: tuningParams.ref_demosaic_share_lo),
+            "ref_demosaic_share_hi": NSNumber(value: tuningParams.ref_demosaic_share_hi),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
@@ -2608,6 +2630,9 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_rejection_only": NSNumber(value: tuningParams.gcam_sabre_rejection_only),
             "gcam_sabre_flow_bilinear": NSNumber(value: tuningParams.gcam_sabre_flow_bilinear),
             "gcam_structure_match": NSNumber(value: tuningParams.gcam_structure_match),
+            "gcam_unblocker_enabled": NSNumber(value: tuningParams.gcam_unblocker_enabled),
+            "gcam_unblocker_scale": NSNumber(value: tuningParams.gcam_unblocker_scale),
+            "gcam_unblocker_offset": NSNumber(value: tuningParams.gcam_unblocker_offset),
             "gcam_structure_tau_strength": NSNumber(value: tuningParams.gcam_structure_tau_strength),
             "gcam_structure_tau_angle": NSNumber(value: tuningParams.gcam_structure_tau_angle),
             "gcam_structure_noise_k": NSNumber(value: tuningParams.gcam_structure_noise_k),

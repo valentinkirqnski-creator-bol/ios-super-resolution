@@ -16,13 +16,99 @@ bool cref_available() { return kCrefTrained; }
 
 static inline float cref_c(float x) { return std::min(8.f, std::max(-8.f, x)) * 0.125f; }
 
+std::vector<float> cref_flow_disagreement(const FlowField& flow) {
+    const int ny = flow.ny, nx = flow.nx;
+    std::vector<float> d((size_t)std::max(0, ny) * std::max(0, nx), 0.f);
+    if (ny <= 0 || nx <= 0 || flow.flow.size() < (size_t)ny * nx * 2) return d;
+    for (int ty = 0; ty < ny; ++ty)
+        for (int tx = 0; tx < nx; ++tx) {
+            float vx[9], vy[9];
+            int k = 0;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int qy = std::min(ny - 1, std::max(0, ty + i)), qx = std::min(nx - 1, std::max(0, tx + j));
+                    vx[k] = flow.dx(qy, qx); vy[k] = flow.dy(qy, qx); ++k;
+                }
+            std::nth_element(vx, vx + 4, vx + 9);
+            std::nth_element(vy, vy + 4, vy + 9);
+            d[(size_t)ty * nx + tx] = std::hypot(flow.dx(ty, tx) - vx[4], flow.dy(ty, tx) - vy[4]);
+        }
+    return d;
+}
+
+void cref_aux_rows(const Image& ref_grey, const std::vector<float>& tdis, int ny, int nx,
+                   int tile_size, const Config& cfg, int ylo, int yhi, float* dis, float* hf) {
+    const int h = ref_grey.h, w = ref_grey.w, nr = yhi - ylo;
+    if (nr <= 0) return;
+    const int ts = std::max(1, tile_size);
+    const bool have_d = ny > 0 && nx > 0 && tdis.size() == (size_t)ny * nx;
+    // HF variance loss on 5x5 windows: binomial [1 4 6 4 1]/16 low-pass L of the ref,
+    // then box-5 mean / mean-square of ref and L. Rows [ylo-4, yhi+4) are touched,
+    // every read edge-clamped (the Metal path gets these planes from here too).
+    const int pad = 4, R0 = ylo - pad, NR = nr + 2 * pad;
+    auto cy = [&](int y) { return std::min(h - 1, std::max(0, y)); };
+    auto cx = [&](int x) { return std::min(w - 1, std::max(0, x)); };
+    std::vector<float> T((size_t)NR * w), L((size_t)NR * w);
+    static const float kb[5] = {1.f / 16, 4.f / 16, 6.f / 16, 4.f / 16, 1.f / 16};
+    parallel_rows(NR, cfg.num_threads, [&](int r) {      // horizontal binomial of rows R0+r
+        const int y = cy(R0 + r);
+        for (int x = 0; x < w; ++x) {
+            float s = 0.f;
+            for (int j = -2; j <= 2; ++j) s += kb[j + 2] * ref_grey.at(y, cx(x + j));
+            T[(size_t)r * w + x] = s;
+        }
+    });
+    parallel_rows(NR, cfg.num_threads, [&](int r) {      // vertical binomial (rows clamped inside T's span)
+        for (int x = 0; x < w; ++x) {
+            float s = 0.f;
+            for (int i = -2; i <= 2; ++i) {
+                const int rr = cy(R0 + r + i) - R0;
+                s += kb[i + 2] * T[(size_t)std::min(NR - 1, std::max(0, rr)) * w + x];
+            }
+            L[(size_t)r * w + x] = s;
+        }
+    });
+    const float na = std::max(0.f, cfg.alpha_dng[1]), nb = std::max(1e-12f, cfg.beta_dng[1]);
+    const float kE = (70.f / 256.f) * (70.f / 256.f);    // noise energy kept by the 2-D binomial
+    parallel_rows(nr, cfg.num_threads, [&](int r) {
+        const int y = ylo + r;
+        const int ty = std::min(ny - 1, y / ts);
+        for (int x = 0; x < w; ++x) {
+            float s1 = 0.f, s2 = 0.f, l1 = 0.f, l2 = 0.f;
+            for (int i = -2; i <= 2; ++i) {
+                const int yy = cy(y + i);
+                const size_t lr = (size_t)std::min(NR - 1, std::max(0, yy - R0)) * w;
+                for (int j = -2; j <= 2; ++j) {
+                    const int xx = cx(x + j);
+                    const float v = ref_grey.at(yy, xx), l = L[lr + xx];
+                    s1 += v; s2 += v * v; l1 += l; l2 += l * l;
+                }
+            }
+            const float m = s1 / 25.f, ml = l1 / 25.f;
+            const float nv = na * std::max(m, 0.f) + nb;
+            const float v = std::max(0.f, s2 / 25.f - m * m) - nv;
+            const float vl = std::max(0.f, std::max(0.f, l2 / 25.f - ml * ml) - kE * nv);
+            hf[(size_t)r * w + x] = (v > 4.f * nv) ? std::min(1.f, std::max(0.f, 1.f - vl / v)) : 0.f;
+            float d = 0.f;
+            if (have_d) d = tdis[(size_t)ty * nx + std::min(nx - 1, x / ts)];
+            dis[(size_t)r * w + x] = std::min(4.f, d) * 0.25f;
+        }
+    });
+}
+
 void cref_features(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
-                   int n_frames, const Image& R_grey, const Config& cfg,
+                   int n_frames, const Image& R_grey, const std::vector<float>& tdis,
+                   int ny, int nx, int tile_size, const Config& cfg,
                    int y0, int y1, int halo, std::vector<float>& out) {
     const int h = ref_grey.h, w = ref_grey.w;
     const int rows = (y1 - y0) + 2 * halo;
     const size_t plane = (size_t)rows * w;
     out.assign((size_t)kCrefIn * plane, 0.f);
+    // Aux planes for the real rows this band touches, then copied with the same
+    // edge-clamped row mapping as the other features.
+    const int alo = std::max(0, y0 - halo), ahi = std::min(h, y1 + halo);
+    std::vector<float> adis((size_t)(ahi - alo) * w), ahf((size_t)(ahi - alo) * w);
+    cref_aux_rows(ref_grey, tdis, ny, nx, tile_size, cfg, alo, ahi, adis.data(), ahf.data());
     const float na = std::max(0.f, cfg.alpha_dng[1]), nb = std::max(1e-12f, cfg.beta_dng[1]);
     const int n = std::max(1, n_frames);
     auto px = [&](const Image& im, int y, int x) {
@@ -50,6 +136,9 @@ void cref_features(const Image& ref_grey, const Image& comp_aligned, const Image
             out[3 * plane + o] = cref_c((rf - loo) * isd);
             out[4 * plane + o] = cref_c(hp(ref_grey, y, x) * is1);
             out[5 * plane + o] = cref_c(hp(comp_aligned, y, x) * is1);
+            const size_t ao = (size_t)(y - alo) * w + x;
+            out[6 * plane + o] = adis[ao];
+            out[7 * plane + o] = ahf[ao];
         }
     });
 }
@@ -83,8 +172,11 @@ static void cref_conv3(const std::vector<float>& in, int cin, std::vector<float>
 }
 
 bool cref_refine(Image& R, const Image& ref_grey, const Image& comp_aligned,
-                 const Image& cons, int n_frames, const Config& cfg) {
+                 const Image& cons, int n_frames, const FlowField& flow, int tile_size,
+                 const Config& cfg) {
     if (!kCrefTrained) return false;
+    const std::vector<float> tdis = cref_flow_disagreement(flow);
+    const int fny = flow.ny, fnx = flow.nx;
     const int h = ref_grey.h, w = ref_grey.w;
     if (h <= 0 || w <= 0 || R.h <= 0 || R.w <= 0 || R.data.size() != (size_t)R.h * R.w * R.c) return false;
     if (comp_aligned.h != h || comp_aligned.w != w || cons.h != h || cons.w != w) return false;
@@ -100,13 +192,15 @@ bool cref_refine(Image& R, const Image& ref_grey, const Image& comp_aligned,
     Image Rout(h, w, 1);
     bool done = false;
 #if defined(__APPLE__)
-    done = cref_refine_bands_metal(ref_grey, comp_aligned, cons, Rg, n_frames, cfg, Rout);
+    done = cref_refine_bands_metal(ref_grey, comp_aligned, cons, Rg, n_frames, tdis, fny, fnx,
+                                   tile_size, cfg, Rout);
 #endif
     const int band = 128, halo = kCrefHalo;
     std::vector<float> f, a, b;
     for (int y0 = 0; !done && y0 < h; y0 += band) {
         const int y1 = std::min(h, y0 + band);
-        cref_features(ref_grey, comp_aligned, cons, n_frames, Rg, cfg, y0, y1, halo, f);
+        cref_features(ref_grey, comp_aligned, cons, n_frames, Rg, tdis, fny, fnx, tile_size, cfg,
+                      y0, y1, halo, f);
         const int rows = (y1 - y0) + 2 * halo;
         const int vlo = std::max(0, halo - y0), vhi = std::min(rows - 1, halo + (h - 1 - y0));
         cref_conv3(f, kCrefIn, a, kCrefCh, rows, w, kCrefW0, kCrefB0, kCrefDil[0], cfg.num_threads, vlo, vhi);

@@ -64,8 +64,11 @@ def to_tensors(b, tau, augment, rng):
 
 
 def evaluate(model, val, tau):
+    """Per mask variant v (0 Alg.6, 1 GCam) and region (all detailed px / HF-pattern px, feature 7 > 0.5):
+    catch / false of the refined mask and of the input mask. res[v] = all, res[v + 2] = HF region.
+    score = mean over variants of 0.5 (catch - false)_all + 0.5 (catch - false)_hf."""
     model.eval()
-    stats = {0: np.zeros(6), 1: np.zeros(6)}   # caught, harmful, false, harmless (refined); caught0, false0 (input R)
+    stats = {k: np.zeros(6) for k in range(4)}   # caught, harmful, false, harmless (refined); caught0, false0
     with torch.no_grad():
         for i in range(0, len(val), 128):
             b = val[i:i + 128]
@@ -74,20 +77,23 @@ def evaluate(model, val, tau):
             s = slice(HALO, -HALO)
             R1, R0, zz = out[:, 0, s, s], feats[:, 0, s, s], z[:, 0, s, s]
             det = feats[:, 4, s, s].abs() > 0.1
+            hfm = feats[:, 7, s, s] > 0.5
             for v in (0, 1):
                 m = (var == v)[:, None, None]
-                bad = m & (zz > 4) & det
-                ok = m & (zz < 1) & det
-                st = stats[v]
-                st[0] += (bad & (R1 < 0.5)).sum().item(); st[1] += bad.sum().item()
-                st[2] += (ok & (R1 < 0.5)).sum().item(); st[3] += ok.sum().item()
-                st[4] += (bad & (R0 < 0.5)).sum().item(); st[5] += (ok & (R0 < 0.5)).sum().item()
+                for reg, rm in ((v, det), (v + 2, det & hfm)):
+                    bad = m & (zz > 4) & rm
+                    ok = m & (zz < 1) & rm
+                    st = stats[reg]
+                    st[0] += (bad & (R1 < 0.5)).sum().item(); st[1] += bad.sum().item()
+                    st[2] += (ok & (R1 < 0.5)).sum().item(); st[3] += ok.sum().item()
+                    st[4] += (bad & (R0 < 0.5)).sum().item(); st[5] += (ok & (R0 < 0.5)).sum().item()
     model.train()
     res = {}
     for v, st in stats.items():
         res[v] = dict(catch=st[0] / max(1, st[1]), false=st[2] / max(1, st[3]),
-                      catch0=st[4] / max(1, st[1]), false0=st[5] / max(1, st[3]))
-    score = np.mean([res[v]["catch"] - res[v]["false"] for v in res])
+                      catch0=st[4] / max(1, st[1]), false0=st[5] / max(1, st[3]), n_bad=int(st[1]), n_ok=int(st[3]))
+    score = np.mean([0.5 * (res[v]["catch"] - res[v]["false"]) + 0.5 * (res[v + 2]["catch"] - res[v + 2]["false"])
+                     for v in (0, 1)])
     return score, res
 
 
@@ -143,7 +149,10 @@ def main():
                 print(f"step {step} {time.time() - t0:.0f}s loss {loss.item():.4f} score {score:.4f}{tag} "
                       f"alg6 catch {res[0]['catch']:.3f} (was {res[0]['catch0']:.3f}) false {res[0]['false']:.3f} "
                       f"(was {res[0]['false0']:.3f}) | gcam catch {res[1]['catch']:.3f} (was {res[1]['catch0']:.3f}) "
-                      f"false {res[1]['false']:.3f} (was {res[1]['false0']:.3f})", flush=True)
+                      f"false {res[1]['false']:.3f} (was {res[1]['false0']:.3f}) || HF: "
+                      f"alg6 catch {res[2]['catch']:.3f} (was {res[2]['catch0']:.3f}) false {res[2]['false']:.3f} "
+                      f"(was {res[2]['false0']:.3f}) | gcam catch {res[3]['catch']:.3f} (was {res[3]['catch0']:.3f}) "
+                      f"false {res[3]['false']:.3f} (was {res[3]['false0']:.3f})", flush=True)
     torch.save(model.state_dict(), os.path.join(a.out, "last.pt"))
     print("done", step, "steps, best score", best, flush=True)
 

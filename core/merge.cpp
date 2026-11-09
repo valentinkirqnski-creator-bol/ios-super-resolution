@@ -1,6 +1,7 @@
 #include "stages.h"
 #include "parallel.h"
 #include "linalg.h"
+#include "ref_demosaic.h"
 #ifdef __APPLE__
 #include "metal_gpu.h"
 #endif
@@ -324,6 +325,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
     (void)acc_rob;  // Adaptive denoiser removed: the reference merge is a fixed
                     // radius-1 kernel with no accumulated-robustness enlargement.
+    const Image* demo = (cfg.ref_demosaic_fallback && cfg.bayer_mode) ? merge_ref_demosaic() : nullptr;
+    if (demo && (demo->h != lr_h || demo->w != lr_w)) demo = nullptr;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -359,6 +362,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             const int center_i = gk ? (int)std::floor(coarse_y) : cuda_round_to_int(coarse_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
+            f32 dsum[3] = {0, 0, 0}, wsum = 0.f;   // demosaiced-reference fallback
             for (int di = -rad; di <= rad; ++di) {
                 for (int dj = -rad; dj <= rad; ++dj) {
                     const int j = center_j + dj;
@@ -381,6 +385,31 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
                     val[channel] += c * w;
                     acc[channel] += w;
+                    if (demo) {
+                        for (int k = 0; k < 3; ++k) dsum[k] += w * demo->at(i, j, k);
+                        wsum += w;
+                    }
+                }
+            }
+
+            // Demosaiced-reference fallback: the comparison frames are already in
+            // num/den (the reference is always merged last), so the reference's share
+            // of this pixel's weight is known. Blend its contribution toward the
+            // kernel-weighted demosaiced RGB, with a common weight A for all three
+            // channels so a fully-rejected pixel comes out as exactly that RGB.
+            if (demo && nch == 3 && wsum > 0.f) {
+                const f32 sacc = acc[0] + acc[1] + acc[2];
+                const f32 dcomp = den.at(local_i, hr_j, 0) + den.at(local_i, hr_j, 1) +
+                                  den.at(local_i, hr_j, 2);
+                const f32 share = sacc / std::max(1e-30f, dcomp + sacc);
+                const f32 t = ref_fallback_t(share, cfg.ref_demosaic_share_lo,
+                                             cfg.ref_demosaic_share_hi);
+                if (t > 0.f) {
+                    const f32 A = sacc / 3.f;
+                    for (int k = 0; k < 3; ++k) {
+                        val[k] = (1.f - t) * val[k] + t * A * (dsum[k] / wsum);
+                        acc[k] = (1.f - t) * acc[k] + t * A;
+                    }
                 }
             }
 

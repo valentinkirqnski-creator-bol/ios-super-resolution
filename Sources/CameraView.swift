@@ -1140,6 +1140,15 @@ struct CameraView: View {
                         Toggle("Consensus Refiner (NN)", isOn: $cam.tuningParams.cref_enabled)
                         Text("A small network refines the robustness mask (Wronski or GCam) by comparing each frame's fine structure with the reference AND with the other frames at their motion-compensated positions: real detail (aliasing) agrees with the other frames, a misaligned or moving sample does not. Can lower or raise the mask. Aligns every frame twice. Inactive until a trained model is built in.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Demosaiced Reference Fallback", isOn: $cam.tuningParams.ref_demosaic_fallback)
+                        Text("Where the comparison frames are rejected the output falls back to the reference alone, which the merge builds per colour from its raw Bayer samples — colour fringes and zipper on edges. With this on, the reference is demosaiced once per burst (edge-directed) and those areas blend toward it. Areas where other frames merged are unchanged. Works with the Wronski and GCam masks.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.ref_demosaic_fallback {
+                            ispRow("Blend Start", $cam.tuningParams.ref_demosaic_share_lo, 0.1...0.95, "%.2f")
+                            ispRow("Blend Full", $cam.tuningParams.ref_demosaic_share_hi, 0.2...1.0, "%.2f")
+                            Text("The reference's share of a pixel's merge weight (1 = every other frame rejected; about 1/N when all N frames merge). Below Blend Start the merge is untouched; at Blend Full the pixel is the demosaiced reference. Defaults 0.50 / 0.90.")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
                         ispRow("Threshold t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
                         ispRow("s1 (irregular flow)", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
                         ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")
@@ -1233,6 +1242,18 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_gcam_enabled {
+                        Toggle("SABRE Unblocker", isOn: Binding(
+                            get: { cam.tuningParams.gcam_unblocker_enabled },
+                            set: { v in
+                                cam.tuningParams.gcam_unblocker_enabled = v
+                                if v { cam.tuningParams.hf_artifact_removal_enabled = false }   // replaces HF rejection
+                            }))
+                        Text("GCam's variance-loss guard, replacing HF Artifact Rejection (turning one on turns the other off). Per tile of each comparison frame it compares the variance of the green plane with that of its 3x3 box-blurred copy, noise-gated at 4x the sensor noise: m = sqrt((V_blur - 4 noise) / (V_raw x 128/9)), unblocker = clamp(Scale x (m - Offset), 0, 1). Only where the local motion field is irregular (the same flow threshold as the x6 boost) it caps the keep weight at 1 - unblocker, before the dilate. m is at most 0.265 (all-low-frequency content), so GCam's own constants (Scale 0.2, Offset 0.45) never fire; defaults here are Scale 8.0, Offset 0.15 (starts at m 0.15, full reject at 0.265). Higher Offset = rejects less.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.gcam_unblocker_enabled {
+                            ispRow("Unblocker Scale", $cam.tuningParams.gcam_unblocker_scale, 0.0...20.0, "%.2f")
+                            ispRow("Unblocker Offset", $cam.tuningParams.gcam_unblocker_offset, 0.0...0.5, "%.3f")
+                        }
                         Toggle("Structure Match", isOn: $cam.tuningParams.gcam_structure_match)
                         Text("Also compares the local structure tensor of each comparison frame (at its motion-compensated position) with the reference's: edge direction (weighted by how edge-like both are) and structure strength, counted only where structure is clearly above noise. Mismatches multiply the GCam mask down. Catches moved, appeared or re-textured content and multi-pixel misalignment; a sub-pixel shift of an edge leaves the tensor unchanged, so it does not catch those.")
                             .font(.footnote).foregroundColor(.secondary)
@@ -1444,7 +1465,12 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
-                    Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
+                    Toggle("HF Artifact Rejection", isOn: Binding(
+                        get: { cam.tuningParams.hf_artifact_removal_enabled },
+                        set: { v in
+                            cam.tuningParams.hf_artifact_removal_enabled = v
+                            if v { cam.tuningParams.gcam_unblocker_enabled = false }   // exclusive with the SABRE Unblocker
+                        }))
                     Text("""
                          Wronski et al. Drops a frame's contribution only where BOTH hold: the reference patch is almost entirely high-frequency (most of its local detail vanishes under a blur, above Variance Loss) AND the per-tile motion is locally irregular (the same r_Mt test that drives the motion prior). Targets the blocky ghosts repetitive fine texture causes — roof tiles, fences, fabric weave, resolution charts — where block matching locks onto the wrong period, while leaving cleanly-tracked detail (hair, fur) and smooth noisy areas untouched. The reference frame stays the fallback. Off by default; it changes which pixels merge.
                          """)
@@ -1452,6 +1478,9 @@ struct CameraView: View {
                     if cam.tuningParams.hf_artifact_removal_enabled {
                         ispRow("Variance Loss", $cam.tuningParams.hf_variance_loss_threshold, 0.50...0.99, "%.2f")
                         Text("Reject above this variance-loss (how much local detail a blur destroys). Lower = rejects more. Reference points: flat wall ~0.04, face ~0.19, brick ~0.83, checkerboard ~0.92.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Texture SNR", $cam.tuningParams.hf_min_texture_snr, 1.0...30.0, "%.1f")
+                        Text("How far above the expected sensor noise a patch's detail must be before it can count as high-frequency texture (signal variance > this × noise variance, from the noise model). Lower = fires on fainter texture and, near 1, on noise itself; higher = only strong texture. Default 4.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }

@@ -1792,6 +1792,26 @@ struct Config {
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
     float gcam_sabre_boost           = 6.0f;        // §5.8 extra_motion_robustness_boost
     float gcam_sabre_boost_var_mult  = 25.0f;       // §5.8 motion_robustness_boost_variance_threshold
+    // SABRE Unblocker (UnblockerRaw16Halide port; gcam_unblocker_map in robustness.cpp).
+    // Per alignment tile of the COMPARISON frame (8x8-green window at the tile's
+    // flow-displaced centre): V_inner = population variance of the raw green plane,
+    // V_outer = that of its 3x3 box-averaged copy, noise_var = beta + alpha*mean;
+    //   m = sqrt(max(V_outer - 4 noise_var, 0) / (V_inner * 128/9))
+    //   unblocker = clamp(scale * (m - offset), 0, 1)
+    // gated by the same flow.z test as the motion boost (0 where the local flow
+    // spread is below gcam_sabre_motion_thresh), and fused per pixel BEFORE the §7
+    // dilate as keep = min(1 - unblocker, frame_weight). Replaces HF artifact
+    // rejection on the GCam path (the two are exclusive). GCam's build constants
+    // (scale 0.2, offset 0.45) are INERT by construction: m <= sqrt(9/128) = 0.265 <
+    // 0.45, and even at offset 0 the cap would be 0.2 * 0.265 = 0.053. Our defaults make
+    // it act: m^2 * 128/9 = V_blur / V_raw (noise aside), so offset 0.15 starts where the
+    // 3x3 blur keeps >= 32% of the tile's variance (mostly low-frequency structure) and
+    // scale 8 reaches full rejection at the structural maximum m = 0.265 (all of it kept:
+    // purely low-frequency content -- under irregular flow, where per-tile flow on such
+    // weakly textured tiles is unreliable).
+    bool  gcam_unblocker_enabled     = false;
+    float gcam_unblocker_scale       = 8.0f;
+    float gcam_unblocker_offset      = 0.15f;
     float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold (UV); converted to raw px as x tile_size x (4128/16) so the boost arms at GCam's flow GRADIENT independent of grid density/sensor res
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
@@ -1962,6 +1982,17 @@ struct Config {
     // the consensus pre-pass (decodes + aligns every frame twice) and host-side masks.
     // No-op until trained weights are compiled in (core/cref_weights.h). OFF by default.
     bool  cref_enabled = false;
+    // Demosaiced-reference fallback (core/ref_demosaic.h). Where the comparison
+    // frames are rejected the output is the reference alone, built per colour from
+    // its own Bayer sites -> colour fringes / zipper. With this on, the reference
+    // is demosaiced once per burst (edge-directed) and its merge contribution is
+    // blended toward the kernel-weighted demosaiced RGB by t = smoothstep(lo, hi,
+    // share), share = the reference's fraction of the pixel's total merge weight
+    // (1 = everything rejected; ~1/N = every frame merged). Below lo the merge is
+    // bit-identical. Works with the Wronski and GCam masks. OFF by default.
+    bool  ref_demosaic_fallback = false;
+    float ref_demosaic_share_lo = 0.5f;
+    float ref_demosaic_share_hi = 0.9f;
     // tools/robust_nn: learned refinement R = sigmoid(logit(R0) + delta) of the
     // finished analytic mask, ~2.3k params (core/robust_nn_shared.h + _weights.h).
     // Trained on synthetic RAW bursts with exact ground-truth correspondence,

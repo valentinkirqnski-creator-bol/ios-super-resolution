@@ -2368,6 +2368,8 @@ static void gcam_structure_match_apply(Image* R, Mask8* m8, const Image& comp_ra
 static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const FlowField& flow,
                                  int tile_size, const Config& cfg) {
     const Image& L = rs.hf_loss;
+    // The SABRE Unblocker replaces this rule on the GCam path (exclusive toggles).
+    if (cfg.gcam_unblocker_enabled) return;
     if (!cfg.hf_artifact_removal_enabled || L.h <= 0 || L.w <= 0 ||
         L.data.size() != (size_t)L.h * L.w || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0)
         return;
@@ -2539,6 +2541,78 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // moving-object seams, block-match blunders -- which is where a one-vector-per-
 // tile fetch is most likely wrong. (Measured to catch the gross/irregular ghosts,
 // not the subtle sub-pixel band; see Config::robustness_gcam_enabled.)
+std::vector<f32> gcam_unblocker_map(const Image& comp_raw, const FlowField& flow, int tile_size,
+                                    const Config& cfg) {
+    const int ny = flow.ny, nx = flow.nx;
+    std::vector<f32> out((size_t)std::max(0, ny) * std::max(0, nx), 0.f);
+    const int H = comp_raw.h, W = comp_raw.w;
+    if (ny <= 0 || nx <= 0 || H < 4 || W < 4 || comp_raw.c != 1 ||
+        comp_raw.data.size() < (size_t)H * W || tile_size <= 0)
+        return out;
+    // Dense half-res green plane: mean of the quad's two green sites.
+    int gs[2][2], ng = 0;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            if (cfg.cfa.p[i][j] == 1 && ng < 2) { gs[ng][0] = i; gs[ng][1] = j; ++ng; }
+    if (ng < 2) return out;
+    const int gh = H / 2, gw = W / 2, nt = cfg.num_threads;
+    std::vector<f32> g((size_t)gh * gw), t((size_t)gh * gw), ga((size_t)gh * gw);
+    parallel_rows(gh, nt, [&](int y) {
+        for (int x = 0; x < gw; ++x)
+            g[(size_t)y * gw + x] = 0.5f * (comp_raw.at(2 * y + gs[0][0], 2 * x + gs[0][1]) +
+                                            comp_raw.at(2 * y + gs[1][0], 2 * x + gs[1][1]));
+    });
+    // 3x3 box average (edge-padded, separable): the kernel's urhadd/uhadd low-pass plane.
+    parallel_rows(gh, nt, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            float s = 0.f;
+            for (int j = -1; j <= 1; ++j) s += g[(size_t)y * gw + std::min(gw - 1, std::max(0, x + j))];
+            t[(size_t)y * gw + x] = s * (1.f / 3.f);
+        }
+    });
+    parallel_rows(gh, nt, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            float s = 0.f;
+            for (int i = -1; i <= 1; ++i) s += t[(size_t)std::min(gh - 1, std::max(0, y + i)) * gw + x];
+            ga[(size_t)y * gw + x] = s * (1.f / 3.f);
+        }
+    });
+    const float alpha = std::max(0.f, cfg.alpha_dng[1]), beta = std::max(0.f, cfg.beta_dng[1]);
+    const float kDen = 128.f / 9.f, scale = cfg.gcam_unblocker_scale, offset = cfg.gcam_unblocker_offset;
+    const float tile_g = 0.5f * (float)tile_size;
+    const int half = 4;                                   // 8x8 green window (= one 16x16 Bayer tile)
+    parallel_rows(ny, nt, [&](int ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            // Tile centre in green px, displaced by the tile's flow (the comparison frame's
+            // content for this reference tile).
+            const int cy = (int)std::lround(((float)ty + 0.5f) * tile_g + 0.5f * flow.dy(ty, tx));
+            const int cx = (int)std::lround(((float)tx + 0.5f) * tile_g + 0.5f * flow.dx(ty, tx));
+            const int y0 = std::max(0, cy - half), y1 = std::min(gh, cy + half);
+            const int x0 = std::max(0, cx - half), x1 = std::min(gw, cx + half);
+            if (y1 <= y0 || x1 <= x0) continue;
+            double si = 0, si2 = 0, so = 0, so2 = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x) {
+                    const double a = g[(size_t)y * gw + x], b = ga[(size_t)y * gw + x];
+                    si += a; si2 += a * a; so += b; so2 += b * b;
+                }
+            const double n = (double)(y1 - y0) * (x1 - x0);
+            const double mi = si / n, mo = so / n;
+            const double v_inner = std::max(0.0, si2 / n - mi * mi);
+            const double v_outer = std::max(0.0, so2 / n - mo * mo);
+            const double signal = std::max(mi, 0.0);           // black already subtracted
+            const double noise_var = beta + alpha * signal;
+            const double num = std::max(v_outer - 4.0 * noise_var, 0.0);
+            const double den = v_inner * kDen;
+            float ub = 0.f;
+            if (num > 0.0 && den > 0.0)
+                ub = std::min(1.f, std::max(0.f, scale * ((float)std::sqrt(num / den) - offset)));
+            out[(size_t)ty * nx + tx] = ub;
+        }
+    });
+    return out;
+}
+
 std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
     const int ny = flow.ny, nx = flow.nx;
     std::vector<f32> irr((size_t)std::max(0, ny) * std::max(0, nx), 0.f);
@@ -2648,6 +2722,9 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const int oh = (int)std::llround((double)rh * (double)cfg.scale);
     const int ow = (int)std::llround((double)rw * (double)cfg.scale);
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
+    // SABRE Unblocker (per tile, gated per pixel below by the same flow.z threshold).
+    const std::vector<f32> unb = cfg.gcam_unblocker_enabled
+        ? gcam_unblocker_map(comp_raw, flow, tile_size, cfg) : std::vector<f32>();
     // GCam's flow.z threshold (gcam_sabre_motion_thresh, normalized UV) was measured
     // over a 3x3 neighbourhood of its ~16-raw-px tiles (258 across a 4128px frame,
     // spec §1). Our M (compute_flow_irregularity) is the flow spread in RAW PIXELS
@@ -2817,7 +2894,14 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             if (arg > 0.f) arg = 0.f;
             f32 w = std::exp2(arg);
             if (!std::isfinite(w)) w = 0.f;
-            const f32 wc = clampf(w, 0.f, 1.f);            // keep weight (unblocker = 0)
+            f32 wc = clampf(w, 0.f, 1.f);                  // keep weight
+            // SABRE Unblocker: off where the flow is smooth (flow.z below the same
+            // threshold that arms the boost); elsewhere weight = min(1 - unblocker, w).
+            if (!unb.empty() && motion_extent > motion_thresh) {
+                const int uy = std::min(std::max(patch_idy, 0), std::max(0, flow.ny - 1));
+                const int ux = std::min(std::max(patch_idx, 0), std::max(0, flow.nx - 1));
+                wc = std::min(wc, 1.f - unb[(size_t)uy * flow.nx + ux]);
+            }
             if (to8) r8row[rx] = (uint8_t)(wc * 255.f + 0.5f);
             else     R.at(ry, rx, 0) = wc;
         }

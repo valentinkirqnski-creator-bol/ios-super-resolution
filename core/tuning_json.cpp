@@ -156,6 +156,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("robustness_save_mask")) cfg.robustness_save_mask = bv("robustness_save_mask");
     if (has("structure_map_save")) cfg.structure_map_save = bv("structure_map_save");
     if (has("cref_enabled")) cfg.cref_enabled = bv("cref_enabled");
+    if (has("ref_demosaic_fallback")) cfg.ref_demosaic_fallback = bv("ref_demosaic_fallback");
+    if (has("ref_demosaic_share_lo")) cfg.ref_demosaic_share_lo = fv("ref_demosaic_share_lo");
+    if (has("ref_demosaic_share_hi")) cfg.ref_demosaic_share_hi = fv("ref_demosaic_share_hi");
     if (has("dng_lossless_compress"))
         cfg.dng_codec = bv("dng_lossless_compress") ? Config::DNG_CODEC_LJPEG : Config::DNG_CODEC_NONE;
     if (has("dng_codec")) cfg.dng_codec = std::max(0, std::min(2, iv("dng_codec")));
@@ -250,6 +253,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_rejection_only")) cfg.gcam_sabre_rejection_only = bv("gcam_sabre_rejection_only");
     if (has("gcam_sabre_flow_bilinear")) cfg.gcam_sabre_flow_bilinear = bv("gcam_sabre_flow_bilinear");
     if (has("gcam_structure_match")) cfg.gcam_structure_match = bv("gcam_structure_match");
+    if (has("gcam_unblocker_enabled")) cfg.gcam_unblocker_enabled = bv("gcam_unblocker_enabled");
+    if (has("gcam_unblocker_scale")) cfg.gcam_unblocker_scale = fv("gcam_unblocker_scale");
+    if (has("gcam_unblocker_offset")) cfg.gcam_unblocker_offset = fv("gcam_unblocker_offset");
     if (has("gcam_sabre_kernel"))       cfg.gcam_sabre_kernel = bv("gcam_sabre_kernel");
     if (has("gcam_cov_shrinked_sigma")) cfg.gcam_cov_shrinked_sigma = fv("gcam_cov_shrinked_sigma");
     if (has("gcam_cov_stretched_sigma")) cfg.gcam_cov_stretched_sigma = fv("gcam_cov_stretched_sigma");
