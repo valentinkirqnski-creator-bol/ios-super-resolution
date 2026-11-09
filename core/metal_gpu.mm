@@ -8,6 +8,8 @@
 #include "cref_weights.h"
 #include "hfnn.h"
 #include "hfnn_weights.h"
+#include "mann.h"
+#include "mann_weights.h"
 #include "dng_writer.h"
 #include "debug_utils.h"
 #include "prof.h"
@@ -6524,6 +6526,49 @@ bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int
             for (int ch = 0; ch < kHfnnCh; ++ch) d += kHfnnWO[ch] * act[(size_t)ch * plane + q];
             delta_out[(size_t)r * w + x] = d;
         }
+    return true;
+  }
+}
+
+bool mann_window_metal(const std::vector<float>& F, int rows, int cols, std::vector<float>& act_out) {
+  @autoreleasepool {
+    if (!kMannTrained || !metal_gpu_init() || rows <= 0 || cols <= 0) return false;
+    if (F.size() != (size_t)kMannIn * rows * cols) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pc = c.pipe("cref_conv");
+    if (!pc) return false;
+    const size_t plane = (size_t)rows * (size_t)cols;
+    id<MTLBuffer> b_F = buf(F.data(), F.size() * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, (size_t)kMannCh * plane * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, (size_t)kMannCh * plane * sizeof(float));
+    if (!b_F || !b_A || !b_B) return false;
+    const float* Ws[kMannLayers] = {kMannW0, kMannW1, kMannW2, kMannW3};
+    const float* Bs[kMannLayers] = {kMannB0, kMannB1, kMannB2, kMannB3};
+    const size_t wbytes[kMannLayers] = {sizeof(kMannW0), sizeof(kMannW1), sizeof(kMannW2), sizeof(kMannW3)};
+    id<MTLBuffer> ins[kMannLayers] = {b_F, b_A, b_B, b_A};
+    id<MTLBuffer> outs[kMannLayers] = {b_A, b_B, b_A, b_B};
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return false;
+    for (int l = 0; l < kMannLayers; ++l) {
+        CrefParamsCPU q{};
+        q.w = (uint32_t)cols; q.rows = (uint32_t)rows;
+        q.cin = (uint32_t)(l == 0 ? kMannIn : kMannCh);
+        q.dil = (uint32_t)kMannDil[l];
+        q.vlo = 0u; q.vhi = (uint32_t)(rows - 1);
+        [enc setBuffer:ins[l] offset:0 atIndex:0]; [enc setBuffer:outs[l] offset:0 atIndex:1];
+        [enc setBytes:Ws[l] length:wbytes[l] atIndex:2];
+        [enc setBytes:Bs[l] length:kMannCh * sizeof(float) atIndex:3];
+        [enc setBytes:&q length:sizeof(q) atIndex:4];
+        dispatch2(enc, pc, q.w, q.rows);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:mann");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    const float* act = (const float*)[b_B contents];
+    act_out.assign(act, act + (size_t)kMannCh * plane);
     return true;
   }
 }

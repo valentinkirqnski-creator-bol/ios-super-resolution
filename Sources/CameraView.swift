@@ -1246,7 +1246,10 @@ struct CameraView: View {
                             get: { cam.tuningParams.gcam_unblocker_enabled },
                             set: { v in
                                 cam.tuningParams.gcam_unblocker_enabled = v
-                                if v { cam.tuningParams.hf_artifact_removal_enabled = false }   // replaces HF rejection
+                                if v {
+                                    cam.tuningParams.hf_artifact_removal_enabled = false   // replaces HF rejection
+                                    cam.tuningParams.mann_enabled = false                  // and the misalignment NN
+                                }
                             }))
                         Text("GCam's variance-loss guard, replacing HF Artifact Rejection (turning one on turns the other off). Per tile of each comparison frame it compares the variance of the green plane with that of its 3x3 box-blurred copy, noise-gated at 4x the sensor noise: m = sqrt((V_blur - 4 noise) / (V_raw x 128/9)), unblocker = clamp(Scale x (m - Offset), 0, 1). Only where the local motion field is irregular (the same flow threshold as the x6 boost) it caps the keep weight at 1 - unblocker, before the dilate. m is at most 0.265 (all-low-frequency content), so GCam's own constants (Scale 0.2, Offset 0.45) never fire; defaults here are Scale 8.0, Offset 0.15 (starts at m 0.15, full reject at 0.265). Higher Offset = rejects less.")
                             .font(.footnote).foregroundColor(.secondary)
@@ -1464,6 +1467,20 @@ struct CameraView: View {
                     }
                 }
 
+                Section(header: Text("Forward-Backward Check")) {
+                    Toggle("Forward-Backward Confidence", isOn: $cam.tuningParams.fb_conf_enabled)
+                    Text("For every tile it measures the motion back from the comparison frame to the reference and checks that the round trip returns to where it started. The round-trip error e becomes a confidence exp(-e²/2τ²) that multiplies the rejection mask after everything else (Wronski or GCam, and the NNs): 0.05 px keeps everything, 0.3 px keeps ~92%, 1.5 px drops to ~14%, 4 px rejects. Only the error ACROSS edges counts (a slide along a straight edge is invisible), and the error sensor noise alone would cause is subtracted, so flat or dim areas are not rejected. Fast: a few sub-pixel steps per tile from the comparison side, no extra images.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.fb_conf_enabled {
+                        ispRow("Tolerance τ (px)", $cam.tuningParams.fb_conf_tau_px, 0.2...2.0, "%.2f")
+                        Text("Round-trip error at which the confidence falls to 61%. Lower = stricter. Default 0.75.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Full Backward Alignment", isOn: $cam.tuningParams.fb_conf_full)
+                        Text("Measures the backward motion with a complete second alignment (comparison → reference) instead of the local check. Also catches wrong matches that look consistent locally (e.g. a slip by one period on a fence), at about twice the alignment time and extra memory.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
                 Section(header: Text("High-Frequency Rejection")) {
                     Toggle("HF Artifact Rejection", isOn: Binding(
                         get: { cam.tuningParams.hf_artifact_removal_enabled },
@@ -1472,14 +1489,38 @@ struct CameraView: View {
                             if v {
                                 cam.tuningParams.gcam_unblocker_enabled = false   // exclusive with the SABRE Unblocker
                                 cam.tuningParams.hfnn_enabled = false             // and with the HF-artifact NN
+                                cam.tuningParams.mann_enabled = false             // and the misalignment NN
                             }
                         }))
                     Toggle("HF Artifact NN", isOn: Binding(
                         get: { cam.tuningParams.hfnn_enabled },
                         set: { v in
                             cam.tuningParams.hfnn_enabled = v
-                            if v { cam.tuningParams.hf_artifact_removal_enabled = false }   // replaces the rule
+                            if v {
+                                cam.tuningParams.hf_artifact_removal_enabled = false   // replaces the rule
+                                cam.tuningParams.mann_enabled = false
+                            }
                         }))
+                    Toggle("Misalignment Artifact NN", isOn: Binding(
+                        get: { cam.tuningParams.mann_enabled },
+                        set: { v in
+                            cam.tuningParams.mann_enabled = v
+                            if v {   // replaces the HF rule, the HF NN and the SABRE Unblocker
+                                cam.tuningParams.hf_artifact_removal_enabled = false
+                                cam.tuningParams.hfnn_enabled = false
+                                cam.tuningParams.gcam_unblocker_enabled = false
+                            }
+                        }))
+                    Text("A tiny network (~2.6k weights) that runs only on tiles whose motion is irregular (the same flow threshold as GCam's x6 boost). There it low-pass filters the reference, the aligned frame and their difference, measures how much variance the filter removes, and from that plus the local edges decides whether the frame would leave a shifted edge, a doubled / ghosted edge or a stair of slightly offset tiles (the aperture problem). Replaces HF Artifact Rejection, the HF Artifact NN and the SABRE Unblocker. No extra alignment pass. Works with the Wronski and GCam masks. On held-out test bursts (edges, tiles with irregular motion): GCam catches 88% of visible misalignments (mask alone 65%) while wrongly rejecting 38% of good edges (39%); Wronski 88% (27%) at 37% (15%).")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.mann_enabled {
+                        ispRow("Motion Gate", $cam.tuningParams.mann_gate, 0.25...4.0, "%.2f")
+                        Text("Multiplies the irregular-motion threshold that opens the network. Lower = more tiles are checked. Default 1.0.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Strictness", $cam.tuningParams.mann_strictness, -2.0...2.0, "%.2f")
+                        Text("Shifts the network's decision: + rejects more, - keeps more detail. 0 = trained default (edges: 88% caught / 37% good wrongly rejected); -0.5 ~ 74-80% / 21-26%; -1.0 ~ 54-72% / 10-16%; +0.5 ~ 92% / 50-55%.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                     Text("A tiny network (~1.4k weights) that replaces HF Artifact Rejection: only in fine repeated-pattern areas (fences, grids, brick, fabric, text) it decides whether each frame is misaligned there (wrong period lock, sliding along lines, tile-shaped steps) or correctly aligned fine detail, so well-aligned patterns still merge. Everywhere else the mask is untouched. Uses each frame's own alignment (no extra alignment pass). Works with the Wronski and GCam masks. Inactive until a trained model is built in.")
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.hfnn_enabled {

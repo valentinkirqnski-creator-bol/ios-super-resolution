@@ -50,6 +50,8 @@ targets:
           - "cref.cpp"
           - "ref_demosaic.cpp"
           - "hfnn.cpp"
+          - "mann.cpp"
+          - "fb_confidence.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"

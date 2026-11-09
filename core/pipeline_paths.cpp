@@ -17,6 +17,8 @@
 #include "structure_map.h"
 #include "ref_demosaic.h"
 #include "hfnn.h"
+#include "mann.h"
+#include "fb_confidence.h"
 #include "cref.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1304,6 +1306,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Config work = cfg;
     // The HF-artifact NN replaces the HF rejection rule (exclusive) on every mask path.
     if (work.hfnn_enabled) work.hf_artifact_removal_enabled = false;
+    // The misalignment NN replaces all three (HF rule, HF NN, SABRE Unblocker).
+    if (work.mann_enabled) {
+        work.hf_artifact_removal_enabled = false;
+        work.hfnn_enabled = false;
+        work.gcam_unblocker_enabled = false;
+    }
     // Drives the reference-kernel enlargement; not a tuning knob.
     work.burst_frame_count = frame_count;
     // Raise the robustness threshold r_t at higher ISO: from ISO 100 up, noise
@@ -1489,7 +1497,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.dense_flow_enabled ||
                               work.feat_metric_refine_enabled ||
                               work.rob_mask_nn_enabled || work.cref_enabled ||
-                              work.hfnn_enabled);
+                              work.hfnn_enabled || work.mann_enabled ||
+                              work.fb_conf_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1523,7 +1532,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled && !work.cref_enabled &&
-                      !work.hfnn_enabled &&
+                      !work.hfnn_enabled && !work.mann_enabled && !work.fb_conf_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -2254,10 +2263,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         Image mask_nn_aligned_grey;
         // (The HF-artifact NN needs only this frame's warped grey -- no consensus, no pre-pass.)
         if ((((work.rob_mask_nn_enabled || work.cref_enabled) && mask_nn_consensus.h > 0) ||
-             work.hfnn_enabled) &&
+             work.hfnn_enabled || work.mann_enabled) &&
             !comp_grey.data.empty())
             mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
                                                          work.num_threads);
+        // Forward-backward flow confidence (Config::fb_conf_enabled): per-tile round-trip
+        // error of the FINAL merge flow (after the GCam median), measured now while the
+        // comparison grey still exists; applied to the mask after every mask stage below.
+        std::vector<float> fb_err;
+        if (work.fb_conf_enabled && !comp_grey.data.empty() && flow.ny > 0 && flow.nx > 0) {
+            const double t_fb = prof_now_ms();
+            fb_err = fb_tile_error(ref_grey, comp_grey, flow, comp.h, comp.w, merge_ts, work);
+            prof_add_cpu("comp:fb-conf", prof_now_ms() - t_fb);
+        }
         const double t_freeg = prof_now_ms();
         comp_grey = Image(); // free before robustness/kernels peak
         prof_add_cpu("comp:free-grey", prof_now_ms() - t_freeg);
@@ -2355,6 +2373,32 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
                                                           work.frame_discard_enabled);
             prof_add_cpu("comp:hfnn", prof_now_ms() - t_hfnn);
+        }
+        // Misalignment-artifact NN (Config::mann_enabled): refines the mask only on tiles
+        // with irregular flow (shifted / doubled edges, tile stairs) from this frame's
+        // warped grey (no consensus). Can raise the mask, so row activity is recomputed.
+        if (work.mann_enabled && rob8.empty() &&
+            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
+            rob.h > 0 && rob.data.size() == (size_t)rob.h * rob.w * rob.c) {
+            const double t_mann = prof_now_ms();
+            if (mann_refine(rob, ref_grey, mask_nn_aligned_grey, flow, merge_ts, work))
+                rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
+                                                          work.frame_discard_enabled);
+            prof_add_cpu("comp:mann", prof_now_ms() - t_mann);
+        }
+        // Forward-backward confidence: multiply the finished mask (host fp32 and/or the
+        // 8-bit merge-res mask) by C(e). Last, so no refiner can raise it back.
+        if (!fb_err.empty()) {
+            const double t_fba = prof_now_ms();
+            const bool host_rob = rob.h > 0 && rob.data.size() == (size_t)rob.h * rob.w * rob.c;
+            const double mean_c = fb_apply_confidence(host_rob ? &rob : nullptr,
+                                                      rob8.empty() ? nullptr : &rob8,
+                                                      fb_err, flow, comp.h, comp.w, merge_ts, work);
+            if (host_rob)
+                rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
+                                                          work.frame_discard_enabled);
+            prof_add_cpu("comp:fb-apply", prof_now_ms() - t_fba);
+            prof_add_cpu("fb#mean-conf", mean_c);
         }
         // gcam_sabre_merge_res: the operator wrote the 48MP mask straight into rob8 at
         // 8-bit (~48MB/frame, the raw-res budget) -- no 48MP fp32 mask was ever built,

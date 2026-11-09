@@ -2003,6 +2003,30 @@ struct Config {
     // - = more lenient. 0 = the validated operating point baked into the weights
     // (pattern px: GCam catch 82% / false 20%, Wronski 79% / 21%).
     float hfnn_strictness = 0.f;
+    // Misalignment-artifact NN (core/mann.h): a ~2.6k-weight CNN that runs ONLY on tiles
+    // whose flow is irregular (3x3 tile-flow spread M above the GCam motion threshold x
+    // mann_gate, soft over 0.75-1.25x) and decides there from low-pass variance loss
+    // (reference, comparison, difference, pair) and local structure whether the frame
+    // leaves a shifted / doubled edge or a tile stair (aperture problem). No consensus,
+    // no second alignment. Forces hf_artifact_removal_enabled, hfnn_enabled and the
+    // SABRE Unblocker off for the burst. OFF by default. Trained weights in
+    // core/mann_weights.h (runs/mann1 best, 60-min budget on 148 bursts incl. edge scenes).
+    bool  mann_enabled = false;
+    float mann_gate = 1.0f;          // x the motion threshold (lower = more tiles checked)
+    float mann_strictness = 0.f;     // logit offset: + rejects more, - fewer
+    // Forward-backward flow confidence (core/fb_confidence.h): per tile, the backward
+    // displacement comparison -> reference is measured at the forward destination and
+    // the round-trip error e (raw px; across-edge part only, noise-corrected) becomes
+    // C = exp(-e^2 / (2 tau^2)), which MULTIPLIES the robustness mask after every other
+    // mask stage (Wronski, GCam, NN refiners). tau 0.75: e 0.3 -> 0.92, 1.5 -> 0.14,
+    // 4 -> 0. Local mode (default): a few LK steps per tile from the comparison side,
+    // no pyramid, one float per tile. fb_conf_full: an independent backward align()
+    // (~2x alignment time, one transient pyramid). OFF by default.
+    bool  fb_conf_enabled = false;
+    bool  fb_conf_full = false;
+    float fb_conf_tau_px = 0.75f;
+    int   fb_conf_iters = 6;
+    float fb_conf_noise_k = 2.0f;    // x the noise-only expected error^2 subtracted
     bool  ref_demosaic_fallback = false;
     float ref_demosaic_share_lo = 0.5f;
     float ref_demosaic_share_hi = 0.9f;

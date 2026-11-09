@@ -160,6 +160,12 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("hfnn_enabled")) cfg.hfnn_enabled = bv("hfnn_enabled");
     if (has("hfnn_gate")) cfg.hfnn_gate = fv("hfnn_gate");
     if (has("hfnn_strictness")) cfg.hfnn_strictness = fv("hfnn_strictness");
+    if (has("mann_enabled")) cfg.mann_enabled = bv("mann_enabled");
+    if (has("mann_gate")) cfg.mann_gate = fv("mann_gate");
+    if (has("mann_strictness")) cfg.mann_strictness = fv("mann_strictness");
+    if (has("fb_conf_enabled")) cfg.fb_conf_enabled = bv("fb_conf_enabled");
+    if (has("fb_conf_full")) cfg.fb_conf_full = bv("fb_conf_full");
+    if (has("fb_conf_tau_px")) cfg.fb_conf_tau_px = fv("fb_conf_tau_px");
     if (has("ref_demosaic_share_lo")) cfg.ref_demosaic_share_lo = fv("ref_demosaic_share_lo");
     if (has("ref_demosaic_share_hi")) cfg.ref_demosaic_share_hi = fv("ref_demosaic_share_hi");
     if (has("dng_lossless_compress"))

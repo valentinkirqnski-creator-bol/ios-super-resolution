@@ -261,6 +261,10 @@ bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, c
 // host-built features; returns the head's delta for the band's out_rows rows.
 bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int out_rows,
                      int vlo, int vhi, std::vector<float>& delta_out);
+// Misalignment-artifact NN (core/mann.h): the 4 convs of one window on the GPU
+// (cref_conv kernel) from host-built features [kMannIn][rows*cols]; returns the last
+// layer's activations [8][rows*cols] (the head + blend run on the host).
+bool mann_window_metal(const std::vector<float>& F, int rows, int cols, std::vector<float>& act_out);
 uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma);
 bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
                            int tile_size, const Config& cfg, std::vector<float>& S_out,

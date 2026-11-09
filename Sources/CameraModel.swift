@@ -122,6 +122,15 @@ struct TuningParams: Equatable, Codable {
     var hfnn_enabled: Bool = false
     var hfnn_gate: Float = 0.35
     var hfnn_strictness: Float = 0
+    /// Misalignment-artifact NN (core/mann.h): irregular-flow tiles only; replaces HF rejection,
+    /// the HF NN and the SABRE Unblocker (exclusive); no second alignment.
+    var mann_enabled: Bool = false
+    var mann_gate: Float = 1.0
+    var mann_strictness: Float = 0
+    /// Forward-backward flow confidence (core/fb_confidence.h): multiplies the mask by exp(-e^2/2tau^2).
+    var fb_conf_enabled: Bool = false
+    var fb_conf_full: Bool = false
+    var fb_conf_tau_px: Float = 0.75
     var ref_demosaic_fallback: Bool = false
     /// Reference share of a pixel's merge weight where the blend starts / is complete.
     var ref_demosaic_share_lo: Float = 0.5
@@ -590,6 +599,8 @@ struct TuningParams: Equatable, Codable {
         case robustness_enabled, robustness_save_mask, structure_map_save, cref_enabled
         case ref_demosaic_fallback, ref_demosaic_share_lo, ref_demosaic_share_hi
         case hfnn_enabled, hfnn_gate, hfnn_strictness
+        case mann_enabled, mann_gate, mann_strictness
+        case fb_conf_enabled, fb_conf_full, fb_conf_tau_px
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -681,6 +692,12 @@ struct TuningParams: Equatable, Codable {
         hfnn_enabled = try c.decodeIfPresent(Bool.self, forKey: .hfnn_enabled) ?? hfnn_enabled
         hfnn_gate = try c.decodeIfPresent(Float.self, forKey: .hfnn_gate) ?? hfnn_gate
         hfnn_strictness = try c.decodeIfPresent(Float.self, forKey: .hfnn_strictness) ?? hfnn_strictness
+        mann_enabled = try c.decodeIfPresent(Bool.self, forKey: .mann_enabled) ?? mann_enabled
+        mann_gate = try c.decodeIfPresent(Float.self, forKey: .mann_gate) ?? mann_gate
+        mann_strictness = try c.decodeIfPresent(Float.self, forKey: .mann_strictness) ?? mann_strictness
+        fb_conf_enabled = try c.decodeIfPresent(Bool.self, forKey: .fb_conf_enabled) ?? fb_conf_enabled
+        fb_conf_full = try c.decodeIfPresent(Bool.self, forKey: .fb_conf_full) ?? fb_conf_full
+        fb_conf_tau_px = try c.decodeIfPresent(Float.self, forKey: .fb_conf_tau_px) ?? fb_conf_tau_px
         ref_demosaic_share_lo = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_lo) ?? ref_demosaic_share_lo
         ref_demosaic_share_hi = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_hi) ?? ref_demosaic_share_hi
         // Older presets carry the boolean. Only an explicit `true` is honoured,
@@ -2568,6 +2585,12 @@ final class CameraModel: NSObject, ObservableObject {
             "hfnn_enabled": NSNumber(value: tuningParams.hfnn_enabled),
             "hfnn_gate": NSNumber(value: tuningParams.hfnn_gate),
             "hfnn_strictness": NSNumber(value: tuningParams.hfnn_strictness),
+            "mann_enabled": NSNumber(value: tuningParams.mann_enabled),
+            "mann_gate": NSNumber(value: tuningParams.mann_gate),
+            "mann_strictness": NSNumber(value: tuningParams.mann_strictness),
+            "fb_conf_enabled": NSNumber(value: tuningParams.fb_conf_enabled),
+            "fb_conf_full": NSNumber(value: tuningParams.fb_conf_full),
+            "fb_conf_tau_px": NSNumber(value: tuningParams.fb_conf_tau_px),
             "ref_demosaic_share_lo": NSNumber(value: tuningParams.ref_demosaic_share_lo),
             "ref_demosaic_share_hi": NSNumber(value: tuningParams.ref_demosaic_share_hi),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),

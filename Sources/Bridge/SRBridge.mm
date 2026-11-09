@@ -519,6 +519,18 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hfnn_gate = tuning[@"hfnn_gate"].floatValue;
     if (tuning[@"hfnn_strictness"])
         cfg.hfnn_strictness = tuning[@"hfnn_strictness"].floatValue;
+    if (tuning[@"mann_enabled"])
+        cfg.mann_enabled = tuning[@"mann_enabled"].boolValue;
+    if (tuning[@"mann_gate"])
+        cfg.mann_gate = tuning[@"mann_gate"].floatValue;
+    if (tuning[@"mann_strictness"])
+        cfg.mann_strictness = tuning[@"mann_strictness"].floatValue;
+    if (tuning[@"fb_conf_enabled"])
+        cfg.fb_conf_enabled = tuning[@"fb_conf_enabled"].boolValue;
+    if (tuning[@"fb_conf_full"])
+        cfg.fb_conf_full = tuning[@"fb_conf_full"].boolValue;
+    if (tuning[@"fb_conf_tau_px"])
+        cfg.fb_conf_tau_px = tuning[@"fb_conf_tau_px"].floatValue;
     if (tuning[@"ref_demosaic_fallback"])
         cfg.ref_demosaic_fallback = tuning[@"ref_demosaic_fallback"].boolValue;
     if (tuning[@"ref_demosaic_share_lo"])
