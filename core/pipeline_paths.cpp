@@ -16,6 +16,7 @@
 #include "isa_prealign.h"
 #include "structure_map.h"
 #include "ref_demosaic.h"
+#include "hfnn.h"
 #include "cref.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1301,6 +1302,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const double t_burst = prof_now_ms();
 
     Config work = cfg;
+    // The HF-artifact NN replaces the HF rejection rule (exclusive) on every mask path.
+    if (work.hfnn_enabled) work.hf_artifact_removal_enabled = false;
     // Drives the reference-kernel enlargement; not a tuning knob.
     work.burst_frame_count = frame_count;
     // Raise the robustness threshold r_t at higher ISO: from ISO 100 up, noise
@@ -1485,7 +1488,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.halftile_refine_enabled ||
                               work.dense_flow_enabled ||
                               work.feat_metric_refine_enabled ||
-                              work.rob_mask_nn_enabled || work.cref_enabled);
+                              work.rob_mask_nn_enabled || work.cref_enabled ||
+                              work.hfnn_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1519,6 +1523,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled && !work.cref_enabled &&
+                      !work.hfnn_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -2247,7 +2252,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (work.robustness_gcam_enabled && flow.ny > 0 && flow.nx > 0 && !flow.flow.empty())
             median3x3_tile_flow(flow);
         Image mask_nn_aligned_grey;
-        if ((work.rob_mask_nn_enabled || work.cref_enabled) && mask_nn_consensus.h > 0 &&
+        // (The HF-artifact NN needs only this frame's warped grey -- no consensus, no pre-pass.)
+        if ((((work.rob_mask_nn_enabled || work.cref_enabled) && mask_nn_consensus.h > 0) ||
+             work.hfnn_enabled) &&
             !comp_grey.data.empty())
             mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
                                                          work.num_threads);
@@ -2336,6 +2343,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
                                                           work.frame_discard_enabled);
             prof_add_cpu("comp:cref", prof_now_ms() - t_cref);
+        }
+        // HF-artifact NN (Config::hfnn_enabled): refines the mask only in HF / repeated-
+        // pattern areas from this frame's warped grey (no consensus). Can raise the mask,
+        // so row activity is recomputed. Not on the 8-bit merge-res mask.
+        if (work.hfnn_enabled && rob8.empty() &&
+            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
+            rob.h > 0 && rob.data.size() == (size_t)rob.h * rob.w * rob.c) {
+            const double t_hfnn = prof_now_ms();
+            if (hfnn_refine(rob, ref_grey, mask_nn_aligned_grey, flow, merge_ts, work))
+                rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
+                                                          work.frame_discard_enabled);
+            prof_add_cpu("comp:hfnn", prof_now_ms() - t_hfnn);
         }
         // gcam_sabre_merge_res: the operator wrote the 48MP mask straight into rob8 at
         // 8-bit (~48MB/frame, the raw-res budget) -- no 48MP fp32 mask was ever built,

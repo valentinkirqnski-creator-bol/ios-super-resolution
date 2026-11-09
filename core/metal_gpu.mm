@@ -6,6 +6,8 @@
 #include "metal_gpu.h"
 #include "cref.h"
 #include "cref_weights.h"
+#include "hfnn.h"
+#include "hfnn_weights.h"
 #include "dng_writer.h"
 #include "debug_utils.h"
 #include "prof.h"
@@ -6466,6 +6468,62 @@ bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, c
         if (cmd.status != MTLCommandBufferStatusCompleted) return false;
         memcpy(Rout.data.data() + (size_t)y0 * W, [b_out contents], (size_t)(y1 - y0) * W * sizeof(float));
     }
+    return true;
+  }
+}
+
+// HF-artifact NN band on the GPU (core/hfnn.cpp twin): the host builds the band's
+// features (kHfnnIn planes, rows x w); this runs the 3 convs with the cref_conv kernel
+// and returns the head's delta per output pixel (without the logit/blend, which the
+// host applies so it can restrict it to HF pixels).
+bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int out_rows,
+                     int vlo, int vhi, std::vector<float>& delta_out) {
+  @autoreleasepool {
+    if (!kHfnnTrained || !metal_gpu_init() || rows <= 0 || w <= 0 || out_rows <= 0) return false;
+    if (F.size() != (size_t)kHfnnIn * rows * w) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pc = c.pipe("cref_conv");
+    if (!pc) return false;
+    const size_t plane = (size_t)rows * (size_t)w;
+    id<MTLBuffer> b_F = buf(F.data(), F.size() * sizeof(float));
+    id<MTLBuffer> b_A = buf(nullptr, (size_t)kHfnnCh * plane * sizeof(float));
+    id<MTLBuffer> b_B = buf(nullptr, (size_t)kHfnnCh * plane * sizeof(float));
+    if (!b_F || !b_A || !b_B) return false;
+    const float* Ws[kHfnnLayers] = {kHfnnW0, kHfnnW1, kHfnnW2};
+    const float* Bs[kHfnnLayers] = {kHfnnB0, kHfnnB1, kHfnnB2};
+    const size_t wbytes[kHfnnLayers] = {sizeof(kHfnnW0), sizeof(kHfnnW1), sizeof(kHfnnW2)};
+    id<MTLBuffer> ins[kHfnnLayers] = {b_F, b_A, b_B};
+    id<MTLBuffer> outs[kHfnnLayers] = {b_A, b_B, b_A};
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return false;
+    for (int l = 0; l < kHfnnLayers; ++l) {
+        CrefParamsCPU q{};
+        q.w = (uint32_t)w; q.rows = (uint32_t)rows;
+        q.cin = (uint32_t)(l == 0 ? kHfnnIn : kHfnnCh);
+        q.dil = (uint32_t)kHfnnDil[l];
+        q.vlo = (uint32_t)vlo; q.vhi = (uint32_t)vhi;
+        [enc setBuffer:ins[l] offset:0 atIndex:0]; [enc setBuffer:outs[l] offset:0 atIndex:1];
+        [enc setBytes:Ws[l] length:wbytes[l] atIndex:2];
+        [enc setBytes:Bs[l] length:kHfnnCh * sizeof(float) atIndex:3];
+        [enc setBytes:&q length:sizeof(q) atIndex:4];
+        dispatch2(enc, pc, q.w, q.rows);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:hfnn");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    // 1x1 head on the host (8 MACs per output pixel; the band is already read back).
+    const float* act = (const float*)[b_A contents];
+    delta_out.assign((size_t)out_rows * w, 0.f);
+    for (int r = 0; r < out_rows; ++r)
+        for (int x = 0; x < w; ++x) {
+            const size_t q = (size_t)(r + halo) * w + x;
+            float d = kHfnnBO;
+            for (int ch = 0; ch < kHfnnCh; ++ch) d += kHfnnWO[ch] * act[(size_t)ch * plane + q];
+            delta_out[(size_t)r * w + x] = d;
+        }
     return true;
   }
 }

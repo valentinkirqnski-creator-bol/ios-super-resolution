@@ -118,6 +118,10 @@ struct TuningParams: Equatable, Codable {
     var cref_enabled: Bool = false
     /// Demosaiced-reference fallback (core/ref_demosaic.h): where every comparison frame
     /// is rejected, blend the reference toward its own edge-directed demosaic.
+    /// HF-artifact NN (core/hfnn.h): replaces HF artifact rejection (exclusive); no second alignment.
+    var hfnn_enabled: Bool = false
+    var hfnn_gate: Float = 0.35
+    var hfnn_strictness: Float = 0
     var ref_demosaic_fallback: Bool = false
     /// Reference share of a pixel's merge weight where the blend starts / is complete.
     var ref_demosaic_share_lo: Float = 0.5
@@ -585,6 +589,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_max_shift
         case robustness_enabled, robustness_save_mask, structure_map_save, cref_enabled
         case ref_demosaic_fallback, ref_demosaic_share_lo, ref_demosaic_share_hi
+        case hfnn_enabled, hfnn_gate, hfnn_strictness
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -673,6 +678,9 @@ struct TuningParams: Equatable, Codable {
         structure_map_save = try c.decodeIfPresent(Bool.self, forKey: .structure_map_save) ?? structure_map_save
         cref_enabled = try c.decodeIfPresent(Bool.self, forKey: .cref_enabled) ?? cref_enabled
         ref_demosaic_fallback = try c.decodeIfPresent(Bool.self, forKey: .ref_demosaic_fallback) ?? ref_demosaic_fallback
+        hfnn_enabled = try c.decodeIfPresent(Bool.self, forKey: .hfnn_enabled) ?? hfnn_enabled
+        hfnn_gate = try c.decodeIfPresent(Float.self, forKey: .hfnn_gate) ?? hfnn_gate
+        hfnn_strictness = try c.decodeIfPresent(Float.self, forKey: .hfnn_strictness) ?? hfnn_strictness
         ref_demosaic_share_lo = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_lo) ?? ref_demosaic_share_lo
         ref_demosaic_share_hi = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_hi) ?? ref_demosaic_share_hi
         // Older presets carry the boolean. Only an explicit `true` is honoured,
@@ -2557,6 +2565,9 @@ final class CameraModel: NSObject, ObservableObject {
             "structure_map_save": NSNumber(value: tuningParams.structure_map_save),
             "cref_enabled": NSNumber(value: tuningParams.cref_enabled),
             "ref_demosaic_fallback": NSNumber(value: tuningParams.ref_demosaic_fallback),
+            "hfnn_enabled": NSNumber(value: tuningParams.hfnn_enabled),
+            "hfnn_gate": NSNumber(value: tuningParams.hfnn_gate),
+            "hfnn_strictness": NSNumber(value: tuningParams.hfnn_strictness),
             "ref_demosaic_share_lo": NSNumber(value: tuningParams.ref_demosaic_share_lo),
             "ref_demosaic_share_hi": NSNumber(value: tuningParams.ref_demosaic_share_hi),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),

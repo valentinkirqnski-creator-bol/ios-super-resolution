@@ -157,6 +157,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("structure_map_save")) cfg.structure_map_save = bv("structure_map_save");
     if (has("cref_enabled")) cfg.cref_enabled = bv("cref_enabled");
     if (has("ref_demosaic_fallback")) cfg.ref_demosaic_fallback = bv("ref_demosaic_fallback");
+    if (has("hfnn_enabled")) cfg.hfnn_enabled = bv("hfnn_enabled");
+    if (has("hfnn_gate")) cfg.hfnn_gate = fv("hfnn_gate");
+    if (has("hfnn_strictness")) cfg.hfnn_strictness = fv("hfnn_strictness");
     if (has("ref_demosaic_share_lo")) cfg.ref_demosaic_share_lo = fv("ref_demosaic_share_lo");
     if (has("ref_demosaic_share_hi")) cfg.ref_demosaic_share_hi = fv("ref_demosaic_share_hi");
     if (has("dng_lossless_compress"))

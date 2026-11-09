@@ -1990,6 +1990,19 @@ struct Config {
     // share), share = the reference's fraction of the pixel's total merge weight
     // (1 = everything rejected; ~1/N = every frame merged). Below lo the merge is
     // bit-identical. Works with the Wronski and GCam masks. OFF by default.
+    // HF-artifact NN (core/hfnn.h): a ~1.4k-weight CNN that replaces the HF artifact
+    // rejection rule -- only where the reference is HF / repeated-pattern texture
+    // (variance loss > hfnn_gate, soft over +-0.1) it decides from this frame's warped
+    // grey vs the reference, the tile-flow disagreement and the texture measure whether
+    // the frame is misaligned there. No multi-frame consensus, so no pre-pass / second
+    // alignment. Forces hf_artifact_removal_enabled off for the burst. OFF by default;
+    // a no-op until trained weights are compiled in (core/hfnn_weights.h).
+    bool  hfnn_enabled = false;
+    float hfnn_gate = 0.35f;
+    // Logit offset subtracted from the network output: + = stricter (rejects more),
+    // - = more lenient. 0 = the validated operating point baked into the weights
+    // (pattern px: GCam catch 82% / false 20%, Wronski 79% / 21%).
+    float hfnn_strictness = 0.f;
     bool  ref_demosaic_fallback = false;
     float ref_demosaic_share_lo = 0.5f;
     float ref_demosaic_share_hi = 0.9f;

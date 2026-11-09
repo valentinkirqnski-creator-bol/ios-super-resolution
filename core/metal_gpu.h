@@ -257,6 +257,10 @@ Image structure_tensor_metal(const Image& raw, const Config& cfg, float sigma);
 bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, const Image& cons,
                              const Image& Rg, int n_frames, const std::vector<float>& tdis,
                              int ny, int nx, int tile_size, const Config& cfg, Image& Rout);
+// HF-artifact NN (core/hfnn.h): 3 convs of one band on the GPU (cref_conv kernel) from
+// host-built features; returns the head's delta for the band's out_rows rows.
+bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int out_rows,
+                     int vlo, int vhi, std::vector<float>& delta_out);
 uint64_t structure_ref_tensor_metal(const Image& ref_raw, const Config& cfg, float sigma);
 bool structure_match_metal(const Image& comp_raw, uint64_t ref_gen, const FlowField& flow,
                            int tile_size, const Config& cfg, std::vector<float>& S_out,

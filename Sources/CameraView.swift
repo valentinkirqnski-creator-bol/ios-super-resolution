@@ -1469,8 +1469,27 @@ struct CameraView: View {
                         get: { cam.tuningParams.hf_artifact_removal_enabled },
                         set: { v in
                             cam.tuningParams.hf_artifact_removal_enabled = v
-                            if v { cam.tuningParams.gcam_unblocker_enabled = false }   // exclusive with the SABRE Unblocker
+                            if v {
+                                cam.tuningParams.gcam_unblocker_enabled = false   // exclusive with the SABRE Unblocker
+                                cam.tuningParams.hfnn_enabled = false             // and with the HF-artifact NN
+                            }
                         }))
+                    Toggle("HF Artifact NN", isOn: Binding(
+                        get: { cam.tuningParams.hfnn_enabled },
+                        set: { v in
+                            cam.tuningParams.hfnn_enabled = v
+                            if v { cam.tuningParams.hf_artifact_removal_enabled = false }   // replaces the rule
+                        }))
+                    Text("A tiny network (~1.4k weights) that replaces HF Artifact Rejection: only in fine repeated-pattern areas (fences, grids, brick, fabric, text) it decides whether each frame is misaligned there (wrong period lock, sliding along lines, tile-shaped steps) or correctly aligned fine detail, so well-aligned patterns still merge. Everywhere else the mask is untouched. Uses each frame's own alignment (no extra alignment pass). Works with the Wronski and GCam masks. Inactive until a trained model is built in.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.hfnn_enabled {
+                        ispRow("Pattern Gate", $cam.tuningParams.hfnn_gate, 0.1...0.9, "%.2f")
+                        Text("How strongly a spot must be repeated-pattern texture (variance loss) before the network decides there. Lower = more areas. Default 0.35.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Strictness", $cam.tuningParams.hfnn_strictness, -2.0...2.0, "%.2f")
+                        Text("Shifts the network's decision: + rejects more pattern misalignments but also more good pattern detail, - keeps more detail. 0 = the validated balance (on test patterns: GCam catches 82% of visible misalignments, rejecting 20% of good detail; +0.5 ~ 91% / 36%; -0.5 ~ 71% / 12%).")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                     Text("""
                          Wronski et al. Drops a frame's contribution only where BOTH hold: the reference patch is almost entirely high-frequency (most of its local detail vanishes under a blur, above Variance Loss) AND the per-tile motion is locally irregular (the same r_Mt test that drives the motion prior). Targets the blocky ghosts repetitive fine texture causes — roof tiles, fences, fabric weave, resolution charts — where block matching locks onto the wrong period, while leaving cleanly-tracked detail (hair, fur) and smooth noisy areas untouched. The reference frame stays the fallback. Off by default; it changes which pixels merge.
                          """)

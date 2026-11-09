@@ -513,6 +513,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.structure_map_save = tuning[@"structure_map_save"].boolValue;
     if (tuning[@"cref_enabled"])
         cfg.cref_enabled = tuning[@"cref_enabled"].boolValue;
+    if (tuning[@"hfnn_enabled"])
+        cfg.hfnn_enabled = tuning[@"hfnn_enabled"].boolValue;
+    if (tuning[@"hfnn_gate"])
+        cfg.hfnn_gate = tuning[@"hfnn_gate"].floatValue;
+    if (tuning[@"hfnn_strictness"])
+        cfg.hfnn_strictness = tuning[@"hfnn_strictness"].floatValue;
     if (tuning[@"ref_demosaic_fallback"])
         cfg.ref_demosaic_fallback = tuning[@"ref_demosaic_fallback"].boolValue;
     if (tuning[@"ref_demosaic_share_lo"])

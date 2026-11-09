@@ -49,6 +49,7 @@ targets:
           - "structure_map.cpp"
           - "cref.cpp"
           - "ref_demosaic.cpp"
+          - "hfnn.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"
