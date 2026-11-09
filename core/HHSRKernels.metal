@@ -3899,9 +3899,10 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // configuration ever selects these sizes.
         if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
-            // 460-parity: trunc toward zero -- see ica_refine_level in align.cpp.
-            float floor_fx = trunc(fx);
-            float floor_fy = trunc(fy);
+            // floor, not 460's trunc (biased for negative displacements) --
+            // see ica_refine_level in align.cpp.
+            float floor_fx = floor(fx);
+            float floor_fy = floor(fy);
             float frac_x = fx - floor_fx;
             float frac_y = fy - floor_fy;
             int floor_off_x = int(floor_fx);
@@ -3968,11 +3969,11 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
-        // 460-parity: trunc toward zero, matching ICA.py (math.modf + int()).
-        // For negative displacements this makes the bilinear sample an
-        // extrapolation; see ica_refine_level in align.cpp.
-        float floor_fx = trunc(fx);
-        float floor_fy = trunc(fy);
+        // floor, not 460's trunc (math.modf + int()): trunc made the bilinear
+        // sample an extrapolation for negative displacements and biased the
+        // solution (see ica_refine_level in align.cpp).
+        float floor_fx = floor(fx);
+        float floor_fy = floor(fy);
         float frac_x = fx - floor_fx;
         float frac_y = fy - floor_fy;
         int floor_off_x = int(floor_fx);

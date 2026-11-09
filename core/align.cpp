@@ -777,16 +777,18 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // 460-parity: truncation toward zero, not floor. ICA.py uses
-                // math.modf + int(), which truncates toward zero, so a negative
-                // displacement such as -0.25 yields offset 0 and fraction -0.25.
-                // bilinear_ica then evaluates m00 + (m01 - m00) * (-0.25): the
-                // right position, but reached by extrapolating from the pair to
-                // the RIGHT of it rather than interpolating from the straddling
-                // pair. (floor would make +/- displacements symmetric but does
-                // not match 460, so parity requires trunc.)
-                const f32 base_x = std::trunc(fx);
-                const f32 base_y = std::trunc(fy);
+                // floor, NOT 460's trunc. ICA.py uses math.modf + int(), which
+                // truncates toward zero: a negative displacement such as -2.05
+                // then gives offset -2 and fraction -0.05, and the bilinear sample
+                // EXTRAPOLATES from the pair to the right instead of interpolating
+                // the straddling pair. The fixed point is biased: measured on exact
+                // even-pixel shifted copies of a real frame, -2 / -4 px came out at
+                // median -2.05 / -4.08 (10% of tiles -2.23 / -4.25) while positive
+                // shifts were exact, offsetting the merge ~0.07 raw px and softening
+                // it ~3%. floor makes +/- symmetric (exact to +-0.01 px). Metal
+                // twins: ica_kernel_* in HHSRKernels.metal.
+                const f32 base_x = std::floor(fx);
+                const f32 base_y = std::floor(fy);
                 f32 frac_x = fx - base_x;
                 int floor_off_x = (int)base_x;
                 f32 frac_y = fy - base_y;
