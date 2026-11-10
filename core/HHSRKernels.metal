@@ -2374,6 +2374,114 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     R[ty * out_w + tx] = wv;
 }
 
+// §2 GCam comparison guide on the GPU (Config::gcam_sabre_gpu_guide). Line-for-line
+// twin of compute_gcam_guide's Bayer branch in robustness.cpp: per half-res guide
+// pixel, the 3x3 neighbourhood of RGGB quads (edge-clamped), sqrt-space rgb =
+// (sR, mean(sGr, sGb), sB), the 1-2-1 weighted mean colour, the unweighted 3x3 colour
+// variance, the 18-sample green variance, the green-only sign flag (noise from the
+// MC LUT or the affine stand-in), and the clipped-highlight guard. Same operation
+// order as the CPU; precise::sqrt. Output [gh][gw][4] (rgb, signed variance).
+struct GcamGuideParams {
+    uint gh, gw, raw_w, use_mc;
+    uint cfa00, cfa01, cfa10, cfa11;
+    float green_factor, clip_point, na, nb;
+    float _p0, _p1, _p2, _p3;
+};  // 64 bytes
+kernel void rob_gcam_guide(device float* guide [[buffer(0)]],
+                           device const float* raw [[buffer(1)]],
+                           device const float* lut [[buffer(2)]],
+                           constant GcamGuideParams& p [[buffer(3)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    const int x = int(gid.x), y = int(gid.y);
+    const float W[3] = {0.25f, 0.5f, 0.25f};
+    const uint cfa[4] = {p.cfa00, p.cfa01, p.cfa10, p.cfa11};
+    float avg[3] = {0.f, 0.f, 0.f};
+    float m0[3] = {0.f, 0.f, 0.f}, m1[3] = {0.f, 0.f, 0.f};
+    float gm0 = 0.f, gm1 = 0.f;
+    float center_green = 0.f;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int qy = clamp(y + dy, 0, int(p.gh) - 1);
+            const int qx = clamp(x + dx, 0, int(p.gw) - 1);
+            float vR = 0.f, vB = 0.f, g0 = 0.f, g1 = 0.f;
+            int gi = 0;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j) {
+                    const uint c = cfa[i * 2 + j];
+                    const float v = raw[uint(2 * qy + i) * p.raw_w + uint(2 * qx + j)];
+                    if (c == 0u) vR = v; else if (c == 2u) vB = v;
+                    else { if (gi == 0) g0 = v; else g1 = v; ++gi; }
+                }
+            const float sR  = precise::sqrt(max(0.f, vR));
+            const float sB  = precise::sqrt(max(0.f, vB));
+            const float sGr = precise::sqrt(max(0.f, g0));
+            const float sGb = precise::sqrt(max(0.f, g1));
+            const float rgb[3] = {sR, 0.5f * (sGr + sGb), sB};
+            const float wq = W[dy + 1] * W[dx + 1];
+            for (int c = 0; c < 3; ++c) {
+                avg[c] += wq * rgb[c];
+                m0[c]  += rgb[c];
+                m1[c]  += rgb[c] * rgb[c];
+            }
+            gm0 += sGr + sGb;
+            gm1 += sGr * sGr + sGb * sGb;
+            if (dy == 0 && dx == 0) center_green = rgb[1];
+        }
+    float rgb_var[3];
+    for (int c = 0; c < 3; ++c) {
+        const float mean = m0[c] / 9.f;
+        rgb_var[c] = max(0.f, m1[c] / 9.f - mean * mean);
+    }
+    const float gmean = gm0 / 18.f;
+    const float green_var = max(0.f, gm1 / 18.f - gmean * gmean);
+    const float avg_luma = 0.25f * avg[0] + 0.5f * avg[1] + 0.25f * avg[2];
+    float green_noise;
+    if (p.use_mc != 0u) {
+        green_noise = 2.f * gcam_lut_sample(lut, avg_luma, 1u, 1u);
+    } else {
+        const float b = clamp(avg_luma, 0.f, 1.f);
+        green_noise = 2.f * (max(p.na * b + p.nb, 0.f) * 0.5f);   // guide_noise_var(nch 3, green)
+    }
+    float col0, col1, col2, var;
+    if (green_var > p.green_factor * green_noise) {
+        col0 = avg[0]; col1 = center_green; col2 = avg[2];
+        var = -max(rgb_var[1], green_var);
+    } else {
+        col0 = avg[0]; col1 = avg[1]; col2 = avg[2];
+        var = (rgb_var[0] + rgb_var[1] + rgb_var[2]) / 3.f;
+    }
+    if (center_green >= p.clip_point) col0 = col1 = col2 = 10000.f;
+    const uint o = (gid.y * p.gw + gid.x) * 4u;
+    guide[o + 0u] = col0; guide[o + 1u] = col1; guide[o + 2u] = col2; guide[o + 3u] = var;
+}
+
+// §2.10 sign-preserving B-spline pre-filter of a 4-channel guide (twin of
+// gcam_prefilter_ref in robustness.cpp): separable [1,4,1]/6 over abs() of each tap,
+// edge-clamped, variance sign restored from the centre.
+kernel void rob_gcam_prefilter(device float* out [[buffer(0)]],
+                               device const float* g [[buffer(1)]],
+                               constant uint2& dims [[buffer(2)]],   // (w, h)
+                               uint2 gid [[thread_position_in_grid]]) {
+    const int w = int(dims.x), h = int(dims.y);
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    const int x = int(gid.x), y = int(gid.y);
+    const float w1d[3] = {1.f / 6.f, 4.f / 6.f, 1.f / 6.f};
+    const uint o = (gid.y * uint(w) + gid.x) * 4u;
+    for (uint ch = 0u; ch < 4u; ++ch) {
+        float s = 0.f;
+        for (int i = -1; i <= 1; ++i) {
+            const int yy = clamp(y + i, 0, h - 1);
+            for (int j = -1; j <= 1; ++j) {
+                const int xx = clamp(x + j, 0, w - 1);
+                s += w1d[i + 1] * w1d[j + 1] * fabs(g[(uint(yy) * uint(w) + uint(xx)) * 4u + ch]);
+            }
+        }
+        out[o + ch] = s;
+    }
+    if (g[o + 3u] < 0.f) out[o + 3u] = -out[o + 3u];
+}
+
 // §7 GCam DilateMask reject-grow, GPU twin of robustness_gcam_dilate (robustness.cpp).
 // rej = sum over a 5x5 of (1 - clamp(R)); keep = clamp(1 - (rej - deadzone)/div, 0, 1).
 // dilate_2x (GCam default): sample the 5x5 centred at the 2x-downsampled grid texel

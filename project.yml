@@ -52,6 +52,7 @@ targets:
           - "hfnn.cpp"
           - "mann.cpp"
           - "fb_confidence.cpp"
+          - "burst_consensus.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"

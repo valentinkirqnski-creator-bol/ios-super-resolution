@@ -1335,6 +1335,11 @@ struct CameraView: View {
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Run operator on GPU", isOn: $cam.tuningParams.gcam_sabre_gpu)
+                        if cam.tuningParams.gcam_sabre_gpu {
+                            Toggle("Build Guide on GPU", isOn: $cam.tuningParams.gcam_sabre_gpu_guide)
+                            Text("Builds each comparison frame's GCam guide on the GPU instead of the CPU (same math, same order; can differ from the CPU in the last bit). Much faster. Turn off to use the CPU guide.")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
                         Text("""
                              All defaults are GCam's measured constants, so the toggle alone gives the faithful model. Robustness Noise is kFilterVarianceScale's noise term: 0 matches the device (noise-blind, rejects hardest), 1 is the paper's full noise subtraction (more tolerant of sensor grain). Motion Boost is how much harder irregular-flow textured tiles are rejected (GCam = 6); Motion Boost Threshold is the local-motion-extent (in normalized UV) the flow must vary by before that ×6 boost arms (GCam = 0.00019). It's internally scaled by your raw tile size (× tile_size × 258) so the boost fires at the same flow GRADIENT GCam uses no matter how dense the flow grid is — important because Half-Tile / Dense flow make the tiles finer, which otherwise shrinks the measured motion and silently stops the boost from arming. LOWER it to arm the boost on smaller rotations/parallax (rejects those seams harder, but also fires on flow noise → more over-rejection); 0 = boost everywhere there's any motion variation. The two Strictness multipliers are GCam's 0.07 (RGB) / 0.35 (green-only) color_difference_multiplier — raise them to reject a detected misalignment harder across the board; the two Filter Var k's are 0.0899 / 0.2117. Green-Only Trigger is how much local green variance must exceed the green noise before a region switches to single-green comparison (GCam = 3; LOWER it to push more edges onto the stricter green-only path). Run operator on GPU moves the per-pixel loop to the Metal kernel (guides still build on the host; it falls back to the CPU operator if the kernel is unavailable) — the CPU path is the verified reference, so A/B them if in doubt. Google's constants are sensor-calibrated for the Pixel; tune on real imported bursts.
                              """)
@@ -1482,8 +1487,22 @@ struct CameraView: View {
                         }
                         Text("How finely each tile is checked. Each piece is checked with its tile's motion vector, so finer pieces catch the parts of a tile the vector does not fit (a shifted edge at the end of a tile). Finer = more sensitive, slightly noisier. Default 4×4.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Count Slides Along Edges", isOn: $cam.tuningParams.fb_conf_along_edges)
+                        Text("Also counts the part of the error ALONG an edge (applies to the Burst Consensus check too). Catches tiles that slid along a curved or textured edge, but along a straight, uniform edge that slide cannot be measured, so correctly aligned straight edges get rejected as well. Off = only the across-edge error counts, the along-edge part weighted by how much structure there is along the edge.")
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("Full Backward Alignment", isOn: $cam.tuningParams.fb_conf_full)
                         Text("Measures the backward motion with a complete second alignment (comparison → reference) instead of the local check. Also catches wrong matches that look consistent locally (e.g. a slip by one period on a fence), at about twice the alignment time and extra memory.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
+                Section(header: Text("Burst Consensus Check")) {
+                    Toggle("Burst Consensus", isOn: $cam.tuningParams.fb_consensus_enabled)
+                    Text("After every frame is aligned, checks each tile's shift in each frame against the OTHER frames of the burst. The camera's own motion is removed per frame; what is left (parallax, a moving object or an alignment error) must follow the smooth path the other frames and the reference trace over time. If the other frames disagree with a frame's shift there, that frame is down-weighted there: confidence exp(-d²/2τ²), multiplied into the rejection mask before the merge. Only disagreement ACROSS edges counts, noise is allowed for, and flat areas are left alone. Uses the motion vectors the alignment already produced: no extra alignment, no extra images. Works together with or without the Forward-Backward check.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.fb_consensus_enabled {
+                        ispRow("Consensus Tolerance τ (px)", $cam.tuningParams.fb_consensus_tau_px, 0.0...2.0, "%.2f")
+                        Text("Disagreement at which the confidence falls to 61%. Lower = stricter. Default 0.75.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }

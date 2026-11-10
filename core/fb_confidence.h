@@ -50,4 +50,12 @@ double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
                            const FlowField& flow, int raw_h, int raw_w,
                            int tile_size, const Config& cfg);
 
+// The same multiply on raw buffers (a fp32 mask [h][w][c] and/or an 8-bit mask [h8][w8];
+// either may be null): err on the (tiles_ny*subdiv) x (tiles_nx*subdiv) patch grid,
+// confidence exp(-e^2 / (2 tau^2)). Used for masks that live in GPU shared memory.
+double fb_apply_confidence_raw(float* data, int h, int w, int c, uint8_t* data8, int h8, int w8,
+                               const std::vector<float>& err, int tiles_ny, int tiles_nx,
+                               int raw_h, int raw_w, int tile_size, int subdiv, float tau_px,
+                               const Config& cfg);
+
 }  // namespace hhsr

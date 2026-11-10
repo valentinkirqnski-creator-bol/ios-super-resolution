@@ -533,6 +533,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.fb_conf_tau_px = tuning[@"fb_conf_tau_px"].floatValue;
     if (tuning[@"fb_conf_subdiv"])
         cfg.fb_conf_subdiv = std::max(1, std::min(8, tuning[@"fb_conf_subdiv"].intValue));
+    if (tuning[@"fb_consensus_enabled"])
+        cfg.fb_consensus_enabled = tuning[@"fb_consensus_enabled"].boolValue;
+    if (tuning[@"fb_consensus_tau_px"])
+        cfg.fb_consensus_tau_px = tuning[@"fb_consensus_tau_px"].floatValue;
+    if (tuning[@"fb_conf_along_edges"])
+        cfg.fb_conf_along_edges = tuning[@"fb_conf_along_edges"].boolValue;
     if (tuning[@"ref_demosaic_fallback"])
         cfg.ref_demosaic_fallback = tuning[@"ref_demosaic_fallback"].boolValue;
     if (tuning[@"ref_demosaic_share_lo"])
@@ -664,6 +670,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_dilate_deadzone"]) cfg.gcam_sabre_dilate_deadzone = tuning[@"gcam_sabre_dilate_deadzone"].floatValue;
     if (tuning[@"gcam_sabre_dilate_div"])     cfg.gcam_sabre_dilate_div = tuning[@"gcam_sabre_dilate_div"].floatValue;
     if (tuning[@"gcam_sabre_gpu"])            cfg.gcam_sabre_gpu = tuning[@"gcam_sabre_gpu"].boolValue;
+    if (tuning[@"gcam_sabre_gpu_guide"])      cfg.gcam_sabre_gpu_guide = tuning[@"gcam_sabre_gpu_guide"].boolValue;
     if (tuning[@"gcam_sabre_raw_res"])        cfg.gcam_sabre_raw_res = tuning[@"gcam_sabre_raw_res"].boolValue;
     if (tuning[@"gcam_sabre_bilinear_upscale"]) cfg.gcam_sabre_bilinear_upscale = tuning[@"gcam_sabre_bilinear_upscale"].boolValue;
     if (tuning[@"gcam_sabre_min5x5"]) cfg.gcam_sabre_min5x5 = tuning[@"gcam_sabre_min5x5"].boolValue;

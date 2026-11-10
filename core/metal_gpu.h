@@ -320,6 +320,11 @@ void metal_merge_set_single_acc_slot(bool enabled);
 // band into its host images (so encode can overlap the next GPU band). Call this
 // to wait + readback the latest band before using its num/den. No-op if idle.
 bool metal_merge_wait_inflight();
+// The merge cache's GPU mask of comparison frame `frame_id` (uploaded during analysis by
+// metal_merge_prefetch_frame), as a CPU pointer into its shared buffer, after any
+// in-flight GPU work has finished. Null if the frame is not cached. Used by the burst
+// consensus check to scale masks in place after the analysis loop.
+float* metal_merge_frame_rob(int frame_id, int& h, int& w, int& c);
 
 // ---------------------------------------------------------------------------
 // Fused band merge.

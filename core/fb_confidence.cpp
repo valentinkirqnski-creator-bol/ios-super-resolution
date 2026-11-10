@@ -174,7 +174,12 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
             // Round-trip error (grey px -> raw px): back-projected position minus the start.
             const float ey = (dgy + By - cgy) / s, ex = (dgx + Bx - cgx) / s;
             // Structure weighting W = Hc / lambda1: only constrained directions count.
-            const double w2 = (hxx * ex * ex + 2.0 * hxy * ex * ey + hyy * ey * ey) / l1;
+            // fb_conf_along_edges: the FULL round-trip distance (slides along an edge count
+            // too). Along a straight uniform edge that component is unmeasurable (LK drift),
+            // so this also rejects correctly aligned straight edges -- opt-in.
+            const double w2 = cfg.fb_conf_along_edges
+                ? (double)ex * ex + (double)ey * ey
+                : (hxx * ex * ex + 2.0 * hxy * ex * ey + hyy * ey * ey) / l1;
             // Noise floor: E[e^T W e] from noise ~ 4 sigma_r^2 / lambda1 with sigma_r^2 = 2 nv
             // (both frames), in grey px^2 -> raw px^2.
             const double noise_e2 = 8.0 * nv / l1 / ((double)s * s);
@@ -185,14 +190,15 @@ std::vector<float> fb_tile_error(const Image& ref_grey, const Image& comp_grey,
     return err;
 }
 
-double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
-                           const FlowField& flow, int raw_h, int raw_w,
-                           int tile_size, const Config& cfg) {
-    const int sub = std::max(1, std::min(8, cfg.fb_conf_subdiv));
-    const int ny = flow.ny * sub, nx = flow.nx * sub;   // patch grid
+double fb_apply_confidence_raw(float* data, int h, int w, int c, uint8_t* data8, int h8, int w8,
+                               const std::vector<float>& err, int tiles_ny, int tiles_nx,
+                               int raw_h, int raw_w, int tile_size, int subdiv, float tau_px,
+                               const Config& cfg) {
+    const int sub = std::max(1, std::min(8, subdiv));
+    const int ny = tiles_ny * sub, nx = tiles_nx * sub;   // patch grid
     const float ts = (float)std::max(1, tile_size) / (float)sub;   // patch size (raw px)
     if (err.size() != (size_t)ny * nx || ny <= 0 || nx <= 0) return 1.0;
-    const float tau = std::max(1e-3f, cfg.fb_conf_tau_px);
+    const float tau = std::max(1e-3f, tau_px);
     std::vector<float> C(err.size());
     double csum = 0;
     for (size_t i = 0; i < err.size(); ++i) {
@@ -218,32 +224,44 @@ double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
         const int y1 = std::min(ny - 1, y0 + 1), x1 = std::min(nx - 1, x0 + 1);
         const float ay = u - (float)y0, ax = v - (float)x0;
         const float a = C[(size_t)y0 * nx + x0], b = C[(size_t)y0 * nx + x1];
-        const float c = C[(size_t)y1 * nx + x0], d = C[(size_t)y1 * nx + x1];
-        const float t = a + (b - a) * ax, w = c + (d - c) * ax;
-        return t + (w - t) * ay;
+        const float cc = C[(size_t)y1 * nx + x0], d = C[(size_t)y1 * nx + x1];
+        const float t = a + (b - a) * ax, ww = cc + (d - cc) * ax;
+        return t + (ww - t) * ay;
     };
-    if (R && R->h > 0 && R->w > 0 && R->data.size() == (size_t)R->h * R->w * R->c) {
-        const float ky = (float)raw_h / (float)R->h, kx = (float)raw_w / (float)R->w;
-        parallel_rows(R->h, cfg.num_threads, [&](int y) {
-            for (int x = 0; x < R->w; ++x) {
-                const float c = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
-                if (c >= 1.f) continue;
-                for (int ch = 0; ch < R->c; ++ch) R->at(y, x, ch) *= c;
+    if (data && h > 0 && w > 0 && c > 0) {
+        const float ky = (float)raw_h / (float)h, kx = (float)raw_w / (float)w;
+        parallel_rows(h, cfg.num_threads, [&](int y) {
+            float* row = data + (size_t)y * w * c;
+            for (int x = 0; x < w; ++x) {
+                const float cf = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
+                if (cf >= 1.f) continue;
+                for (int ch = 0; ch < c; ++ch) row[(size_t)x * c + ch] *= cf;
             }
         });
     }
-    if (m8 && !m8->empty()) {
-        const float ky = (float)raw_h / (float)m8->h, kx = (float)raw_w / (float)m8->w;
-        parallel_rows(m8->h, cfg.num_threads, [&](int y) {
-            for (int x = 0; x < m8->w; ++x) {
-                const float c = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
-                if (c >= 1.f) continue;
-                uint8_t& v = m8->data[(size_t)y * m8->w + x];
-                v = (uint8_t)std::lround((float)v * c);
+    if (data8 && h8 > 0 && w8 > 0) {
+        const float ky = (float)raw_h / (float)h8, kx = (float)raw_w / (float)w8;
+        parallel_rows(h8, cfg.num_threads, [&](int y) {
+            for (int x = 0; x < w8; ++x) {
+                const float cf = conf_at(((float)y + 0.5f) * ky - 0.5f, ((float)x + 0.5f) * kx - 0.5f);
+                if (cf >= 1.f) continue;
+                uint8_t& v = data8[(size_t)y * w8 + x];
+                v = (uint8_t)std::lround((float)v * cf);
             }
         });
     }
     return csum / (double)std::max<size_t>(1, C.size());
+}
+
+double fb_apply_confidence(Image* R, Mask8* m8, const std::vector<float>& err,
+                           const FlowField& flow, int raw_h, int raw_w,
+                           int tile_size, const Config& cfg) {
+    const bool rok = R && R->h > 0 && R->w > 0 && R->data.size() == (size_t)R->h * R->w * R->c;
+    const bool mok = m8 && !m8->empty();
+    return fb_apply_confidence_raw(rok ? R->data.data() : nullptr, rok ? R->h : 0, rok ? R->w : 0,
+                                   rok ? R->c : 0, mok ? m8->data.data() : nullptr,
+                                   mok ? m8->h : 0, mok ? m8->w : 0, err, flow.ny, flow.nx,
+                                   raw_h, raw_w, tile_size, cfg.fb_conf_subdiv, cfg.fb_conf_tau_px, cfg);
 }
 
 }  // namespace hhsr

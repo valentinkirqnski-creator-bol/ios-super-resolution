@@ -132,6 +132,9 @@ struct TuningParams: Equatable, Codable {
     var fb_conf_full: Bool = false
     var fb_conf_tau_px: Float = 0.75
     var fb_conf_subdiv: Int = 4
+    var fb_consensus_enabled: Bool = false
+    var fb_consensus_tau_px: Float = 0.75
+    var fb_conf_along_edges: Bool = false
     var ref_demosaic_fallback: Bool = false
     /// Reference share of a pixel's merge weight where the blend starts / is complete.
     var ref_demosaic_share_lo: Float = 0.5
@@ -321,6 +324,7 @@ struct TuningParams: Equatable, Codable {
     /// CPU; only the per-pixel loop moves to the GPU. Falls back to CPU if the kernel
     /// is unavailable. Off by default — the kernel is unverified until a device build.
     var gcam_sabre_gpu: Bool = false
+    var gcam_sabre_gpu_guide: Bool = true
     // DEFAULT ON: gcam stats are upsampled+warped to input-frame res; R + §7 run there.
     var gcam_sabre_raw_res: Bool = true
     var gcam_sabre_bilinear_upscale: Bool = false
@@ -602,6 +606,7 @@ struct TuningParams: Equatable, Codable {
         case hfnn_enabled, hfnn_gate, hfnn_strictness
         case mann_enabled, mann_gate, mann_strictness
         case fb_conf_enabled, fb_conf_full, fb_conf_tau_px, fb_conf_subdiv
+        case fb_consensus_enabled, fb_consensus_tau_px, fb_conf_along_edges
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
@@ -618,6 +623,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
+        case gcam_sabre_gpu_guide
         case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
@@ -700,6 +706,9 @@ struct TuningParams: Equatable, Codable {
         fb_conf_full = try c.decodeIfPresent(Bool.self, forKey: .fb_conf_full) ?? fb_conf_full
         fb_conf_tau_px = try c.decodeIfPresent(Float.self, forKey: .fb_conf_tau_px) ?? fb_conf_tau_px
         fb_conf_subdiv = try c.decodeIfPresent(Int.self, forKey: .fb_conf_subdiv) ?? fb_conf_subdiv
+        fb_consensus_enabled = try c.decodeIfPresent(Bool.self, forKey: .fb_consensus_enabled) ?? fb_consensus_enabled
+        fb_consensus_tau_px = try c.decodeIfPresent(Float.self, forKey: .fb_consensus_tau_px) ?? fb_consensus_tau_px
+        fb_conf_along_edges = try c.decodeIfPresent(Bool.self, forKey: .fb_conf_along_edges) ?? fb_conf_along_edges
         ref_demosaic_share_lo = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_lo) ?? ref_demosaic_share_lo
         ref_demosaic_share_hi = try c.decodeIfPresent(Float.self, forKey: .ref_demosaic_share_hi) ?? ref_demosaic_share_hi
         // Older presets carry the boolean. Only an explicit `true` is honoured,
@@ -778,6 +787,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_dilate_deadzone = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_dilate_deadzone) ?? gcam_sabre_dilate_deadzone
         gcam_sabre_dilate_div = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_dilate_div) ?? gcam_sabre_dilate_div
         gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
+        gcam_sabre_gpu_guide = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu_guide) ?? gcam_sabre_gpu_guide
         gcam_sabre_raw_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_raw_res) ?? gcam_sabre_raw_res
         gcam_sabre_bilinear_upscale = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_bilinear_upscale) ?? gcam_sabre_bilinear_upscale
         gcam_sabre_min5x5 = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_min5x5) ?? gcam_sabre_min5x5
@@ -2594,6 +2604,9 @@ final class CameraModel: NSObject, ObservableObject {
             "fb_conf_full": NSNumber(value: tuningParams.fb_conf_full),
             "fb_conf_tau_px": NSNumber(value: tuningParams.fb_conf_tau_px),
             "fb_conf_subdiv": NSNumber(value: tuningParams.fb_conf_subdiv),
+            "fb_consensus_enabled": NSNumber(value: tuningParams.fb_consensus_enabled),
+            "fb_consensus_tau_px": NSNumber(value: tuningParams.fb_consensus_tau_px),
+            "fb_conf_along_edges": NSNumber(value: tuningParams.fb_conf_along_edges),
             "ref_demosaic_share_lo": NSNumber(value: tuningParams.ref_demosaic_share_lo),
             "ref_demosaic_share_hi": NSNumber(value: tuningParams.ref_demosaic_share_hi),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),
@@ -2657,6 +2670,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_dilate_deadzone": NSNumber(value: tuningParams.gcam_sabre_dilate_deadzone),
             "gcam_sabre_dilate_div": NSNumber(value: tuningParams.gcam_sabre_dilate_div),
             "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
+            "gcam_sabre_gpu_guide": NSNumber(value: tuningParams.gcam_sabre_gpu_guide),
             "gcam_sabre_raw_res": NSNumber(value: tuningParams.gcam_sabre_raw_res),
             "gcam_sabre_bilinear_upscale": NSNumber(value: tuningParams.gcam_sabre_bilinear_upscale),
             "gcam_sabre_min5x5": NSNumber(value: tuningParams.gcam_sabre_min5x5),

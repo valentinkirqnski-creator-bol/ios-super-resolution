@@ -167,6 +167,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("fb_conf_full")) cfg.fb_conf_full = bv("fb_conf_full");
     if (has("fb_conf_tau_px")) cfg.fb_conf_tau_px = fv("fb_conf_tau_px");
     if (has("fb_conf_subdiv")) cfg.fb_conf_subdiv = std::max(1, std::min(8, iv("fb_conf_subdiv")));
+    if (has("fb_consensus_enabled")) cfg.fb_consensus_enabled = bv("fb_consensus_enabled");
+    if (has("fb_consensus_tau_px")) cfg.fb_consensus_tau_px = fv("fb_consensus_tau_px");
+    if (has("fb_conf_along_edges")) cfg.fb_conf_along_edges = bv("fb_conf_along_edges");
     if (has("ref_demosaic_share_lo")) cfg.ref_demosaic_share_lo = fv("ref_demosaic_share_lo");
     if (has("ref_demosaic_share_hi")) cfg.ref_demosaic_share_hi = fv("ref_demosaic_share_hi");
     if (has("dng_lossless_compress"))
@@ -253,6 +256,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_dilate_deadzone")) cfg.gcam_sabre_dilate_deadzone = fv("gcam_sabre_dilate_deadzone");
     if (has("gcam_sabre_dilate_div"))   cfg.gcam_sabre_dilate_div = fv("gcam_sabre_dilate_div");
     if (has("gcam_sabre_gpu"))          cfg.gcam_sabre_gpu = bv("gcam_sabre_gpu");
+    if (has("gcam_sabre_gpu_guide"))    cfg.gcam_sabre_gpu_guide = bv("gcam_sabre_gpu_guide");
     if (has("gcam_sabre_raw_res"))      cfg.gcam_sabre_raw_res = bv("gcam_sabre_raw_res");
     if (has("gcam_sabre_bilinear_upscale")) cfg.gcam_sabre_bilinear_upscale = bv("gcam_sabre_bilinear_upscale");
     if (has("gcam_sabre_min5x5"))       cfg.gcam_sabre_min5x5 = bv("gcam_sabre_min5x5");

@@ -1624,6 +1624,19 @@ GcamNoiseLut build_gcam_noise_lut(const Config& cfg) {
         }
         g[c] = (gc > 1e-6f) ? gc : 1.f;
     }
+    // Memo: the table is a pure function of these nine numbers (fixed-seed Monte Carlo),
+    // and it was rebuilt for every comparison frame -- twice (guide + operator), ~1.6M
+    // normal draws each. Return the previous table when the inputs are bit-identical.
+    static std::mutex s_lut_mu;
+    static bool s_lut_have = false;
+    static f32 s_lut_key[9];
+    static GcamNoiseLut s_lut;
+    f32 key[9];
+    for (int c = 0; c < 3; ++c) { key[c] = S[c]; key[3 + c] = O[c]; key[6 + c] = g[c]; }
+    {
+        std::lock_guard<std::mutex> lk(s_lut_mu);
+        if (s_lut_have && std::memcmp(key, s_lut_key, sizeof key) == 0) return s_lut;
+    }
     std::mt19937 rng(12345u);
     std::normal_distribution<f32> N(0.f, 1.f);
     for (int i = 0; i < 10; ++i) {
@@ -1649,6 +1662,12 @@ GcamNoiseLut build_gcam_noise_lut(const Config& cfg) {
             lut.v[(0 * 10 + i) * 4 + c] = var;     // row 0 (reference)
             lut.v[(1 * 10 + i) * 4 + c] = var;     // row 1 (comparison) -- same ISO
         }
+    }
+    {
+        std::lock_guard<std::mutex> lk(s_lut_mu);
+        std::memcpy(s_lut_key, key, sizeof key);
+        s_lut = lut;
+        s_lut_have = true;
     }
     return lut;
 }
@@ -1677,13 +1696,22 @@ static Image gcam_prefilter_ref(const Image& g) {
     const int vch = g.c - 1;                  // variance channel
     parallel_rows(g.h, 0, [&](int y) {
         for (int x = 0; x < g.w; ++x) {
+            // Interior pixels skip the per-tap edge clamp (identical taps, identical
+            // summation order -> bit-identical); the border keeps the clamped form.
+            const bool inner = y > 0 && y < g.h - 1 && x > 0 && x < g.w - 1;
             for (int ch = 0; ch < g.c; ++ch) {
                 f32 s = 0.f;
-                for (int i = -1; i <= 1; ++i) {
-                    const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(g.h - 1));
-                    for (int j = -1; j <= 1; ++j) {
-                        const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(g.w - 1));
-                        s += w1d[i + 1] * w1d[j + 1] * std::fabs(g.at(yy, xx, ch));
+                if (inner) {
+                    for (int i = -1; i <= 1; ++i)
+                        for (int j = -1; j <= 1; ++j)
+                            s += w1d[i + 1] * w1d[j + 1] * std::fabs(g.at(y + i, x + j, ch));
+                } else {
+                    for (int i = -1; i <= 1; ++i) {
+                        const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(g.h - 1));
+                        for (int j = -1; j <= 1; ++j) {
+                            const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(g.w - 1));
+                            s += w1d[i + 1] * w1d[j + 1] * std::fabs(g.at(yy, xx, ch));
+                        }
                     }
                 }
                 out.at(y, x, ch) = s;
@@ -1747,9 +1775,23 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
     // (fixed seed), outside the pixel loop.
     const bool use_mc = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = use_mc ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
-    // Per-guide-pixel stats; rows independent (write own guide row, read-only raw/lut)
-    // -> parallel. dispatch_apply on Apple; big win since this runs per comp frame.
-    parallel_rows(gh, cfg.num_threads, [&](int y) {
+    // Per-guide-pixel stats in bands of guide rows (bands independent -> parallel;
+    // dispatch_apply on Apple). Each quad's four square roots used to be recomputed by
+    // all nine neighbours that read it; now a band first computes them once for its
+    // rows +-1 (edge-clamped exactly like quad()) into a small band buffer (~1 MB),
+    // and the 3x3 loop below reads them in the same order -> bit-identical output.
+    constexpr int kBand = 32;
+    const int n_bands = (gh + kBand - 1) / kBand;
+    parallel_rows(n_bands, cfg.num_threads, [&](int bi) {
+      const int by0 = bi * kBand, by1 = std::min(gh, by0 + kBand);
+      const int qr0 = by0 - 1, qnr = (by1 - by0) + 2;
+      std::vector<f32> Q((size_t)qnr * gw * 4);
+      for (int r = 0; r < qnr; ++r) {
+          f32* qrow = &Q[(size_t)r * gw * 4];
+          for (int qx = 0; qx < gw; ++qx)
+              quad(qr0 + r, qx, qrow[4 * qx + 0], qrow[4 * qx + 1], qrow[4 * qx + 2], qrow[4 * qx + 3]);
+      }
+      for (int y = by0; y < by1; ++y) {
         for (int x = 0; x < gw; ++x) {
             f32 avg[3] = {0, 0, 0};                      // 1-2-1 weighted mean colour
             f32 m0[3] = {0, 0, 0}, m1[3] = {0, 0, 0};    // unweighted colour moments
@@ -1757,8 +1799,9 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
             f32 center_green = 0.f;
             for (int dy = -1; dy <= 1; ++dy)
                 for (int dx = -1; dx <= 1; ++dx) {
-                    f32 sR, sGr, sGb, sB;
-                    quad(y + dy, x + dx, sR, sGr, sGb, sB);
+                    const int qx = std::min(gw - 1, std::max(0, x + dx));
+                    const f32* qv = &Q[((size_t)(y + dy - qr0) * gw + qx) * 4];
+                    const f32 sR = qv[0], sGr = qv[1], sGb = qv[2], sB = qv[3];
                     const f32 rgb[3] = {sR, 0.5f * (sGr + sGb), sB};
                     const f32 wq = W[dy + 1] * W[dx + 1];
                     for (int c = 0; c < 3; ++c) {
@@ -1800,6 +1843,7 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
             guide.at(y, x, 2) = col[2];
             guide.at(y, x, 3) = var;
         }
+      }
     });
     return prefilter_ref ? gcam_prefilter_ref(guide) : guide;
 }
@@ -2063,10 +2107,36 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
         return out;
     }
     // Finer: keep the mask at full guide resolution (dropped GCam's downsample).
-    // Rows are independent -> parallel (dispatch_apply on Apple, thread pool else).
-    parallel_rows(R.h, 0, [&](int y) {
-        for (int x = 0; x < R.w; ++x)
-            out.at(y, x, 0) = dilate_at(y, x);
+    // Bands of rows are independent -> parallel (dispatch_apply on Apple, thread pool
+    // else). Each band first computes the rejection 1 - clamp(R) of its rows +-2 once,
+    // edge-replicated 2 px left/right, into a small buffer (~1 MB) -- instead of every
+    // pixel recomputing 25 clamped reads with float->int edge clamps. The 5x5 sum then
+    // adds the SAME values in the SAME order (row-major i, j) -> bit-identical to
+    // dilate_at.
+    const int h = R.h, w = R.w, pw = w + 4;
+    constexpr int kBand = 32;
+    const int n_bands = (h + kBand - 1) / kBand;
+    parallel_rows(n_bands, 0, [&](int bi) {
+        const int y0 = bi * kBand, y1 = std::min(h, y0 + kBand);
+        const int r0 = y0 - 2, nr = (y1 - y0) + 4;
+        std::vector<f32> rej((size_t)nr * pw);
+        for (int r = 0; r < nr; ++r) {
+            const int yy = std::min(h - 1, std::max(0, r0 + r));
+            f32* row = &rej[(size_t)r * pw];
+            for (int px = 0; px < pw; ++px) {
+                const int xx = std::min(w - 1, std::max(0, px - 2));
+                row[px] = 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);
+            }
+        }
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                f32 sum = 0.f;
+                for (int i = -2; i <= 2; ++i) {
+                    const f32* row = &rej[(size_t)(y + i - r0) * pw + x + 2];
+                    for (int j = -2; j <= 2; ++j) sum += row[j];
+                }
+                out.at(y, x, 0) = clampf(1.f - (sum - dz) / dv, 0.f, 1.f);
+            }
     });
     return out;
 }

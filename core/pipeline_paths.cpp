@@ -19,6 +19,7 @@
 #include "hfnn.h"
 #include "mann.h"
 #include "fb_confidence.h"
+#include "burst_consensus.h"
 #include "cref.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1531,8 +1532,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this makes it explicit so the refined host mask is what the banded merge
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
+    // The HF NN, the misalignment NN and the forward-backward confidence edit the HOST
+    // mask. With GCam that mask is host-side anyway (GCam returns a host mask, and it is
+    // pushed into the frame's slot by metal_frame_put_rob only AFTER those steps), so they
+    // keep residency there; only the Wronski resident path (mask produced inside a GPU
+    // slice, no host copy) still has to give it up for them.
+    const bool host_mask_editors = work.hfnn_enabled || work.mann_enabled || work.fb_conf_enabled;
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled && !work.cref_enabled &&
-                      !work.hfnn_enabled && !work.mann_enabled && !work.fb_conf_enabled &&
+                      !(host_mask_editors && !work.robustness_gcam_enabled) &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1777,6 +1784,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // instead of pushing them through DRAM once per frame. Only an explicit
     // merge_arch == 2 still asks for online.
     if (frames_resident) use_online = false;   // never both (see metal_frames_begin)
+    // Burst consensus scales each frame's mask AFTER every frame is aligned; online would
+    // already have merged them. An explicit merge_arch == 2 keeps online (check skipped).
+    if (work.fb_consensus_enabled && work.merge_arch != 2) use_online = false;
     // Residency could not get its slices, so do not escalate to the accumulator
     // that wants five times as much.
     //
@@ -1924,6 +1934,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (use_online) metal_merge_begin_online(out_h, out_w, out_nch);
     prof_mark_memory(use_online ? "merge:online-armed" : "merge:banded-armed");
 #endif
+
+    // Burst consensus (Config::fb_consensus_enabled): every analysed frame's final merge
+    // tile vectors (raw px) and its burst index, for the check after the loop.
+    std::vector<std::vector<float>> cons_flows;
+    std::vector<int> cons_frames;
+    int cons_ny = 0, cons_nx = 0;
 
     auto drain_spill = [&]() {
         if (!spill_fut.valid()) return;
@@ -2270,6 +2286,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // Forward-backward flow confidence (Config::fb_conf_enabled): per-tile round-trip
         // error of the FINAL merge flow (after the GCam median), measured now while the
         // comparison grey still exists; applied to the mask after every mask stage below.
+        if (work.fb_consensus_enabled && !use_online && flow.ny > 0 && flow.nx > 0 &&
+            flow.flow.size() >= (size_t)flow.ny * (size_t)flow.nx * 2u) {
+            if (cons_flows.empty()) { cons_ny = flow.ny; cons_nx = flow.nx; }
+            if (flow.ny == cons_ny && flow.nx == cons_nx) {
+                cons_flows.emplace_back(flow.flow.begin(),
+                                        flow.flow.begin() + (size_t)flow.ny * (size_t)flow.nx * 2u);
+                cons_frames.push_back(k);
+            }
+        }
         std::vector<float> fb_err;
         if (work.fb_conf_enabled && !comp_grey.data.empty() && flow.ny > 0 && flow.nx > 0) {
             const double t_fb = prof_now_ms();
@@ -2627,6 +2652,66 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         metal_merge_end_online();
 #endif
         return Image();
+    }
+
+    // Burst consensus: now that every frame's vectors exist, test each frame's shift per
+    // tile against the other frames, and scale its stored mask (host, 8-bit, or already
+    // in the GPU merge cache) by the confidence before the merge reads it.
+    if (work.fb_consensus_enabled && !use_online && cons_flows.size() >= 3u) {
+        const double t_cons = prof_now_ms();
+        const std::vector<float> tstruct =
+            consensus_tile_structure(ref_grey, ref_h, ref_w, cons_ny, cons_nx, merge_ts, work);
+        const std::vector<std::vector<float>> cerr =
+            burst_consensus_error(cons_flows, cons_frames, ref_index, cons_ny, cons_nx,
+                                  merge_ts, tstruct, work);
+        // The mask of burst frame fk, wherever it is stored now.
+        auto mask_of = [&](int fk, float*& d, int& h, int& w, int& c, uint8_t*& d8, int& h8, int& w8) {
+            d = nullptr; d8 = nullptr; h = w = c = h8 = w8 = 0;
+            Image* rp = nullptr;
+            Mask8* mp = nullptr;
+            for (CachedCompFrame& fc : cached) if (fc.index == fk) { rp = &fc.rob; mp = &fc.rob8; }
+            for (CachedCompMeta& m : cached_meta) if (m.index == fk) { rp = &m.rob; mp = &m.rob8; }
+            if (rp && rp->h > 0 && rp->w > 0 && rp->data.size() == (size_t)rp->h * rp->w * rp->c) {
+                d = rp->data.data(); h = rp->h; w = rp->w; c = rp->c;
+            }
+            if (mp && !mp->empty()) { d8 = mp->data.data(); h8 = mp->h; w8 = mp->w; }
+#if defined(__APPLE__)
+            if (!d && !d8) d = metal_merge_frame_rob(fk, h, w, c);   // uploaded during analysis
+#endif
+        };
+        double csum = 0.0;
+        int capplied = 0;
+        for (size_t i = 0; i < cons_frames.size() && i < cerr.size(); ++i) {
+            if (cerr[i].empty()) continue;
+            float* d; uint8_t* d8; int h, w, c, h8, w8;
+            mask_of(cons_frames[i], d, h, w, c, d8, h8, w8);
+            if (!d && !d8) continue;
+            csum += fb_apply_confidence_raw(d, h, w, c, d8, h8, w8, cerr[i], cons_ny, cons_nx,
+                                            ref_h, ref_w, merge_ts, /*subdiv=*/1,
+                                            work.fb_consensus_tau_px, work);
+            ++capplied;
+        }
+        // Save-mask: the streamed path summed the masks inside the loop (before this
+        // check), so rebuild the sum from the scaled masks; the cached path sums later.
+        if (want_acc_rob && stream_comp_raw && capplied > 0) {
+            acc_rob = Image();
+            have_acc_rob = false;
+            for (const CachedCompMeta& m : cached_meta) {
+                float* d; uint8_t* d8; int h, w, c, h8, w8;
+                mask_of(m.index, d, h, w, c, d8, h8, w8);
+                if (d8) {
+                    Mask8 tmp; tmp.h = h8; tmp.w = w8; tmp.data.assign(d8, d8 + (size_t)h8 * w8);
+                    absorb_robustness_sum_u8(acc_rob, tmp, have_acc_rob);
+                } else if (d) {
+                    Image tmp(h, w, c);
+                    std::copy(d, d + (size_t)h * w * c, tmp.data.begin());
+                    absorb_robustness_sum(acc_rob, tmp, have_acc_rob);
+                }
+            }
+        }
+        prof_add_cpu("merge:burst-consensus", prof_now_ms() - t_cons);
+        prof_add_cpu("consensus#frames", (double)capplied);
+        if (capplied > 0) prof_add_cpu("consensus#mean-conf", csum / capplied);
     }
 
     // Release reference-side helpers not needed during merge.

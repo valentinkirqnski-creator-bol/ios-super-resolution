@@ -2,6 +2,7 @@
 // Chunks large batches so full-res (1×) fits in memory / GPU time; 2× crop is smaller.
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <dispatch/dispatch.h>
 
 #include "metal_gpu.h"
 #include "cref.h"
@@ -231,8 +232,27 @@ static MetalCtx& ctx() {
             "align_upscale_flow_bilinear",
             "merge_normalize_rgb16",
             nullptr};
-        for (int i = 0; need[i]; ++i) {
-            if (!c.pipe(need[i])) return;
+        // Compile the required pipelines IN PARALLEL. They used to be built one after
+        // another here, synchronously, on the first GPU use of the app session (it
+        // lands in ref:grey) -- ~60 independent pipeline compiles in series. MTLDevice
+        // and MTLLibrary are thread-safe for these calls; each worker writes only its
+        // own slot, and the map is filled serially afterwards. Same pipelines.
+        size_t n_need = 0;
+        while (need[n_need]) ++n_need;
+        std::vector<id<MTLComputePipelineState>> made(n_need);
+        __strong id<MTLComputePipelineState>* made_p = made.data();
+        const char* const* names = need;
+        id<MTLDevice> dev = c.device;
+        id<MTLLibrary> lib = c.library;
+        dispatch_apply(n_need, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+            id<MTLFunction> fn = [lib newFunctionWithName:@(names[i])];
+            if (!fn) return;
+            NSError* perr = nil;
+            made_p[i] = [dev newComputePipelineStateWithFunction:fn error:&perr];
+        });
+        for (size_t i = 0; i < n_need; ++i) {
+            if (!made[i]) return;   // a required kernel is missing: GPU path off (as before)
+            c.pipes[need[i]] = made[i];
         }
         c.ok = true;
     });
@@ -2583,7 +2603,11 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // stds_hires -- is_ref=true, so no flow warp, just the upscale.
     id<MTLBuffer> b_means_hires = nil, b_vars_hires = nil;
     int hires_h = 0, hires_w = 0;
-    if (cfg.robustness_raw_resolution_active()) {
+    // Not with GCam: its operator reads only the reference's own gcam guide, and the
+    // only readers of these buffers (the Wronski raw-res mask, the learned-mask host
+    // fetch) never run on the GCam path. At 12MP x 3 channels they were ~290 MB pinned
+    // for the whole burst for nothing. Same condition as the CPU init_robustness.
+    if (cfg.robustness_raw_resolution_active() && !cfg.robustness_gcam_enabled) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         // GCam's SampleBicubic is a cubic B-spline, so force B-spline (not
         // Catmull-Rom) for the gcam stats upscale.
@@ -3011,6 +3035,15 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 // exactly like the CPU operator's. Empty return -> caller falls back to the CPU
 // operator. The kernel is looked up lazily (not in the required pipeline list), so
 // if it is somehow absent Metal stays up for everything else and gcam uses the CPU.
+// Host twin of GcamGuideParams (HHSRKernels.metal).
+struct GcamGuideParamsCPU {
+    uint32_t gh, gw, raw_w, use_mc;
+    uint32_t cfa00, cfa01, cfa10, cfa11;
+    float green_factor, clip_point, na, nb;
+    float _p0, _p1, _p2, _p3;
+};
+static_assert(sizeof(GcamGuideParamsCPU) == 64, "GcamGuideParamsCPU layout");
+
 Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats& ref_stats,
                                           const FlowField& flow, int tile_size,
                                           const Config& cfg, Image* s_select_out) {
@@ -3033,8 +3066,78 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     // Prefilter BOTH guides identically (see compute_robustness_gcam_sabre): the ref
     // guide is always prefiltered, so prefilter the comp too, or identical frames
     // self-reject in guide-res. Was `resample` (asymmetric on the guide-res path).
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
-    if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
+    // The comparison guide is only needed until it is copied into its GPU buffer: build
+    // it in a scope so its ~48 MB host copy is freed before the mask / dilate buffers
+    // and the mask readback are allocated (lower per-frame peak, identical result).
+    id<MTLBuffer> b_compg = nil;
+    // Config::gcam_sabre_gpu_guide: build the comparison guide ON THE GPU
+    // (rob_gcam_guide + rob_gcam_prefilter, line-for-line twins of compute_gcam_guide /
+    // gcam_prefilter_ref) straight into the buffer the operator reads -- instead of
+    // ~100+ ms of host work per frame plus the guide upload. Same order of operations
+    // and precise::sqrt; Metal fast-math may still differ from the CPU in the last bit
+    // (~1e-7 relative). Falls back to the host guide below if a kernel is unavailable.
+    if (cfg.gcam_sabre_gpu_guide && cfg.bayer_mode &&
+        comp_raw.h / 2 == refg.h && comp_raw.w / 2 == refg.w &&
+        comp_raw.data.size() >= (size_t)comp_raw.h * (size_t)comp_raw.w) {
+        id<MTLComputePipelineState> gpipe = c.pipe("rob_gcam_guide");
+        id<MTLComputePipelineState> fpipe = c.pipe("rob_gcam_prefilter");
+        if (gpipe && fpipe) {
+            id<MTLBuffer> b_out = nil;
+            bool gok = false;
+            @autoreleasepool {
+                const size_t gbytes = (size_t)refg.h * (size_t)refg.w * 4u * sizeof(float);
+                id<MTLBuffer> b_raw = buf(comp_raw.data.data(),
+                                          (size_t)comp_raw.h * (size_t)comp_raw.w * sizeof(float));
+                id<MTLBuffer> b_g0 = buf(nullptr, gbytes);
+                b_out = buf(nullptr, gbytes);
+                const GcamNoiseLut glut = cfg.gcam_sabre_noise_model ? build_gcam_noise_lut(cfg)
+                                                                     : GcamNoiseLut{};
+                id<MTLBuffer> b_glut = buf(glut.v, sizeof(glut.v));
+                GcamGuideParamsCPU gp{};
+                gp.gh = (uint32_t)refg.h; gp.gw = (uint32_t)refg.w;
+                gp.raw_w = (uint32_t)comp_raw.w;
+                gp.use_mc = cfg.gcam_sabre_noise_model ? 1u : 0u;
+                gp.cfa00 = cfg.cfa.p[0][0]; gp.cfa01 = cfg.cfa.p[0][1];
+                gp.cfa10 = cfg.cfa.p[1][0]; gp.cfa11 = cfg.cfa.p[1][1];
+                gp.green_factor = cfg.gcam_sabre_green_factor;
+                gp.clip_point = cfg.gcam_sabre_clip_point;
+                gp.na = cfg.noise_alpha_robustness();
+                gp.nb = cfg.noise_beta_robustness();
+                const uint32_t dims[2] = {(uint32_t)refg.w, (uint32_t)refg.h};
+                id<MTLCommandBuffer> gcmd = (b_raw && b_g0 && b_out && b_glut) ? [c.queue commandBuffer] : nil;
+                if (gcmd) {
+                    id<MTLComputeCommandEncoder> e1 = [gcmd computeCommandEncoder];
+                    if (e1) {
+                        [e1 setBuffer:b_g0 offset:0 atIndex:0];
+                        [e1 setBuffer:b_raw offset:0 atIndex:1];
+                        [e1 setBuffer:b_glut offset:0 atIndex:2];
+                        [e1 setBytes:&gp length:sizeof(gp) atIndex:3];
+                        dispatch2(e1, gpipe, (NSUInteger)refg.w, (NSUInteger)refg.h);
+                        [e1 endEncoding];
+                    }
+                    id<MTLComputeCommandEncoder> e2 = e1 ? [gcmd computeCommandEncoder] : nil;
+                    if (e2) {
+                        [e2 setBuffer:b_out offset:0 atIndex:0];
+                        [e2 setBuffer:b_g0 offset:0 atIndex:1];
+                        [e2 setBytes:dims length:sizeof(dims) atIndex:2];
+                        dispatch2(e2, fpipe, (NSUInteger)refg.w, (NSUInteger)refg.h);
+                        [e2 endEncoding];
+                        prof_tag_gpu(gcmd, "robustness:gcam-guide");
+                        [gcmd commit];
+                        [gcmd waitUntilCompleted];
+                        gok = gcmd.status == MTLCommandBufferStatusCompleted;
+                    }
+                }
+            }
+            if (gok) b_compg = b_out;
+        }
+    }
+    if (!b_compg) {
+        const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
+        if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
+        b_compg = buf(compg.data.data(), compg.data.size() * sizeof(float));
+        if (!b_compg) return Image();
+    }
     const int gh = refg.h, gw = refg.w;
     const int oh = (int)std::llround((double)comp_raw.h * (double)cfg.scale);
     const int ow = (int)std::llround((double)comp_raw.w * (double)cfg.scale);
@@ -3047,7 +3150,6 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
     id<MTLBuffer> b_refg  = buf(refg.data.data(),  refg.data.size()  * sizeof(float));
-    id<MTLBuffer> b_compg = buf(compg.data.data(), compg.data.size() * sizeof(float));
     id<MTLBuffer> b_flow  = buf(flow.flow.data(),  flow.flow.size()  * sizeof(float));
     id<MTLBuffer> b_irr   = buf(irr.data(),        irr.size()        * sizeof(float));
     const size_t mask_b = (size_t)th * (size_t)tw * sizeof(float);   // target grid
@@ -3091,24 +3193,36 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.rejection_only = rej_only ? 1u : 0u;
     mp.unblocker = use_unb ? 1u : 0u;
 
-    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-    if (!cmd) return Image();
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return Image();
-    [enc setBuffer:b_R     offset:0 atIndex:0];
-    [enc setBuffer:b_refg  offset:0 atIndex:1];
-    [enc setBuffer:b_compg offset:0 atIndex:2];
-    [enc setBuffer:b_flow  offset:0 atIndex:3];
-    [enc setBuffer:b_irr   offset:0 atIndex:4];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:5];
-    [enc setBuffer:b_lut   offset:0 atIndex:6];
-    [enc setBuffer:b_unb   offset:0 atIndex:7];
-    dispatch2(enc, pipe, (NSUInteger)tw, (NSUInteger)th);
-    [enc endEncoding];
-    prof_tag_gpu(cmd, "robustness:gcam-sabre");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+    // Each GPU pass runs in its own autorelease pool: a command buffer keeps every
+    // buffer it referenced alive until IT is released, which without the inner pool
+    // is the end of this function -- so the reference guide, the comparison guide, the
+    // mask, the dilate output and the host readback (~48 MB each at 12MP) all
+    // coexisted. Draining the pool right after the pass, then dropping the inputs,
+    // frees them before the next allocation. Same kernels, same data, same result.
+    bool op_ok = false;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = cmd ? [cmd computeCommandEncoder] : nil;
+        if (enc) {
+            [enc setBuffer:b_R     offset:0 atIndex:0];
+            [enc setBuffer:b_refg  offset:0 atIndex:1];
+            [enc setBuffer:b_compg offset:0 atIndex:2];
+            [enc setBuffer:b_flow  offset:0 atIndex:3];
+            [enc setBuffer:b_irr   offset:0 atIndex:4];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+            [enc setBuffer:b_lut   offset:0 atIndex:6];
+            [enc setBuffer:b_unb   offset:0 atIndex:7];
+            dispatch2(enc, pipe, (NSUInteger)tw, (NSUInteger)th);
+            [enc endEncoding];
+            prof_tag_gpu(cmd, "robustness:gcam-sabre");
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            op_ok = cmd.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+    // The operator's inputs are no longer needed (the two guides alone are ~96 MB).
+    b_refg = nil; b_compg = nil; b_flow = nil; b_irr = nil; b_lut = nil; b_unb = nil;
+    if (!op_ok) return Image();
 
     // §7 refinement = GCam soft reject-grow (DilateMask). Guide-res: run it on the GPU
     // (rob_gcam_dilate reads the GPU R buffer -- no R readback, no host dilate), CPU
@@ -3130,21 +3244,26 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
             dp.h = (uint32_t)th; dp.w = (uint32_t)tw;
             dp.dilate_2x = (!resample && cfg.gcam_sabre_dilate_2x) ? 1u : 0u;
             dp.deadzone = cfg.gcam_sabre_dilate_deadzone; dp.div = cfg.gcam_sabre_dilate_div;
-            id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc2 = cmd2 ? [cmd2 computeCommandEncoder] : nil;
-            if (enc2) {
-                [enc2 setBuffer:b_dil offset:0 atIndex:0];
-                [enc2 setBuffer:b_R   offset:0 atIndex:1];
-                [enc2 setBytes:&dp length:sizeof(dp) atIndex:2];
-                dispatch2(enc2, dpipe, (NSUInteger)tw, (NSUInteger)th);
-                [enc2 endEncoding];
-                prof_tag_gpu(cmd2, "robustness:gcam-dilate");
-                [cmd2 commit];
-                [cmd2 waitUntilCompleted];
-                if (cmd2.status == MTLCommandBufferStatusCompleted) {
-                    dil = Image(th, tw, 1);
-                    memcpy(dil.data.data(), [b_dil contents], mask_b);
+            bool dil_ok = false;
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc2 = cmd2 ? [cmd2 computeCommandEncoder] : nil;
+                if (enc2) {
+                    [enc2 setBuffer:b_dil offset:0 atIndex:0];
+                    [enc2 setBuffer:b_R   offset:0 atIndex:1];
+                    [enc2 setBytes:&dp length:sizeof(dp) atIndex:2];
+                    dispatch2(enc2, dpipe, (NSUInteger)tw, (NSUInteger)th);
+                    [enc2 endEncoding];
+                    prof_tag_gpu(cmd2, "robustness:gcam-dilate");
+                    [cmd2 commit];
+                    [cmd2 waitUntilCompleted];
+                    dil_ok = cmd2.status == MTLCommandBufferStatusCompleted;
                 }
+            }
+            if (dil_ok) {
+                b_R = nil;   // undilated mask no longer needed: free it before the readback
+                dil = Image(th, tw, 1);
+                memcpy(dil.data.data(), [b_dil contents], mask_b);
             }
         }
     }
@@ -3152,6 +3271,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
         // GPU dilate not taken (resample / extra-min / kernel absent / error) -> host §7.
         Image R_pre(th, tw, 1);
         memcpy(R_pre.data.data(), [b_R contents], mask_b);
+        b_R = nil;   // host copy taken; free the GPU mask before the host dilate allocates
         // §7 = GCam soft DilateMask in both cases (twin of compute_robustness_gcam_sabre).
         // Raw-res: the 2x guide->quarter downsample is forced OFF (already finer than guide).
         if (resample) {
@@ -5093,6 +5213,26 @@ static id<MTLBuffer> build_dense_fp16(const FlowField& flow) {
     return b;
 }
 
+// Upload a host CovField (4 floats per entry: xx, xy, yx, yy) packed to the 3-float
+// layout the merge kernels already support (cov_stride 3 = xx, xy, yy; cov_at maps
+// idx 3 -> slot 2). xy == yx, so the kernel reads exactly the same values: bit-
+// identical merge, 25% less GPU memory per frame's covariances (~12 MB at 12MP)
+// for every comparison frame cached through the merge and the reference. Packed
+// straight into the shared buffer -- no host temporary.
+static id<MTLBuffer> buf_cov3(const f32* cp, size_t n_floats4) {
+    const size_t n = n_floats4 / 4;
+    if (!cp || n == 0) return nil;
+    id<MTLBuffer> b = buf(nullptr, n * 3 * sizeof(float));
+    if (!b) return nil;
+    float* d = (float*)[b contents];
+    for (size_t i = 0; i < n; ++i) {
+        d[3 * i + 0] = cp[4 * i + 0];
+        d[3 * i + 1] = cp[4 * i + 1];
+        d[3 * i + 2] = cp[4 * i + 3];
+    }
+    return b;
+}
+
 // Resolve comparison-frame GPU buffers. Prefer frame_key (>=0) so streamed
 // scratch Images (same CPU pointer, new pixels) still hit across bands.
 // Cache hit does not require CPU img/flow/rob pointers (skip disk reload).
@@ -5121,7 +5261,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         b_affine = e.b_affine;   // nil when the burst has no affine model
         b_dense = e.b_dense;     // nil when the frame has no dense field / over budget
         if (!b_cov) {
-            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
             b_cov = buf(kDummyCov, sizeof(kDummyCov));
             e.b_cov = b_cov;
         }
@@ -5162,7 +5302,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.affine_b = affine_b;
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
-            e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+            e.b_cov = cov_b ? buf_cov3(cp, cov_b / sizeof(float)) : nil;
             e.b_rob = buf(rp, rob_b);
             e.b_affine = affine_b ? buf(ap, affine_b) : nil;
             e.b_dense = build_dense_fp16(flow);  // nil = absent/over budget -> tile fallback
@@ -5173,7 +5313,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (affine_b && !e.b_affine) return false;
             if (!e.b_cov) {
-                static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+                static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
                 e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
                 if (!e.b_cov) return false;
             }
@@ -5199,7 +5339,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         // Same img allocation, new contents/aux (legacy streamed path).
         if (!ensure_sized(e.b_img, img_b) || !copy_into(e.b_img, ip, img_b)) return false;
         e.b_flow = buf(fp, flow_b);
-        e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+        e.b_cov = cov_b ? buf_cov3(cp, cov_b / sizeof(float)) : nil;
         e.b_rob = buf(rp, rob_b);
         e.b_affine = affine_b ? buf(ap, affine_b) : nil;
         e.b_dense = build_dense_fp16(flow);
@@ -5224,7 +5364,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         if (!e.b_flow || !e.b_rob) return false;
         if (affine_b && !e.b_affine) return false;
         if (!e.b_cov) {
-            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
             e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
             if (!e.b_cov) return false;
         }
@@ -5256,7 +5396,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.affine_b = affine_b;
     e.b_img = buf(ip, img_b);
     e.b_flow = buf(fp, flow_b);
-    e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    e.b_cov = cov_b ? buf_cov3(cp, cov_b / sizeof(float)) : nil;
     e.b_rob = buf(rp, rob_b);
     e.b_affine = affine_b ? buf(ap, affine_b) : nil;
     e.b_dense = build_dense_fp16(flow);
@@ -5267,7 +5407,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
     if (affine_b && !e.b_affine) return false;
     if (!e.b_cov) {
-        static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+        static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
         e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
         if (!e.b_cov) return false;
     }
@@ -5293,7 +5433,7 @@ static bool acquire_ref_gpu(const Image& img, const CovField& covs, const Image*
         b_cov = g_merge_ref.b_cov;
         b_acc = g_merge_ref.b_acc;
         if (!b_cov) {
-            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
             b_cov = buf(kDummyCov, sizeof(kDummyCov));
             g_merge_ref.b_cov = b_cov;
         }
@@ -5307,7 +5447,7 @@ static bool acquire_ref_gpu(const Image& img, const CovField& covs, const Image*
     g_merge_ref.cov_b = cov_b;
     g_merge_ref.acc_b = acc_b;
     g_merge_ref.b_img = buf(ip, img_b);
-    g_merge_ref.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    g_merge_ref.b_cov = cov_b ? buf_cov3(cp, cov_b / sizeof(float)) : nil;
     if (denoise && ap)
         g_merge_ref.b_acc = buf(ap, acc_b);
     else {
@@ -5316,7 +5456,7 @@ static bool acquire_ref_gpu(const Image& img, const CovField& covs, const Image*
     }
     if (!g_merge_ref.b_img || !g_merge_ref.b_acc) return false;
     if (!g_merge_ref.b_cov) {
-        static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+        static float kDummyCov[4] = {1.f, 0.f, 1.f, 0.f};   // cov_stride 3: xx, xy, yy
         g_merge_ref.b_cov = buf(kDummyCov, sizeof(kDummyCov));
         if (!g_merge_ref.b_cov) return false;
     }
@@ -5936,6 +6076,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         return false;
 
     MergeCompParamsCPU p{};
+    p.cov_stride = 3u;   // acquire_frame_gpu uploads covariances packed (buf_cov3)
     p.band_h = (uint32_t)acc_h;
     p.Ws = (uint32_t)acc_w;
     p.y0 = (uint32_t)y0;
@@ -6087,6 +6228,7 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
         return false;
 
     MergeRefParamsCPU p{};
+    p.cov_stride = 3u;   // acquire_ref_gpu uploads the covariances packed (buf_cov3)
     p.band_h = (uint32_t)acc_h;
     p.Ws = (uint32_t)acc_w;
     p.y0 = (uint32_t)y0;
@@ -6571,6 +6713,19 @@ bool mann_window_metal(const std::vector<float>& F, int rows, int cols, std::vec
     act_out.assign(act, act + (size_t)kMannCh * plane);
     return true;
   }
+}
+
+float* metal_merge_frame_rob(int frame_id, int& h, int& w, int& c) {
+    h = w = c = 0;
+    if (frame_id < 0 || !metal_merge_wait_inflight()) return nullptr;
+    for (MergeFrameGpu& e : g_merge_frames) {
+        if (e.key != frame_id || !e.b_rob) continue;
+        const size_t need = (size_t)e.rob_h * (size_t)e.rob_w * (size_t)std::max(1, e.rob_nch) * sizeof(float);
+        if (e.rob_h <= 0 || e.rob_w <= 0 || [e.b_rob length] < need) return nullptr;
+        h = e.rob_h; w = e.rob_w; c = std::max(1, e.rob_nch);
+        return (float*)[e.b_rob contents];
+    }
+    return nullptr;
 }
 
 } // namespace hhsr

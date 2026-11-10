@@ -1843,6 +1843,11 @@ struct Config {
     // Off by default: the CPU operator is the verified reference and runs on device
     // as-is. The Metal kernel is unverified until a device/CI build compiles it.
     bool  gcam_sabre_gpu             = false;
+    // With gcam_sabre_gpu: also build each COMPARISON guide on the GPU (rob_gcam_guide +
+    // rob_gcam_prefilter, twins of compute_gcam_guide) instead of on the host -- removes
+    // ~100+ ms of CPU work and the guide upload per frame. Same math in the same order;
+    // Metal fast-math may differ from the CPU in the last bit. Off = the host guide.
+    bool  gcam_sabre_gpu_guide       = true;
     // Compute the gcam robustness mask at the INPUT-FRAME (raw) resolution instead of
     // the ~3MP guide -- the paper's Algorithm 6 literally: the 3x3 statistics are
     // computed on the guide, then Dodgson x2 upscaled + flow-warped to raw res, where R
@@ -2028,6 +2033,20 @@ struct Config {
     int   fb_conf_iters = 6;
     float fb_conf_noise_k = 2.0f;    // x the noise-only expected error^2 subtracted
     int   fb_conf_subdiv = 4;        // check each tile in subdiv x subdiv patches (1 = whole tile)
+    // Burst consensus (core/burst_consensus.h): after all frames are aligned, a tile's
+    // shift in one frame is trusted only if the OTHER frames agree -- each frame's camera
+    // motion (robust affine) is removed, and the tile's remaining local motion must lie
+    // on the smooth path the other frames (and the reference at 0) trace over time.
+    // Disagreement d (raw px, across-edge only, noise-corrected) -> C = exp(-d^2/2tau^2)
+    // multiplied into that frame's mask before the merge. Vectors only: no extra
+    // alignment, no extra images. Forces the banded merge (online merges frames before
+    // all vectors exist). OFF by default.
+    bool  fb_consensus_enabled = false;
+    // Forward-backward + consensus: count the FULL disagreement, including slides ALONG an
+    // edge (default: only the across-edge part, weighted by the local structure). Along a
+    // straight uniform edge that part is unmeasurable, so this also rejects good edges.
+    bool  fb_conf_along_edges = false;
+    float fb_consensus_tau_px = 0.75f;
     bool  ref_demosaic_fallback = false;
     float ref_demosaic_share_lo = 0.5f;
     float ref_demosaic_share_hi = 0.9f;
