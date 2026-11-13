@@ -184,7 +184,7 @@ GuideTuning default_guide_tuning() {
 S82GuideParams guide_params(int Wr, int Hr, const S82Cfa& cfa, const GuideTuning& t) {
     S82GuideParams P{};
     P.Wr = Wr; P.Hr = Hr; P.Wg = Wr / 2; P.Hg = Hr / 2; P.row0 = 0; P.nrows = Hr; P.cfa = cfa;
-    P.force_rgb = 0;
+    P.force_rgb = t.force_rgb;
     P.green_clip = t.green_clip;
     P.fbp[0] = kGuideBorderGuidePx / P.Wg; P.fbp[1] = kGuideBorderGuidePx / P.Hg;
     P.fbp[2] = 1.f - kGuideBorderGuidePx / P.Wg; P.fbp[3] = 1.f - kGuideBorderGuidePx / P.Hg;

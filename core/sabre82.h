@@ -52,6 +52,7 @@ void extract_eps(const Config& cfg, const CFA& cfa, float K, float eps[4]);
 struct GuideTuning {
     float cov1[4], cov2[2];
     float green_clip;
+    int force_rgb = 0;        // force_reference_color_rgb.x (per shot in GCam; 0 = allow green-only)
 };
 GuideTuning guide_tuning(const CovTuning& cov, float green_clip);
 GuideTuning default_guide_tuning();   // the captured device values (K ~ 6.22), clip off

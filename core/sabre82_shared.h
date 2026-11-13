@@ -447,14 +447,18 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
 
 // kDilateMaskEntryPoint for output pixel (ox, oy) of an OW x OH target reading the W x H R8 rejection
 // (tex_size = W x H): 9 textureGathers, (sum - 0.2) / 2, output 1 - rejection.
+// The gather points (tc + off/size)*size - 0.5 land EXACTLY on texel boundaries, so the literal floor() is
+// decided by float rounding noise (flips texel to texel). The device resolves them to the fixed 5x5 window
+// x in [2o-2, 2o+2], y in [2o-1, 2o+3] (W = 2*OW): measured on c2_GT2 ROBUST_0 -> MASKOP_0 (96.9% exact,
+// 100% +-1 = fp16 ties) and 3 dbgpull pairs; the literal reading scored 85.7% / max 204 (a texel = 2 raw px
+// to the side). Gather origins below are those integer texels; tap groupings / summation order unchanged.
 S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, int OW, int OH, int ox, int oy) {
-    const float tcx = ((float)ox + 0.5f) / (float)OW, tcy = ((float)oy + 0.5f) / (float)OH;
+    (void)OW; (void)OH;
     const float k = 1.0f / 255.0f;
     float g[4];
-#define S82_GATHER(offx, offy)                                                                     \
+#define S82_GATHER(dx, dy)                                                                         \
     {                                                                                              \
-        const int i0 = (int)s82_floor((tcx + (offx) * (1.0f / (float)W)) * (float)W - 0.5f);       \
-        const int j0 = (int)s82_floor((tcy + (offy) * (1.0f / (float)H)) * (float)H - 0.5f);       \
+        const int i0 = 2 * ox + (dx), j0 = 2 * oy + (dy);                                          \
         const int xa = s82_clampi(i0, 0, W - 1), xb = s82_clampi(i0 + 1, 0, W - 1);               \
         const int ya = s82_clampi(j0, 0, H - 1), yb = s82_clampi(j0 + 1, 0, H - 1);               \
         g[0] = (float)rej[yb * W + xa] * k; g[1] = (float)rej[yb * W + xb] * k;                   \
@@ -462,15 +466,15 @@ S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, i
     }
 #define S82_DOT() (((g[0] + g[1]) + g[2]) + g[3])
     float r = 0.0f;
-    S82_GATHER(-1.5f, -1.5f) r += S82_DOT();
-    S82_GATHER(0.5f, -1.5f)  r += S82_DOT();
-    S82_GATHER(1.5f, -1.5f)  r += g[2]; r += g[1];
-    S82_GATHER(-1.5f, 0.5f)  r += S82_DOT();
-    S82_GATHER(0.5f, 0.5f)   r += S82_DOT();
-    S82_GATHER(1.5f, 0.5f)   r += g[2]; r += g[1];
-    S82_GATHER(-1.5f, 1.5f)  r += g[0]; r += g[1];
-    S82_GATHER(0.5f, 1.5f)   r += g[0]; r += g[1];
-    S82_GATHER(1.5f, 1.5f)   r += g[1];
+    S82_GATHER(-2, -1) r += S82_DOT();          // GLSL offset (-1.5, -1.5)
+    S82_GATHER(0, -1)  r += S82_DOT();          // ( 0.5, -1.5)
+    S82_GATHER(1, -1)  r += g[2]; r += g[1];    // ( 1.5, -1.5)
+    S82_GATHER(-2, 1)  r += S82_DOT();          // (-1.5,  0.5)
+    S82_GATHER(0, 1)   r += S82_DOT();          // ( 0.5,  0.5)
+    S82_GATHER(1, 1)   r += g[2]; r += g[1];    // ( 1.5,  0.5)
+    S82_GATHER(-2, 2)  r += g[0]; r += g[1];    // (-1.5,  1.5)
+    S82_GATHER(0, 2)   r += g[0]; r += g[1];    // ( 0.5,  1.5)
+    S82_GATHER(1, 2)   r += g[1];               // ( 1.5,  1.5)
 #undef S82_DOT
 #undef S82_GATHER
     r -= 0.2f;
