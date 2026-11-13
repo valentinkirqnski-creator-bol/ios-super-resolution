@@ -1726,6 +1726,15 @@ struct Config {
     // rejection subtracts / floors against. 1 = the LUT as filled from the DNG NoiseProfile; higher keeps
     // more of each comparison frame (brighter mask), 0 = noise-blind.
     float sabre_noise_scale = 1.0f;
+    // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
+    // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
+    // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on
+    // the guides) and, on edges above the edge_pct percentile of |grad|, scales the frame's keep mask by
+    // exp(-((shift - tol) / width)^2) (raw px). Off by default.
+    bool  sabre_resid_shift_enabled = false;
+    float sabre_resid_shift_tol_px = 0.15f;
+    float sabre_resid_shift_width_px = 0.2f;
+    float sabre_resid_shift_edge_pct = 90.0f;
     float gcam_mult = 1.0f;        // kDistanceMultiplier (GCam = 1)
     float gcam_thresh = 0.0f;      // kRejectionThreshold, additive inside exp2 (GCam = 0)
     float gcam_boost = 6.0f;       // extra_motion_robustness_boost in irregular+high-detail tiles (GCam = 6)

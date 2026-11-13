@@ -99,6 +99,7 @@ S82_INLINE S82F4 s82_f4(float x, float y, float z, float w) { S82F4 r; r.x = x; 
 #define S82_KEPSILON 0.00005f            // GetKernelWeight kEpsilon
 #define S82_DEHOMOG_EPS 0.0000001f       // SabreDehomogenize kEpsilon
 #define S82_FORCE_REJECT_COLOR 10000.0f  // kForceRejectReferenceColor
+#define S82_RS_CLIP_LUMA 9000.0f         // residual-shift test: luma at/above = a force-rejected texel
 
 // R, G1 (RGGB-order y), G2 (z), B site positions in each 2x2 quad. st_gbrg selects the GRBG/GBRG structure-
 // tensor formula; GCam's guard is `#if defined(BAYER_GBRG) || defined(BAYER_GBRG)` (sic), so only GBRG takes it.
@@ -387,10 +388,12 @@ S82_INLINE S82F4 s82_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int H
 
 // ------------------------------------------------------------------------------------------------ rejection
 // kRejectionEntryPoint + ComputeFrameWeight for guide pixel (gx, gy). Returns 1 - weight. `unb` = the burst's
-// unblocker texture (R8, P.unx x P.uny, NEAREST at tex_coord * unblocker_scale).
+// unblocker texture (R8, P.unx x P.uny, NEAREST at tex_coord * unblocker_scale). *it_out = luma(warped alt) -
+// luma(base reference) for the residual-shift test (hhsr extension; 0 where either is force-rejected).
 S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82_DEVICE float* alt_guide,
                                      const S82_DEVICE float* flow, const S82_DEVICE float* lut,
-                                     const S82_DEVICE uint8_t* unb, S82RejParams P, int gx, int gy) {
+                                     const S82_DEVICE uint8_t* unb, S82RejParams P, int gx, int gy,
+                                     S82_THREAD float* it_out) {
     const float tcx = ((float)gx + 0.5f) / (float)P.Wg, tcy = ((float)gy + 0.5f) / (float)P.Hg;
     const S82F4 fl = s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
     float wuv[2];
@@ -408,6 +411,10 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
     float ref_w = s82_fabs(rv[3]);
     const S82F4 cur = s82_sample_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
     float cur_w = cur.w;
+    {
+        const float lc = (cur.x + cur.y + cur.z) * (1.0f / 3.0f), lr = (rv[0] + rv[1] + rv[2]) * (1.0f / 3.0f);
+        *it_out = (lc < S82_RS_CLIP_LUMA && lr < S82_RS_CLIP_LUMA) ? lc - lr : 0.0f;
+    }
     const float luma = green_only ? rv[1] : (rv[0] * (1.0f / 3.0f) + rv[1] * (1.0f / 3.0f) + rv[2] * (1.0f / 3.0f));
     const S82F4 rn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 0.0f * P.nsb[1] + P.nsb[3]);
     const S82F4 cn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 1.0f * P.nsb[1] + P.nsb[3]);
@@ -469,6 +476,64 @@ S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, i
     r -= 0.2f;
     r /= 2.0f;
     return 1.0f - r;
+}
+
+// ------------------------------------------------------------------------------------ residual-shift test
+// hhsr EXTENSION, not GCam (Config::sabre_resid_shift_enabled). SABRE's rejection divides the colour difference by
+// the local variance, which at a strong edge is ~100x the difference a 0.3-1 px misalignment makes, so it keeps
+// misaligned edge samples (burst12 house: weight 0.92-0.94). This measures the misalignment directly: the
+// across-edge Lucas-Kanade shift of the warped alt against the base reference over 7x7,
+//   s = sum(It * |grad L|) / sum(|grad L|^2)       (guide px; It, L on the same bicubic-B-spline-filtered data)
+// and, on strong edges only (|grad L| above the burst's 90th percentile), multiplies the frame's dilated keep by
+//   f = exp(-((max(2|s| * cal - t0, 0)) / width)^2)   (2|s|*cal = raw px; cal: the 7x7 sum under-reads a thin edge)
+// minimised over the guide pixels a keep texel covers.
+struct S82ResidParams {
+    int Wg, Hg, Wm, Hm;
+    float thr;                // strong-edge |grad L| threshold
+    float cal;                // raw px per 2|s|
+    float t0, width;          // tolerance and fall-off, raw px
+};
+// |grad L| of the base reference luma: Sobel / 8, clamp to edge; 0 near force-rejected texels.
+S82_INLINE float s82_base_grad_pixel(const S82_DEVICE float* base_ref, int Wg, int Hg, int x, int y) {
+    float l[9];
+    for (int j = -1; j <= 1; ++j)
+        for (int i = -1; i <= 1; ++i) {
+            const int xx = s82_clampi(x + i, 0, Wg - 1), yy = s82_clampi(y + j, 0, Hg - 1);
+            const S82_DEVICE float* p = base_ref + ((long)yy * Wg + xx) * 4;
+            const float lu = (p[0] + p[1] + p[2]) * (1.0f / 3.0f);
+            if (lu >= S82_RS_CLIP_LUMA) return 0.0f;
+            l[(j + 1) * 3 + i + 1] = lu;
+        }
+    const float gx = ((l[2] - l[0]) + 2.0f * (l[5] - l[3]) + (l[8] - l[6])) * 0.125f;
+    const float gy = ((l[6] - l[0]) + 2.0f * (l[7] - l[1]) + (l[8] - l[2])) * 0.125f;
+    return s82_sqrt(gx * gx + gy * gy);
+}
+// R1: the per-guide-pixel factor. itg = It * |grad L| (rejection pass x base gradient), gm = |grad L|.
+S82_INLINE float s82_resid_factor_pixel(const S82_DEVICE float* itg, const S82_DEVICE float* gm, S82ResidParams P,
+                                        int x, int y) {
+    if (!(gm[(long)y * P.Wg + x] > P.thr)) return 1.0f;
+    float num = 0.0f, den = 0.0f;
+    for (int j = -3; j <= 3; ++j) {
+        const int yy = s82_clampi(y + j, 0, P.Hg - 1);
+        for (int i = -3; i <= 3; ++i) {
+            const long k = (long)yy * P.Wg + s82_clampi(x + i, 0, P.Wg - 1);
+            num += itg[k]; den += gm[k] * gm[k];
+        }
+    }
+    if (!(den > 0.0f)) return 1.0f;
+    const float r = 2.0f * s82_fabs(num / den) * P.cal;
+    const float t = s82_max(r - P.t0, 0.0f) / P.width;
+    return s82_exp2(-1.4426950408889634f * t * t);
+}
+// R2: keep texel (ox, oy) of the Wm x Hm mask times the minimum factor over guide pixels [2o-1, 2o+2]^2.
+S82_INLINE float s82_resid_apply_pixel(const S82_DEVICE uint8_t* keep, const S82_DEVICE float* f, S82ResidParams P,
+                                       int ox, int oy) {
+    float m = 1.0f;
+    for (int j = -1; j <= 2; ++j) {
+        const int yy = s82_clampi(2 * oy + j, 0, P.Hg - 1);
+        for (int i = -1; i <= 2; ++i) m = s82_min(m, f[(long)yy * P.Wg + s82_clampi(2 * ox + i, 0, P.Wg - 1)]);
+    }
+    return (float)keep[(long)oy * P.Wm + ox] * (1.0f / 255.0f) * m;
 }
 
 // ------------------------------------------------------------------------------------------------ merge

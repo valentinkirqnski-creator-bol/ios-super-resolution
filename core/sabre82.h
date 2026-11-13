@@ -105,8 +105,22 @@ struct Guide {
 Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads);
 // BaseFrameRefColor pass: bicubic-filtered base guide, sign kept (RGBA16F).
 std::vector<float> base_reference(const Guide& base, int threads);
+// Residual-shift test (hhsr extension, Config::sabre_resid_shift_enabled; see sabre82_shared.h). Per burst:
+// |grad L| of the base reference and the strong-edge threshold (Config::sabre_resid_shift_edge_pct percentile).
+// gm is always filled (the rejection pass reads it); `enabled` gates the extra passes.
+struct ResidShift {
+    bool enabled = false;
+    std::vector<float> gm;
+    S82ResidParams P{};
+};
+ResidShift resid_shift_setup(const std::vector<float>& base_ref, int Wg, int Hg, const Config& cfg, int threads);
+// R1 + R2 on the CPU: keep (Wg/2 x Hg/2) *= min factor; itg = It * |grad L| from rejection().
+void resid_shift_apply(const ResidShift& rs, const std::vector<float>& itg, std::vector<uint8_t>& keep, int threads);
+
+// rejection: also fills itg (Wg x Hg, It * |grad L|) for the residual-shift test when rs.enabled.
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
-               float noise_scale, const Unblocker& unb, std::vector<uint8_t>& rej, int threads);
+               float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
+               std::vector<float>& itg, int threads);
 // DilateMask to the half-guide grid (Wg/2 x Hg/2).
 void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads);
 
@@ -141,7 +155,7 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
 // metal_frame_stages: guide + kernel of one comparison frame, rejection against the resident base reference,
 // dilate. Returns the kernel covariance codes and the dilated mask.
 bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cfa, const float lut[80],
-                        const GuideTuning& t, float noise_scale, const Unblocker& unb,
+                        const GuideTuning& t, float noise_scale, const Unblocker& unb, const ResidShift& rs,
                         std::vector<uint16_t>& cov, std::vector<uint8_t>& keep);
 void metal_end_burst();
 bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandContext& ctx, int y0, int y1,

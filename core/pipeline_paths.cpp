@@ -1356,15 +1356,18 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         base_guide = compute_guide(ref, cfa, lut, base_t, work.num_threads);
         base_ref = base_reference(base_guide, work.num_threads);
     }
+    // Residual-shift test (hhsr extension): base-reference gradient + strong-edge threshold, once per burst.
+    const ResidShift rs = resid_shift_setup(base_ref, Wg, Hg, work, work.num_threads);
     prof_add_cpu("sabre:base", prof_now_ms() - t_g0);
     {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
                       "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g, SNR %.3g K %.3g "
-                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)",
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s",
                       gpu ? "GPU" : "CPU", Wr, Hr, Wo, Ho, frame_count,
                       work.has_noise_profile ? "DNG" : "fallback", noise_scale, cov_t.snr, cov_t.K,
-                      cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1]);
+                      cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1],
+                      rs.enabled ? ", edge shift test on" : "");
         report(buf, 0.05f);
     }
 
@@ -1433,13 +1436,15 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         extract_eps(work, work.cfa, Kf, mf->eps);
         bool done = false;
 #if defined(__APPLE__)
-        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, mf->cov, mf->keep);
+        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, rs, mf->cov, mf->keep);
 #endif
         if (!done) {
             Guide g = compute_guide(comp, cfa, lut, ft, work.num_threads);
             std::vector<uint8_t> rej;
-            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rej, work.num_threads);
+            std::vector<float> itg;
+            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rs, rej, itg, work.num_threads);
             dilate(rej, Wg, Hg, mf->keep, work.num_threads);
+            resid_shift_apply(rs, itg, mf->keep, work.num_threads);
             mf->cov = std::move(g.cov);
         }
         prof_add_cpu("sabre:frame", prof_now_ms() - t_s);

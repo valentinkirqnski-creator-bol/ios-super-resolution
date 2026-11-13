@@ -17,10 +17,14 @@ struct S82Gpu {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> guide = nil, base_ref = nil, reject = nil, dilate = nil, merge = nil, dehomog = nil;
+    id<MTLComputePipelineState> resid_factor = nil, resid_apply = nil;   // residual-shift test (optional)
     bool ok = false;
     // burst state: the base reference colour every rejection pass reads
     id<MTLBuffer> base_ref_buf = nil;
     int Wg = 0, Hg = 0;
+    // burst state: |grad L| of the base reference (residual-shift test; the rejection pass always reads it)
+    id<MTLBuffer> gm_buf = nil;
+    const float* gm_src = nullptr;
 };
 S82Gpu& gpu() {
     static S82Gpu g;
@@ -48,6 +52,8 @@ S82Gpu& gpu() {
         g.dilate = make(@"s82_dilate_kernel");
         g.merge = make(@"s82_merge_kernel");
         g.dehomog = make(@"s82_dehomog_kernel");
+        g.resid_factor = make(@"s82_resid_factor_kernel");
+        g.resid_apply = make(@"s82_resid_apply_kernel");
         g.ok = g.guide && g.base_ref && g.reject && g.dilate && g.merge && g.dehomog;
     });
     return g;
@@ -118,7 +124,7 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
 }
 
 bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cfa, const float lut[80],
-                        const GuideTuning& t, float noise_scale, const Unblocker& unb,
+                        const GuideTuning& t, float noise_scale, const Unblocker& unb, const ResidShift& rs,
                         std::vector<uint16_t>& cov_out, std::vector<uint8_t>& keep) {
     @autoreleasepool {
         S82Gpu& g = gpu();
@@ -130,14 +136,22 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale, unb);
         const int Wm = std::max(1, g.Wg / 2), Hm = std::max(1, g.Hg / 2);
         const size_t n = (size_t)g.Wg * g.Hg, nm = (size_t)Wm * Hm;
-        if (unb.data.size() < (size_t)unb.w * unb.h) return false;
+        if (unb.data.size() < (size_t)unb.w * unb.h || rs.gm.size() != n) return false;
+        if (rs.enabled && (!g.resid_factor || !g.resid_apply)) return false;
+        if (!g.gm_buf || g.gm_src != rs.gm.data()) {
+            g.gm_buf = buf(d, rs.gm.data(), n * 4);
+            g.gm_src = rs.gm.data();
+            if (!g.gm_buf) return false;
+        }
         id<MTLBuffer> raw = buf(d, comp.data.data(), (size_t)comp.w * comp.h * 4);
         id<MTLBuffer> lb = buf(d, lut, 80 * 4);
         id<MTLBuffer> fl = buf(d, flow.data.data(), flow.data.size() * 4);
         id<MTLBuffer> ub = buf(d, unb.data.data(), unb.data.size());
         id<MTLBuffer> r4 = buf(d, nullptr, n * 16), cov = buf(d, nullptr, n * 6);
         id<MTLBuffer> rej = buf(d, nullptr, n), kp = buf(d, nullptr, nm);
-        if (!raw || !lb || !fl || !ub || !r4 || !cov || !rej || !kp) return false;
+        id<MTLBuffer> itg = buf(d, nullptr, n * 4);
+        id<MTLBuffer> rf = rs.enabled ? buf(d, nullptr, n * 4) : nil, kp2 = rs.enabled ? buf(d, nullptr, nm) : nil;
+        if (!raw || !lb || !fl || !ub || !r4 || !cov || !rej || !kp || !itg || (rs.enabled && (!rf || !kp2))) return false;
         const int size4[4] = {g.Wg, g.Hg, Wm, Hm};
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
@@ -151,6 +165,8 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         [e setBytes:&RP length:sizeof(RP) atIndex:4];
         [e setBuffer:rej offset:0 atIndex:5];
         [e setBuffer:ub offset:0 atIndex:6];
+        [e setBuffer:g.gm_buf offset:0 atIndex:7];
+        [e setBuffer:itg offset:0 atIndex:8];
         dispatch2d(e, g.reject, g.Wg, g.Hg);
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [e setComputePipelineState:g.dilate];
@@ -158,10 +174,27 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         [e setBuffer:kp offset:0 atIndex:1];
         [e setBytes:size4 length:sizeof(size4) atIndex:2];
         dispatch2d(e, g.dilate, Wm, Hm);
+        if (rs.enabled) {
+            const S82ResidParams RS = rs.P;
+            [e setComputePipelineState:g.resid_factor];
+            [e setBuffer:itg offset:0 atIndex:0];
+            [e setBuffer:g.gm_buf offset:0 atIndex:1];
+            [e setBytes:&RS length:sizeof(RS) atIndex:2];
+            [e setBuffer:rf offset:0 atIndex:3];
+            dispatch2d(e, g.resid_factor, g.Wg, g.Hg);
+            [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [e setComputePipelineState:g.resid_apply];
+            [e setBuffer:kp offset:0 atIndex:0];
+            [e setBuffer:rf offset:0 atIndex:1];
+            [e setBytes:&RS length:sizeof(RS) atIndex:2];
+            [e setBuffer:kp2 offset:0 atIndex:3];
+            dispatch2d(e, g.resid_apply, Wm, Hm);
+        }
         [e endEncoding];
         if (!run(cb)) return false;
         cov_out.assign((const uint16_t*)cov.contents, (const uint16_t*)cov.contents + n * 3);
-        keep.assign((const uint8_t*)kp.contents, (const uint8_t*)kp.contents + nm);
+        id<MTLBuffer> kout = rs.enabled ? kp2 : kp;
+        keep.assign((const uint8_t*)kout.contents, (const uint8_t*)kout.contents + nm);
         return true;
     }
 }
@@ -169,6 +202,7 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
 void metal_end_burst() {
     S82Gpu& g = gpu();
     g.base_ref_buf = nil; g.Wg = g.Hg = 0;
+    g.gm_buf = nil; g.gm_src = nullptr;
 }
 
 bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandContext& ctx, int y0, int y1,

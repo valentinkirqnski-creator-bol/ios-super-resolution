@@ -1245,6 +1245,9 @@ struct CameraView: View {
                         ispRow("SABRE Noise Scale", $cam.tuningParams.sabre_noise_scale, 0.0...8.0, "%.2f")
                         Text("Multiplies the simulated noise table the rejection subtracts and floors against. 1 = as estimated from the DNG noise profile; higher keeps more of each frame (brighter mask, more noise reduction), lower rejects more (0 = noise-blind).")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SABRE Edge Shift Test (not GCam)", isOn: $cam.tuningParams.sabre_resid_shift_enabled)
+                        Text("Adds a check GCam doesn't have. SABRE judges a frame by its colour difference relative to the local contrast, so on strong edges it keeps frames that are 0.3-1 px misaligned; those show as doubled, colour-fringed edges. This measures how far each frame's edge sits from the reference edge after alignment and reduces that frame's weight on strong edges when it is more than about 0.15 px off. Off by default.")
+                            .font(.footnote).foregroundColor(.secondary)
                     }
                     Toggle("Paper-Exact R (guide-res → bilinear to merge grid)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
                     Text("""

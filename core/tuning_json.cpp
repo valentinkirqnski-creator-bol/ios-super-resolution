@@ -278,6 +278,10 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_cov_blurred_sigma"))  cfg.gcam_cov_blurred_sigma = fv("gcam_cov_blurred_sigma");
     if (has("gcam_cov_gradient_transition")) cfg.gcam_cov_gradient_transition = fv("gcam_cov_gradient_transition");
     if (has("gcam_cov_scale"))          cfg.gcam_cov_scale = fv("gcam_cov_scale");
+    if (has("sabre_resid_shift_enabled"))  cfg.sabre_resid_shift_enabled = bv("sabre_resid_shift_enabled");
+    if (has("sabre_resid_shift_tol_px"))   cfg.sabre_resid_shift_tol_px = fv("sabre_resid_shift_tol_px");
+    if (has("sabre_resid_shift_width_px")) cfg.sabre_resid_shift_width_px = fv("sabre_resid_shift_width_px");
+    if (has("sabre_resid_shift_edge_pct")) cfg.sabre_resid_shift_edge_pct = fv("sabre_resid_shift_edge_pct");
     if (has("gcam_sabre_k_rgb_biquad")) cfg.gcam_sabre_k_rgb_biquad = fv("gcam_sabre_k_rgb_biquad");
     if (has("gcam_sabre_k_green_biquad")) cfg.gcam_sabre_k_green_biquad = fv("gcam_sabre_k_green_biquad");
 

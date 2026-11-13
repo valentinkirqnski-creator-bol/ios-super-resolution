@@ -34,6 +34,9 @@ const float kCdm[2] = {0.07000000029802322f, 0.3499999940395355f};
 const float kBoost = 6.0f;
 const float kBoostVarThr = 25.0f;
 const float kMotionThrGuidePx = 0.2016f;    // 1.9236641e-4 uv at a 1048-px guide
+// Residual-shift test (hhsr extension): raw px per 2|s| of the 7x7 across-edge LK (it under-reads a thin edge;
+// calibrated by s82_resid_cal: alt = base reference shifted by a known amount).
+const float kResidCal = 1.7f;   // s82_rcal on burst12: 1.98 across vertical edges, 1.46 across horizontal (geo mean)
 const float kGuideBorderGuidePx = 1.25f;    // guide pass frame_border_padded
 const float kMergeBorderGuidePx = 0.75f;    // rejection + merge frame_border_padded (1.5 raw px)
 }  // namespace
@@ -429,14 +432,55 @@ std::vector<float> base_reference(const Guide& base, int threads) {
 }
 
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
-               float noise_scale, const Unblocker& unb, std::vector<uint8_t>& rej, int threads) {
+               float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
+               std::vector<float>& itg, int threads) {
     const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale, unb);
     rej.assign((size_t)alt.w * alt.h, 0);
+    const bool want_it = rs.enabled && rs.gm.size() == rej.size();
+    if (want_it) itg.assign(rej.size(), 0.f); else itg.clear();
     parallel_rows(alt.h, threads, [&](int gy) {
-        for (int gx = 0; gx < alt.w; ++gx)
-            rej[(size_t)gy * alt.w + gx] = s82_to_u8(
-                s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut, unb.data.data(), P, gx, gy));
+        for (int gx = 0; gx < alt.w; ++gx) {
+            float it;
+            const size_t i = (size_t)gy * alt.w + gx;
+            rej[i] = s82_to_u8(s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut,
+                                                   unb.data.data(), P, gx, gy, &it));
+            if (want_it) itg[i] = it * rs.gm[i];
+        }
     });
+}
+
+ResidShift resid_shift_setup(const std::vector<float>& base_ref, int Wg, int Hg, const Config& cfg, int threads) {
+    ResidShift rs;
+    rs.gm.assign((size_t)Wg * Hg, 0.f);
+    parallel_rows(Hg, threads, [&](int y) {
+        for (int x = 0; x < Wg; ++x) rs.gm[(size_t)y * Wg + x] = s82_base_grad_pixel(base_ref.data(), Wg, Hg, x, y);
+    });
+    rs.enabled = cfg.sabre_resid_shift_enabled;
+    rs.P.Wg = Wg; rs.P.Hg = Hg; rs.P.Wm = std::max(1, Wg / 2); rs.P.Hm = std::max(1, Hg / 2);
+    rs.P.cal = kResidCal;
+    rs.P.t0 = cfg.sabre_resid_shift_tol_px;
+    rs.P.width = std::max(1e-3f, cfg.sabre_resid_shift_width_px);
+    std::vector<float> tmp(rs.gm);
+    const double pct = std::min(99.9, std::max(0.0, (double)cfg.sabre_resid_shift_edge_pct));
+    const size_t k = std::min(tmp.size() - 1, (size_t)(pct / 100.0 * (double)(tmp.size() - 1)));
+    std::nth_element(tmp.begin(), tmp.begin() + (long)k, tmp.end());
+    rs.P.thr = tmp[k];
+    return rs;
+}
+
+void resid_shift_apply(const ResidShift& rs, const std::vector<float>& itg, std::vector<uint8_t>& keep, int threads) {
+    if (!rs.enabled || itg.size() != rs.gm.size() || keep.size() != (size_t)rs.P.Wm * rs.P.Hm) return;
+    std::vector<float> f(itg.size());
+    parallel_rows(rs.P.Hg, threads, [&](int y) {
+        for (int x = 0; x < rs.P.Wg; ++x)
+            f[(size_t)y * rs.P.Wg + x] = s82_resid_factor_pixel(itg.data(), rs.gm.data(), rs.P, x, y);
+    });
+    std::vector<uint8_t> out(keep.size());
+    parallel_rows(rs.P.Hm, threads, [&](int oy) {
+        for (int ox = 0; ox < rs.P.Wm; ++ox)
+            out[(size_t)oy * rs.P.Wm + ox] = s82_to_u8(s82_resid_apply_pixel(keep.data(), f.data(), rs.P, ox, oy));
+    });
+    keep.swap(out);
 }
 
 void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads) {

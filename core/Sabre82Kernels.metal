@@ -44,12 +44,43 @@ kernel void s82_rejection_kernel(device const float* base_ref  [[buffer(0)]],
                                  constant S82RejParams& P      [[buffer(4)]],
                                  device uint8_t* rej           [[buffer(5)]],
                                  device const uint8_t* unb     [[buffer(6)]],
+                                 device const float* gm        [[buffer(7)]],
+                                 device float* itg             [[buffer(8)]],
                                  uint2 gid [[thread_position_in_grid]])
 {
     const int gx = (int)gid.x, gy = (int)gid.y;
     if (gx >= P.Wg || gy >= P.Hg) return;
     const S82RejParams p = P;
-    rej[gy * p.Wg + gx] = s82_to_u8(s82_rejection_pixel(base_ref, alt_guide, flow, lut, unb, p, gx, gy));
+    float it;
+    const int i = gy * p.Wg + gx;
+    rej[i] = s82_to_u8(s82_rejection_pixel(base_ref, alt_guide, flow, lut, unb, p, gx, gy, &it));
+    itg[i] = it * gm[i];
+}
+
+// Residual-shift test (hhsr extension, not GCam). R1: per-guide-pixel factor.
+kernel void s82_resid_factor_kernel(device const float* itg   [[buffer(0)]],
+                                    device const float* gm    [[buffer(1)]],
+                                    constant S82ResidParams& P [[buffer(2)]],
+                                    device float* f           [[buffer(3)]],
+                                    uint2 gid [[thread_position_in_grid]])
+{
+    const int x = (int)gid.x, y = (int)gid.y;
+    if (x >= P.Wg || y >= P.Hg) return;
+    const S82ResidParams p = P;
+    f[y * p.Wg + x] = s82_resid_factor_pixel(itg, gm, p, x, y);
+}
+
+// R2: dilated keep (Wm x Hm R8) times the factor's minimum over the guide pixels it covers.
+kernel void s82_resid_apply_kernel(device const uint8_t* keep_in [[buffer(0)]],
+                                   device const float* f         [[buffer(1)]],
+                                   constant S82ResidParams& P    [[buffer(2)]],
+                                   device uint8_t* keep_out      [[buffer(3)]],
+                                   uint2 gid [[thread_position_in_grid]])
+{
+    const int ox = (int)gid.x, oy = (int)gid.y;
+    if (ox >= P.Wm || oy >= P.Hm) return;
+    const S82ResidParams p = P;
+    keep_out[oy * p.Wm + ox] = s82_to_u8(s82_resid_apply_pixel(keep_in, f, p, ox, oy));
 }
 
 // kDilateMaskEntryPoint to the half-guide grid -> R8 keep. size = (W, H, OW, OH).
