@@ -18,7 +18,8 @@
 // Our raw planes are already GCam's normalized space (the loader delivers (raw - black)/(white - black) *
 // wb[c]/wb[G], exposure-matched), so `gains` = 1 and `black_levels_times_gains` = 0: x*gains + black == x.
 // The ExtractBayerTexture pass (RGGB-ordered quads per texel) is the identity on such a plane: quads are read
-// straight from it through the CFA site table.
+// straight from it through the CFA site table. Its `+ vec4(1e-4)` is truncated away by the guide's uvec4()
+// read and kept by the merge's float read (S82MergeParams::eps).
 //
 // Portability (MSL is C++14-based): no templates, no std::, no references in signatures, address spaces
 // through S82_DEVICE / S82_THREAD, plain float/int, POD structs, fixed-size arrays.
@@ -129,6 +130,8 @@ struct S82RejParams {
     float boost_var_thr;      // motion_robustness_boost_variance_threshold
     float mot_thr, ub_thr;    // flow.z thresholds (uv)
     float noise_scale;        // 1 = the LUT as filled (exposed as a tuning knob)
+    int unx, uny;             // unblocker texture (R8, one texel per 8x8 guide pixels)
+    float uscale[2];          // unblocker_scale
 };
 
 struct S82MergeParams {
@@ -145,6 +148,7 @@ struct S82MergeParams {
     float fbp[4];             // frame_border_padded (merge pass)
     float unpack_rg[4];       // cov_range_rg
     float unpack_b[2];        // cov_range_b
+    float eps[4];             // ExtractBayer's +1e-4 DN in our normalized units, per site (y&1)*2+(x&1)
     S82Cfa cfa;
 };
 
@@ -382,16 +386,17 @@ S82_INLINE S82F4 s82_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int H
 }
 
 // ------------------------------------------------------------------------------------------------ rejection
-// kRejectionEntryPoint + ComputeFrameWeight for guide pixel (gx, gy). Returns 1 - weight. Unblocker off.
+// kRejectionEntryPoint + ComputeFrameWeight for guide pixel (gx, gy). Returns 1 - weight. `unb` = the burst's
+// unblocker texture (R8, P.unx x P.uny, NEAREST at tex_coord * unblocker_scale).
 S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82_DEVICE float* alt_guide,
                                      const S82_DEVICE float* flow, const S82_DEVICE float* lut,
-                                     S82RejParams P, int gx, int gy) {
+                                     const S82_DEVICE uint8_t* unb, S82RejParams P, int gx, int gy) {
     const float tcx = ((float)gx + 0.5f) / (float)P.Wg, tcy = ((float)gy + 0.5f) / (float)P.Hg;
     const S82F4 fl = s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
     float wuv[2];
     wuv[0] = tcx + fl.x; wuv[1] = tcy + fl.y;
     s82_mirror(wuv, P.fbp);
-    float unblocker = 0.0f;
+    float unblocker = s82_nearest_u8(unb, P.unx, P.uny, tcx * P.uscale[0], tcy * P.uscale[1]);
     const float lfv = fl.z;
     bool prior = false;
     if (lfv < P.ub_thr) unblocker = 0.0f;
@@ -496,8 +501,10 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
             const float kd = dx * dx * c[0] + dy * dy * c[1] + dx * dy * c[2] * 2.0f;
             const float w = s82_exp2(-0.5f * kd) + S82_KEPSILON;
             const int x = s82_clampi(px + i, 0, P.Wr - 1), y = s82_clampi(py + j, 0, P.Hr - 1);
-            const float v = s82_raw(raw, P.Wr, P.Hr, P.raw_row0, P.raw_nrows, x, y);
             const int sy = y & 1, sx = x & 1;
+            // Get3x3FromExtractedBayer reads the extracted texel as float, so ExtractBayer's +1e-4 survives here
+            // (the guide's uvec4() conversion truncates it away there).
+            const float v = s82_raw(raw, P.Wr, P.Hr, P.raw_row0, P.raw_nrows, x, y) + P.eps[sy * 2 + sx];
             if (sy == P.cfa.ry && sx == P.cfa.rx) { ai0 += v * w; aw0 += w; }
             else if (sy == P.cfa.by && sx == P.cfa.bx) { ai2 += v * w; aw2 += w; }
             else { ai1 += v * w; aw1 += w; }

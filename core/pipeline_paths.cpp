@@ -1327,6 +1327,20 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
     build_noise_lut(slope, offset, lut);
+    // Per-capture kernel covariance: EstimateSnr on the green noise model at the reference's mean level,
+    // K = sqrt(N/12)*SNR through the 6 MergeOptions curves (same for every frame of the burst).
+    const CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
+    // green_clipping_point per frame from the exposure gain the loader applied (the base: 1 -> off).
+    auto applied_gain = [&](const Image& im) {
+        if (!work.exposure_match_enabled || !(ref.exposure > 0.f) || !(im.exposure > 0.f)) return 1.f;
+        const float g = std::min(1.5f, std::max(0.67f, ref.exposure / im.exposure));
+        return std::fabs(g - 1.f) > 0.002f ? g : 1.f;
+    };
+    const GuideTuning base_t = guide_tuning(cov_t, green_clip_point(1.f, work.white_level));
+    // Unblocker: once per burst from the base frame, read by every rejection pass.
+    const double t_ub = prof_now_ms();
+    const Unblocker unb = compute_unblocker(ref, work, slope[1], offset[1]);
+    prof_add_cpu("sabre:unblocker", prof_now_ms() - t_ub);
 
     // Every stage runs on the GPU; the CPU versions (same arithmetic, core/sabre82_shared.h) are the
     // fallback if Metal is unavailable or a command buffer fails.
@@ -1335,19 +1349,22 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     std::vector<float> base_ref;
     bool gpu = false;
 #if defined(__APPLE__)
-    gpu = metal_base_stages(ref, cfa, lut, base_guide, base_ref);
+    gpu = metal_base_stages(ref, cfa, lut, base_t, base_guide, base_ref);
     struct S82BurstGuard { ~S82BurstGuard() { metal_end_burst(); } } s82_burst_guard;
 #endif
     if (!gpu) {
-        base_guide = compute_guide(ref, cfa, lut, work.num_threads);
+        base_guide = compute_guide(ref, cfa, lut, base_t, work.num_threads);
         base_ref = base_reference(base_guide, work.num_threads);
     }
     prof_add_cpu("sabre:base", prof_now_ms() - t_g0);
     {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g",
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g, SNR %.3g K %.3g "
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)",
                       gpu ? "GPU" : "CPU", Wr, Hr, Wo, Ho, frame_count,
-                      work.has_noise_profile ? "DNG" : "fallback", noise_scale);
+                      work.has_noise_profile ? "DNG" : "fallback", noise_scale, cov_t.snr, cov_t.K,
+                      cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1]);
         report(buf, 0.05f);
     }
 
@@ -1411,14 +1428,17 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         const double t_s = prof_now_ms();
         auto mf = std::make_unique<MergeFrame>();
         mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work);
+        const float Kf = applied_gain(comp);
+        const GuideTuning ft = guide_tuning(cov_t, green_clip_point(Kf, work.white_level));
+        extract_eps(work, work.cfa, Kf, mf->eps);
         bool done = false;
 #if defined(__APPLE__)
-        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, noise_scale, mf->cov, mf->keep);
+        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, mf->cov, mf->keep);
 #endif
         if (!done) {
-            Guide g = compute_guide(comp, cfa, lut, work.num_threads);
+            Guide g = compute_guide(comp, cfa, lut, ft, work.num_threads);
             std::vector<uint8_t> rej;
-            rejection(base_ref, g, mf->flow, lut, noise_scale, rej, work.num_threads);
+            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rej, work.num_threads);
             dilate(rej, Wg, Hg, mf->keep, work.num_threads);
             mf->cov = std::move(g.cov);
         }
@@ -1440,6 +1460,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     MergeFrame base;
     base.raw = &ref;
     base.cov = std::move(base_guide.cov);
+    extract_eps(work, work.cfa, 1.f, base.eps);
     base.flow = zero_flow_tex(frames.empty() ? std::max(1, Wr / merge_ts) : frames[0]->flow.nx,
                               frames.empty() ? std::max(1, Hr / merge_ts) : frames[0]->flow.ny, merge_ts, Wr, Hr);
     base_guide = Guide();

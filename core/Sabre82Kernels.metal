@@ -43,12 +43,13 @@ kernel void s82_rejection_kernel(device const float* base_ref  [[buffer(0)]],
                                  device const float* lut       [[buffer(3)]],
                                  constant S82RejParams& P      [[buffer(4)]],
                                  device uint8_t* rej           [[buffer(5)]],
+                                 device const uint8_t* unb     [[buffer(6)]],
                                  uint2 gid [[thread_position_in_grid]])
 {
     const int gx = (int)gid.x, gy = (int)gid.y;
     if (gx >= P.Wg || gy >= P.Hg) return;
     const S82RejParams p = P;
-    rej[gy * p.Wg + gx] = s82_to_u8(s82_rejection_pixel(base_ref, alt_guide, flow, lut, p, gx, gy));
+    rej[gy * p.Wg + gx] = s82_to_u8(s82_rejection_pixel(base_ref, alt_guide, flow, lut, unb, p, gx, gy));
 }
 
 // kDilateMaskEntryPoint to the half-guide grid -> R8 keep. size = (W, H, OW, OH).

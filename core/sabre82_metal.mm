@@ -84,13 +84,13 @@ void encode_guide(id<MTLComputeCommandEncoder> e, S82Gpu& g, id<MTLBuffer> raw, 
 }
 }  // namespace
 
-bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80], Guide& guide,
-                       std::vector<float>& base_ref) {
+bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80], const GuideTuning& t,
+                       Guide& guide, std::vector<float>& base_ref) {
     @autoreleasepool {
         S82Gpu& g = gpu();
         if (!g.ok || ref.data.size() < (size_t)ref.w * ref.h) return false;
         id<MTLDevice> d = g.device;
-        const S82GuideParams P = guide_params(ref.w, ref.h, cfa);
+        const S82GuideParams P = guide_params(ref.w, ref.h, cfa, t);
         const size_t n = (size_t)P.Wg * P.Hg;
         id<MTLBuffer> raw = buf(d, ref.data.data(), (size_t)ref.w * ref.h * 4);
         id<MTLBuffer> lb = buf(d, lut, 80 * 4);
@@ -118,23 +118,26 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
 }
 
 bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cfa, const float lut[80],
-                        float noise_scale, std::vector<uint16_t>& cov_out, std::vector<uint8_t>& keep) {
+                        const GuideTuning& t, float noise_scale, const Unblocker& unb,
+                        std::vector<uint16_t>& cov_out, std::vector<uint8_t>& keep) {
     @autoreleasepool {
         S82Gpu& g = gpu();
         if (!g.ok || !g.base_ref_buf || comp.w / 2 != g.Wg || comp.h / 2 != g.Hg ||
             comp.data.size() < (size_t)comp.w * comp.h)
             return false;
         id<MTLDevice> d = g.device;
-        const S82GuideParams GP = guide_params(comp.w, comp.h, cfa);
-        const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale);
+        const S82GuideParams GP = guide_params(comp.w, comp.h, cfa, t);
+        const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale, unb);
         const int Wm = std::max(1, g.Wg / 2), Hm = std::max(1, g.Hg / 2);
         const size_t n = (size_t)g.Wg * g.Hg, nm = (size_t)Wm * Hm;
+        if (unb.data.size() < (size_t)unb.w * unb.h) return false;
         id<MTLBuffer> raw = buf(d, comp.data.data(), (size_t)comp.w * comp.h * 4);
         id<MTLBuffer> lb = buf(d, lut, 80 * 4);
         id<MTLBuffer> fl = buf(d, flow.data.data(), flow.data.size() * 4);
+        id<MTLBuffer> ub = buf(d, unb.data.data(), unb.data.size());
         id<MTLBuffer> r4 = buf(d, nullptr, n * 16), cov = buf(d, nullptr, n * 6);
         id<MTLBuffer> rej = buf(d, nullptr, n), kp = buf(d, nullptr, nm);
-        if (!raw || !lb || !fl || !r4 || !cov || !rej || !kp) return false;
+        if (!raw || !lb || !fl || !ub || !r4 || !cov || !rej || !kp) return false;
         const int size4[4] = {g.Wg, g.Hg, Wm, Hm};
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
@@ -147,6 +150,7 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         [e setBuffer:lb offset:0 atIndex:3];
         [e setBytes:&RP length:sizeof(RP) atIndex:4];
         [e setBuffer:rej offset:0 atIndex:5];
+        [e setBuffer:ub offset:0 atIndex:6];
         dispatch2d(e, g.reject, g.Wg, g.Hg);
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [e setComputePipelineState:g.dilate];

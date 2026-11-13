@@ -5,7 +5,6 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
-#include <random>
 
 namespace hhsr {
 namespace sabre82 {
@@ -16,8 +15,17 @@ namespace sabre82 {
 // frame size the way the captured ones follow GCam's.
 namespace {
 const float kNsb[4] = {0.9f, 0.5f, 0.05f, 0.25f};                      // 10x2 LUT: ((n-1)/n, 1/2, 0.5/n, 1/4)
+// The captured device uniforms (= cov_tuning at K ~ 6.22); default_guide_tuning only. Bursts use cov_tuning.
 const float kCov1[4] = {4.545454025268555f, 1.0101009607315063f, 0.0011417345376685262f, 3.0303030014038086f};
 const float kCov2[2] = {0.7265790104866028f, 48.421653747558594f};
+// MergeOptions covariance curves, (K, value) knots, built by FUN_0141068c from .rodata
+// (Documents/super/SABRE_8.2_merge_covariance_SPEC.md section 5).
+const float kCurveBase[] = {7.2f, 0.33f, 14.4f, 0.25f};                                   // p0
+const float kCurveBlurred[] = {5.4f, 4.2f, 11.0f, 4.0f, 27.0f, 3.0f};                     // p1
+const float kCurveGradClip[] = {0.9f, 0.01f, 1.0f, 0.0012f, 3.6f, 0.0012f, 12.6f, 0.001f, 27.0f, 0.001f};  // p2
+const float kCurveGradTrans[] = {0.9f, 0.028f, 2.7f, 0.025f, 10.8f, 0.015f, 27.0f, 0.009f};  // p3 (1/transition)
+const float kCurveStretched[] = {16.0f, 3.0f};                                             // p4
+const float kCurveShrinked[] = {16.0f, 1.5f};                                              // p5
 const float kPackRG[4] = {-0.015019307844340801f, 0.040903590619564056f, -0.014296099543571472f, 0.03893400356173515f};
 const float kPackB[2] = {0.4981805980205536f, 0.071417897939682f};
 const float kUnpackRG[4] = {0.3671880066394806f, 24.447731018066406f, 0.3671880066394806f, 25.684490203857422f};
@@ -58,50 +66,248 @@ void noise_model_s2(const Config& cfg, float slope[3], float offset[3]) {
     }
 }
 
+// var(sqrt(max(0, s + sd*Z))), Z ~ N(0,1), by quadrature on a fine grid over [-9, 9] (exact to ~1e-9 relative
+// for this integrand; deterministic, unlike the Monte Carlo it replaces).
+static double var_sqrt_clipped(double s, double sd) {
+    constexpr int kN = 20001;
+    constexpr double kZ = 9.0;
+    double wsum = 0, m1 = 0, m2 = 0;
+    for (int k = 0; k < kN; ++k) {
+        const double z = -kZ + 2.0 * kZ * k / (kN - 1);
+        const double w = std::exp(-0.5 * z * z);
+        const double f = std::sqrt(std::max(0.0, s + sd * z));
+        wsum += w; m1 += w * f; m2 += w * f * f;
+    }
+    m1 /= wsum; m2 /= wsum;
+    return std::max(0.0, m2 - m1 * m1);
+}
+
 void build_noise_lut(const float slope[3], const float offset[3], float lut[80]) {
     std::memset(lut, 0, sizeof(float) * 80);
-    std::mt19937 rng(12345u);
-    std::normal_distribution<float> nd(0.f, 1.f);
-    constexpr int kN = 40000;
     for (int i = 0; i < 10; ++i) {
         const double L = (double)i / 9.0;
-        const float s = (float)(L * L);
-        float sd[3];
-        for (int c = 0; c < 3; ++c) sd[c] = std::sqrt(std::max(0.f, slope[c] * s + offset[c]));
-        double m[3] = {0, 0, 0}, m2[3] = {0, 0, 0};
-        for (int n = 0; n < kN; ++n) {
-            const float r = std::sqrt(std::max(0.f, s + sd[0] * nd(rng)));       // loader clips at 0
-            const float g1 = std::sqrt(std::max(0.f, s + sd[1] * nd(rng)));
-            const float g2 = std::sqrt(std::max(0.f, s + sd[1] * nd(rng)));
-            const float b = std::sqrt(std::max(0.f, s + sd[2] * nd(rng)));
-            const float v[3] = {r, 0.5f * (g1 + g2), b};
-            for (int c = 0; c < 3; ++c) { m[c] += v[c]; m2[c] += (double)v[c] * v[c]; }
+        const double s = L * L;
+        double v[3];
+        for (int c = 0; c < 3; ++c) {
+            const double sd = std::sqrt(std::max(0.0, (double)slope[c] * s + (double)offset[c]));
+            v[c] = var_sqrt_clipped(s, sd);                   // loader clips at 0
         }
+        v[1] *= 0.5;                                          // .y = 0.5*(sqrt G1 + sqrt G2), independent sites
         for (int row = 0; row < 2; ++row) {
             float* o = lut + (row * 10 + i) * 4;
-            for (int c = 0; c < 3; ++c) {
-                const double mu = m[c] / kN;
-                o[c] = (float)std::max(0.0, m2[c] / kN - mu * mu);
-            }
+            for (int c = 0; c < 3; ++c) o[c] = (float)v[c];
             o[3] = 0.f;
         }
     }
 }
 
-S82GuideParams guide_params(int Wr, int Hr, const S82Cfa& cfa) {
+// ------------------------------------------------------------------------------------------- tuning
+float eval_curve(const float* xy, int n, float K) {
+    if (n <= 0) return 0.f;
+    if (K <= xy[0]) return xy[1];
+    if (xy[2 * (n - 1)] <= K) return xy[2 * (n - 1) + 1];
+    int i = 1;                                   // first knot with x > K (upper bound)
+    while (i < n - 1 && xy[2 * i] <= K) ++i;
+    const float* hi = xy + 2 * i;
+    const float t = (K - hi[-2]) / (hi[0] - hi[-2]);
+    return hi[1] * t + hi[-1] * (1.0f - t);
+}
+
+float estimate_snr(float signal, float shot_noise_factor, float read_noise_var) {
+    if (!(signal > 0.f) || !std::isfinite(signal)) signal = 0.18f;
+    const float v = read_noise_var + shot_noise_factor * signal;
+    return v > 0.f ? signal / std::sqrt(v) : 0.f;
+}
+
+CovTuning cov_tuning(float snr, int num_frames) {
+    CovTuning t;
+    t.snr = snr;
+    t.K = std::sqrt((float)num_frames / 12.0f) * snr;
+    t.p[0] = eval_curve(kCurveBase, 2, t.K);
+    t.p[1] = eval_curve(kCurveBlurred, 3, t.K);
+    t.p[2] = eval_curve(kCurveGradClip, 5, t.K);
+    t.p[3] = eval_curve(kCurveGradTrans, 4, t.K);
+    t.p[4] = eval_curve(kCurveStretched, 1, t.K);
+    t.p[5] = eval_curve(kCurveShrinked, 1, t.K);
+    const float p0 = t.p[0];
+    t.cov1[0] = 1.0f / (p0 / t.p[5]);
+    t.cov1[1] = 1.0f / (p0 * t.p[4]);
+    t.cov1[2] = t.p[2];
+    t.cov1[3] = 1.0f / p0;
+    t.cov2[0] = 1.0f / (p0 * t.p[1]);
+    t.cov2[1] = 1.0f / t.p[3];
+    return t;
+}
+
+float green_clip_point(float K, float white_level) {
+    const int white = (int)white_level;
+    if (!(K > 0.f) || K * 1.0f >= 1.0f || white <= 3) return FLT_MAX;
+    return (K * 1.0f + (K * 1.0f)) * 0.5f * ((float)(white - 3) / (float)white);
+}
+
+void extract_eps(const Config& cfg, const CFA& cfa, float K, float eps[4]) {
+    for (int s = 0; s < 4; ++s) {
+        eps[s] = 0.f;
+        int c = cfa.p[s / 2][s % 2];
+        if (c < 0 || c > 2) c = 1;
+        const float black = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+        const float range = cfg.white_level - black;
+        if (!(range > 0.f) || !(K > 0.f)) continue;
+        float g = 1.f;
+        if (cfg.raw_prewhitened) {
+            const float r = cfg.white_balance[c] / cfg.white_balance[1];
+            if (std::isfinite(r) && r > 0.f) g = r;
+        }
+        eps[s] = 1e-4f * K * g / range;
+    }
+}
+
+GuideTuning guide_tuning(const CovTuning& cov, float green_clip) {
+    GuideTuning t;
+    for (int k = 0; k < 4; ++k) t.cov1[k] = cov.cov1[k];
+    for (int k = 0; k < 2; ++k) t.cov2[k] = cov.cov2[k];
+    t.green_clip = green_clip;
+    return t;
+}
+
+GuideTuning default_guide_tuning() {
+    GuideTuning t;
+    for (int k = 0; k < 4; ++k) t.cov1[k] = kCov1[k];
+    for (int k = 0; k < 2; ++k) t.cov2[k] = kCov2[k];
+    t.green_clip = FLT_MAX;
+    return t;
+}
+
+S82GuideParams guide_params(int Wr, int Hr, const S82Cfa& cfa, const GuideTuning& t) {
     S82GuideParams P{};
     P.Wr = Wr; P.Hr = Hr; P.Wg = Wr / 2; P.Hg = Hr / 2; P.row0 = 0; P.nrows = Hr; P.cfa = cfa;
     P.force_rgb = 0;
-    P.green_clip = FLT_MAX;
+    P.green_clip = t.green_clip;
     P.fbp[0] = kGuideBorderGuidePx / P.Wg; P.fbp[1] = kGuideBorderGuidePx / P.Hg;
     P.fbp[2] = 1.f - kGuideBorderGuidePx / P.Wg; P.fbp[3] = 1.f - kGuideBorderGuidePx / P.Hg;
-    for (int k = 0; k < 4; ++k) { P.nsb[k] = kNsb[k]; P.cov1[k] = kCov1[k]; P.pack_rg[k] = kPackRG[k]; }
-    for (int k = 0; k < 2; ++k) { P.cov2[k] = kCov2[k]; P.pack_b[k] = kPackB[k]; }
+    for (int k = 0; k < 4; ++k) { P.nsb[k] = kNsb[k]; P.cov1[k] = t.cov1[k]; P.pack_rg[k] = kPackRG[k]; }
+    for (int k = 0; k < 2; ++k) { P.cov2[k] = t.cov2[k]; P.pack_b[k] = kPackB[k]; }
     return P;
 }
 
-S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale) {
+Unblocker zero_unblocker(int Wr, int Hr) {
+    Unblocker u;
+    // Output size per axis = ((dim >> 1) + 7) >> 3 (FUN_012c32f0), i.e. ceil(guide / 8).
+    u.w = std::max(1, ((Wr >> 1) + 7) >> 3);
+    u.h = std::max(1, ((Hr >> 1) + 7) >> 3);
+    // unblocker_scale: the rejection's tex_coord spans the guide (Wr raw px), the texture 16*w raw px. The
+    // captured burst (2096 = 131*16) had (1, 1); not recovered for other sizes, this keeps the tiles aligned.
+    u.scale[0] = (float)Wr / (float)(16 * u.w);
+    u.scale[1] = (float)Hr / (float)(16 * u.h);
+    u.data.assign((size_t)u.w * u.h, 0);
+    return u;
+}
+
+namespace {
+inline int64_t uhadd(int64_t a, int64_t b) { return (a + b) >> 1; }
+inline int64_t urhadd(int64_t a, int64_t b) { return (a + b + 1) >> 1; }
+// Halide BoundaryConditions::mirror_image over [0, n): ..1 0 | 0 1.. (edge sample repeated).
+inline int mirror_idx(int p, int n) {
+    int m = p % (2 * n);
+    if (m < 0) m += 2 * n;
+    return m >= n ? 2 * n - 1 - m : m;
+}
+// 3x3 halving-add blur of p (ph x pw), output (ph-2) x (pw-2):
+//   col = H2(H1(p[y-1], p[y+1]), p[y]);  out = H4(H3(col[x-1], col[x+1]), col[x])
+void blur3(const std::vector<int64_t>& p, int ph, int pw, bool all_round, std::vector<int64_t>& out) {
+    const int oh = ph - 2, ow = pw - 2;
+    std::vector<int64_t> col((size_t)oh * pw);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < pw; ++x) {
+            const int64_t t = p[(size_t)y * pw + x], m = p[(size_t)(y + 1) * pw + x], b = p[(size_t)(y + 2) * pw + x];
+            col[(size_t)y * pw + x] = urhadd(all_round ? urhadd(t, b) : uhadd(t, b), m);
+        }
+    out.assign((size_t)oh * ow, 0);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            const int64_t l = col[(size_t)y * pw + x], m = col[(size_t)y * pw + x + 1], r = col[(size_t)y * pw + x + 2];
+            out[(size_t)y * ow + x] = all_round ? urhadd(urhadd(l, r), m) : uhadd(urhadd(l, r), m);
+        }
+}
+inline float f32_bits(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+}  // namespace
+
+Unblocker unblocker_dn(const uint16_t* raw, int W, int H, bool green_on_even, float shot, float read, float black,
+                       bool gcam82_rounding) {
+    Unblocker u = zero_unblocker(W, H);
+    const int T = 8, N = T * T, Wh = W >> 1, Hh = H >> 1, ow = u.w, oh = u.h;
+    if (Wh <= 0 || Hh <= 0) return u;
+    // Half-res coordinates [-T-1, T*(o+1)+1): weight tiles -1..o (apron) plus the blur's 1-px apron.
+    const int x0 = -T - 1, y0 = -T - 1, pw = T * (ow + 2) + 2, ph = T * (oh + 2) + 2;
+    const int g0 = green_on_even ? 0 : 1, g1 = green_on_even ? 3 : 2;
+    std::vector<int> mx(pw), my(ph);
+    for (int i = 0; i < pw; ++i) mx[i] = mirror_idx(x0 + i, Wh);
+    for (int i = 0; i < ph; ++i) my[i] = mirror_idx(y0 + i, Hh);
+    auto plane = [&](int c, int iy, int ix) -> int64_t {
+        return raw[(size_t)(2 * my[iy] + (c >> 1)) * W + 2 * mx[ix] + (c & 1)];
+    };
+    std::vector<int64_t> avg((size_t)ph * pw);
+    for (int iy = 0; iy < ph; ++iy)
+        for (int ix = 0; ix < pw; ++ix) avg[(size_t)iy * pw + ix] = urhadd(plane(g0, iy, ix), plane(g1, iy, ix));
+    std::vector<int64_t> G;
+    blur3(avg, ph, pw, gcam82_rounding, G);   // (ph-2) x (pw-2), covers half-res [-T, T*(o+1))
+    const int gw = pw - 2;
+    const int ntx = ow + 2, nty = oh + 2;
+    std::vector<int64_t> weight((size_t)nty * ntx);
+    const float kDen = f32_bits(0x41638E39u), kScale = f32_bits(0x3E4CCCCDu), kOffset = f32_bits(0x3EE66666u);
+    for (int ty = 0; ty < nty; ++ty)
+        for (int tx = 0; tx < ntx; ++tx) {
+            int64_t S12 = 0, Q12 = 0, S3 = 0, Q3 = 0;
+            for (int j = 0; j < T; ++j)
+                for (int i = 0; i < T; ++i) {
+                    const int gy = ty * T + j, gx = tx * T + i;          // index into G
+                    const int iy = gy + 1, ix = gx + 1;                   // same position in the plane grid
+                    const int64_t a = plane(g0, iy, ix), b = plane(g1, iy, ix), g = G[(size_t)gy * gw + gx];
+                    S12 += a + b; Q12 += a * a + b * b; S3 += g; Q3 += g * g;
+                }
+            const int64_t mean_g = (S12 + N) / (2 * N);
+            const int64_t V_raw = (2 * N * Q12 - S12 * S12 + 2 * N * N) / (4 * N * N);
+            const int64_t V_blur = (N * Q3 - S3 * S3 + (N * N) / 2) / (N * N);
+            const float sig = std::max((float)mean_g - black, 0.0f);
+            const float noise = gcam82_rounding ? read + shot * sig : std::fma(shot, sig, read);
+            const float num = (float)V_raw + noise * -4.0f;
+            float uu;
+            if (V_blur == 0) uu = num > 0.f ? kScale : 0.f;
+            else {
+                const float den = (float)V_blur * kDen;
+                const float m = std::sqrt(std::max(num, 0.0f) / den);
+                uu = kScale * (m - kOffset);
+            }
+            uu = std::max(std::min(uu, 1.0f), 0.0f);
+            weight[(size_t)ty * ntx + tx] = (int64_t)(uu * 255.0f);   // fcvtzs: truncation
+        }
+    std::vector<int64_t> out;
+    blur3(weight, nty, ntx, gcam82_rounding, out);   // blur$1: oh x ow
+    for (size_t i = 0; i < out.size(); ++i) u.data[i] = (uint8_t)std::min<int64_t>(255, std::max<int64_t>(0, out[i]));
+    return u;
+}
+
+Unblocker compute_unblocker(const Image& base, const Config& cfg, float slope_g, float offset_g) {
+    const int W = base.w, H = base.h;
+    const float black = cfg.has_black_levels ? cfg.black_levels[1] : 0.f;
+    const float range = cfg.white_level - black;
+    if (base.c != 1 || W < 2 || H < 2 || !(range > 0.f) || base.data.size() < (size_t)W * H) return zero_unblocker(W, H);
+    // Green sites back to DN (the loader delivered (DN - black)/(white - black), gain 1 on green, K = 1 on the
+    // base). The non-green sites are never read.
+    std::vector<uint16_t> dn((size_t)W * H, 0);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            if (cfg.cfa.p[y & 1][x & 1] != 1) continue;
+            const float v = base.data[(size_t)y * W + x] * range + black;
+            dn[(size_t)y * W + x] = (uint16_t)std::min(65535.f, std::max(0.f, std::floor(v + 0.5f)));
+        }
+    const bool goe = cfg.cfa.p[0][0] == 1 && cfg.cfa.p[1][1] == 1;
+    return unblocker_dn(dn.data(), W, H, goe, slope_g * range, offset_g * range * range, black);
+}
+
+S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, const Unblocker& unb) {
     S82RejParams P{};
+    P.unx = unb.w; P.uny = unb.h; P.uscale[0] = unb.scale[0]; P.uscale[1] = unb.scale[1];
     P.Wg = Wg; P.Hg = Hg; P.fnx = flow.nx; P.fny = flow.ny;
     for (int k = 0; k < 4; ++k) { P.fso[k] = flow.fso[k]; P.nsb[k] = kNsb[k]; }
     P.fbp[0] = kMergeBorderGuidePx / Wg; P.fbp[1] = kMergeBorderGuidePx / Hg;
@@ -190,12 +396,12 @@ FlowTex zero_flow_tex(int nx, int ny, int ts, int Wr, int Hr) {
 }
 
 // ------------------------------------------------------------------------------------------- per frame
-Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], int threads) {
+Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads) {
     Guide g;
     g.w = raw.w / 2; g.h = raw.h / 2;
     g.ref4.assign((size_t)g.w * g.h * 4, 0.f);
     g.cov.assign((size_t)g.w * g.h * 3, 0);
-    const S82GuideParams P = guide_params(raw.w, raw.h, cfa);
+    const S82GuideParams P = guide_params(raw.w, raw.h, cfa, t);
     const float* rp = raw.data.data();
     parallel_rows(g.h, threads, [&](int gy) {
         for (int gx = 0; gx < g.w; ++gx) {
@@ -223,13 +429,13 @@ std::vector<float> base_reference(const Guide& base, int threads) {
 }
 
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
-               float noise_scale, std::vector<uint8_t>& rej, int threads) {
-    const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale);
+               float noise_scale, const Unblocker& unb, std::vector<uint8_t>& rej, int threads) {
+    const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale, unb);
     rej.assign((size_t)alt.w * alt.h, 0);
     parallel_rows(alt.h, threads, [&](int gy) {
         for (int gx = 0; gx < alt.w; ++gx)
-            rej[(size_t)gy * alt.w + gx] =
-                s82_to_u8(s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut, P, gx, gy));
+            rej[(size_t)gy * alt.w + gx] = s82_to_u8(
+                s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut, unb.data.data(), P, gx, gy));
     });
 }
 
@@ -263,6 +469,7 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
     P.out_row0 = out_row0; P.use_mask = is_base ? 0 : 1;
     for (int k = 0; k < 4; ++k) { P.fso[k] = f.flow.fso[k]; P.unpack_rg[k] = kUnpackRG[k]; }
     P.unpack_b[0] = kUnpackB[0]; P.unpack_b[1] = kUnpackB[1];
+    for (int k = 0; k < 4; ++k) P.eps[k] = f.eps[k];
     P.fbp[0] = kMergeBorderGuidePx / ctx.Wg; P.fbp[1] = kMergeBorderGuidePx / ctx.Hg;
     P.fbp[2] = 1.f - kMergeBorderGuidePx / ctx.Wg; P.fbp[3] = 1.f - kMergeBorderGuidePx / ctx.Hg;
     P.cfa = ctx.cfa;
