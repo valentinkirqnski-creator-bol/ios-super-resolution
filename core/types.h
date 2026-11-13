@@ -1722,6 +1722,10 @@ struct Config {
     // All constants are Pixel-sensor-calibrated in the APK; these defaults are
     // starting values and need on-device A/B. Off by default.
     bool  robustness_gcam_enabled = false;
+    // GCam SABRE 8.2 (the robustness_gcam_enabled pipeline): multiplier on the simulated noise LUT the
+    // rejection subtracts / floors against. 1 = the LUT as filled from the DNG NoiseProfile; higher keeps
+    // more of each comparison frame (brighter mask), 0 = noise-blind.
+    float sabre_noise_scale = 1.0f;
     float gcam_mult = 1.0f;        // kDistanceMultiplier (GCam = 1)
     float gcam_thresh = 0.0f;      // kRejectionThreshold, additive inside exp2 (GCam = 0)
     float gcam_boost = 6.0f;       // extra_motion_robustness_boost in irregular+high-detail tiles (GCam = 6)

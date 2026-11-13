@@ -691,6 +691,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_structure_min_window"]) cfg.gcam_structure_min_window = std::max(1, tuning[@"gcam_structure_min_window"].intValue);
     if (tuning[@"gcam_sabre_kernel"])        cfg.gcam_sabre_kernel = tuning[@"gcam_sabre_kernel"].boolValue;
     if (tuning[@"gcam_cov_scale"])           cfg.gcam_cov_scale = tuning[@"gcam_cov_scale"].floatValue;
+    if (tuning[@"sabre_noise_scale"])        cfg.sabre_noise_scale = tuning[@"sabre_noise_scale"].floatValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])

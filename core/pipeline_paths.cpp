@@ -21,7 +21,7 @@
 #include "fb_confidence.h"
 #include "burst_consensus.h"
 #include "cref.h"
-#include "sabre61.h"
+#include "sabre82.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1262,19 +1262,21 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 } // namespace
 
 // ================================================================================================
-// GCam 6.1.021 SABRE (Config::robustness_gcam_enabled). Everything after ALIGNMENT is SABRE:
-//   per frame : guide + structure tensor + kernel covariance (STAGE 1), rejection vs the base guide
-//               (STAGE 2), 5x5 dilate, copy_mask into the R8 accumulated frame weights
-//   per band  : merge of every alt frame (STAGE 3), base last with undercoverage kernel widening and
-//               the normalising blend, then the 3-level post-merge denoiser (STAGE 4)
+// GCam 8.2.300 SABRE (Config::robustness_gcam_enabled). Everything after ALIGNMENT is SABRE:
+//   per frame : guide (RGB + signed variance) + green structure tensor + RGB10_A2 kernel covariance;
+//               base frame additionally its BaseFrameRefColor; comparison frames: rejection against it
+//               (noise-subtracted variance distance) and the dilate to the half-guide grid
+//   per band  : merge of every comparison frame, the base last with frame weight 1, then SabreDehomogenize
 // Alignment is ours, unchanged (pre-align plan, global warp, block match / LK, half-tile / dense /
 // feature-metric refinements); its result is handed to SABRE as GCam's flow texture (one vector per
-// tile, NEAREST). None of the hhsr robustness / kernel / merge / mask-editor stages run.
-// Per-pixel math: core/sabre61_shared.h. Reference: Documents/super/SABRE_6.1_COMPLETE_REFERENCE.md.
-static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& loader,
-                                   const Config& cfg, const std::string& dng_path,
-                                   const ProgressFn& progress, int maxPreviewDim) {
-    using namespace sabre61;
+// tile after the 3x3 median, NEAREST). None of the hhsr robustness / kernel / merge / mask stages run.
+// 8.2's post-merge spatial-merge / RAISR resolve chain is not part of the reference; the dehomogenized
+// merge is the output. Per-pixel math: core/sabre82_shared.h. Reference:
+// Documents/super/SABRE_8.2_COMPLETE_REFERENCE.md.
+static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader,
+                                 const Config& cfg, const std::string& dng_path,
+                                 const ProgressFn& progress, int maxPreviewDim) {
+    using namespace sabre82;
     prof_reset();
     const double t_burst = prof_now_ms();
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
@@ -1293,8 +1295,8 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
         report("Error: SABRE needs the reference pixels on the host", 1.f);
         return Image();
     }
-    if (!work.bayer_mode || (ref.h & 1) || (ref.w & 1)) {
-        report("Error: SABRE needs an even-sized Bayer frame", 1.f);
+    if (!work.bayer_mode || (ref.h & 3) || (ref.w & 3)) {
+        report("Error: SABRE needs a Bayer frame with sides divisible by 4", 1.f);
         return Image();
     }
     clear_align_ref_ica_cache();
@@ -1318,46 +1320,40 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
     const int merge_ts = std::max(1, tile_size >> halftile_levels);
     Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, work.grey_tile_size(tile_size)), work.bm_factors);
 
-    const int Wr = ref.w, Hr = ref.h, Wg = Wr / 2, Hg = Hr / 2;
+    const int Wr = ref.w, Hr = ref.h, Wg = Wr / 2, Hg = Hr / 2, Wm = Wg / 2, Hm = Hg / 2;
     const int Wo = (int)std::lround(work.scale * Wr), Ho = (int)std::lround(work.scale * Hr);
-    const S61Cfa cfa = cfa_from(work.cfa);
-    float slope[3], offset[3], lut[80], yuv[4];
+    const S82Cfa cfa = cfa_from(work.cfa);
+    const float noise_scale = std::max(0.f, work.sabre_noise_scale);
+    float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
-    build_noise_lut(slope, offset, cfa, lut);
-    yuv_noise_model(slope, offset, yuv);
-    {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "SABRE 6.1: %dx%d -> %dx%d, %d frames, noise %s, LUT std floor %.3g..%.3g",
-                      Wr, Hr, Wo, Ho, frame_count, work.has_noise_profile ? "DNG" : "fallback", lut[3], lut[9 * 4 + 3]);
-        report(buf, 0.05f);
-    }
-    auto to_half = [](const std::vector<float>& v) {
-        std::vector<uint16_t> h(v.size());
-        for (size_t i = 0; i < v.size(); ++i) h[i] = s61_f2h_bits(v[i]);
-        return h;
-    };
-    // Every SABRE stage runs on the GPU; the CPU versions (same arithmetic, core/sabre61_shared.h) are the
+    build_noise_lut(slope, offset, lut);
+
+    // Every stage runs on the GPU; the CPU versions (same arithmetic, core/sabre82_shared.h) are the
     // fallback if Metal is unavailable or a command buffer fails.
     const double t_g0 = prof_now_ms();
     Guide base_guide;
-    std::vector<uint16_t> base_cov_h;
+    std::vector<float> base_ref;
     bool gpu = false;
 #if defined(__APPLE__)
-    gpu = metal_base_guide(ref, cfa, lut, base_guide, base_cov_h);
-    struct S61BurstGuard { ~S61BurstGuard() { metal_end_burst(); } } s61_burst_guard;
+    gpu = metal_base_stages(ref, cfa, lut, base_guide, base_ref);
+    struct S82BurstGuard { ~S82BurstGuard() { metal_end_burst(); } } s82_burst_guard;
 #endif
     if (!gpu) {
         base_guide = compute_guide(ref, cfa, lut, work.num_threads);
-        base_cov_h = to_half(base_guide.cov3);
-        base_guide.cov3.clear();
+        base_ref = base_reference(base_guide, work.num_threads);
     }
-    prof_add_cpu("sabre:guide", prof_now_ms() - t_g0);
-    report(gpu ? "SABRE: running on the GPU" : "SABRE: running on the CPU", 0.055f);
+    prof_add_cpu("sabre:base", prof_now_ms() - t_g0);
+    {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g",
+                      gpu ? "GPU" : "CPU", Wr, Hr, Wo, Ho, frame_count,
+                      work.has_noise_profile ? "DNG" : "fallback", noise_scale);
+        report(buf, 0.05f);
+    }
 
-    std::vector<uint8_t> acc((size_t)Wg * Hg, 0);         // accumulated_frame_weights (R8)
     std::vector<std::unique_ptr<Image>> comp_raws;
     std::vector<std::unique_ptr<MergeFrame>> frames;
-    Image keep_sum;                                       // save-mask export: sum of keep masks
+    Image keep_sum;                                       // save-mask export: sum of the dilated masks
     bool have_keep = false;
     int pos = 0;
     for (int k = 0; k < frame_count; ++k) {
@@ -1417,20 +1413,20 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
         mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work);
         bool done = false;
 #if defined(__APPLE__)
-        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, mf->cov_h, mf->keep, acc);
+        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, noise_scale, mf->cov, mf->keep);
 #endif
         if (!done) {
             Guide g = compute_guide(comp, cfa, lut, work.num_threads);
             std::vector<uint8_t> rej;
-            rejection(base_guide, g, mf->flow, lut, rej, work.num_threads);
+            rejection(base_ref, g, mf->flow, lut, noise_scale, rej, work.num_threads);
             dilate(rej, Wg, Hg, mf->keep, work.num_threads);
-            copy_mask_accumulate(mf->keep, acc);
-            mf->cov_h = to_half(g.cov3);
+            mf->cov = std::move(g.cov);
         }
-        prof_add_cpu("sabre:guide+reject+dilate", prof_now_ms() - t_s);
+        prof_add_cpu("sabre:frame", prof_now_ms() - t_s);
         if (work.robustness_save_mask) {
-            if (!have_keep) { keep_sum = Image(Hg, Wg, 1); have_keep = true; }
-            for (size_t i = 0; i < mf->keep.size(); ++i) keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
+            if (!have_keep) { keep_sum = Image(Hm, Wm, 1); have_keep = true; }
+            for (size_t i = 0; i < mf->keep.size() && i < keep_sum.data.size(); ++i)
+                keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
         }
         comp_raws.push_back(std::make_unique<Image>(std::move(comp)));
         mf->raw = comp_raws.back().get();
@@ -1443,12 +1439,14 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
 
     MergeFrame base;
     base.raw = &ref;
-    base.cov_h = std::move(base_cov_h);
+    base.cov = std::move(base_guide.cov);
     base.flow = zero_flow_tex(frames.empty() ? std::max(1, Wr / merge_ts) : frames[0]->flow.nx,
                               frames.empty() ? std::max(1, Hr / merge_ts) : frames[0]->flow.ny, merge_ts, Wr, Hr);
     base_guide = Guide();
-    std::vector<const MergeFrame*> alts;
-    for (auto& f : frames) alts.push_back(f.get());
+    base_ref.clear(); base_ref.shrink_to_fit();
+    std::vector<const MergeFrame*> merge_frames;
+    for (auto& f : frames) merge_frames.push_back(f.get());
+    merge_frames.push_back(&base);   // base frame last, frame weight 1
 
     // ---- output ----
     const int nch = 3;
@@ -1468,16 +1466,15 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
     const int ph = std::max(1, (int)(Ho * pscale)), pw = std::max(1, (int)(Wo * pscale));
     Image preview(ph, pw, 3);
     BandContext ctx;
-    ctx.Wo = Wo; ctx.Ho = Ho; ctx.Wr = Wr; ctx.Hr = Hr; ctx.Wg = Wg; ctx.Hg = Hg;
-    ctx.cfa = cfa; for (int i = 0; i < 4; ++i) ctx.yuv_noise[i] = yuv[i];
-    ctx.acc = &acc; ctx.threads = work.num_threads; ctx.use_rejection = true;
-    const int band = std::max(16, std::min(Ho, (int)((48ull << 20) / ((size_t)Wo * 3 * 4 * 3))));
+    ctx.Wo = Wo; ctx.Ho = Ho; ctx.Wr = Wr; ctx.Hr = Hr; ctx.Wg = Wg; ctx.Hg = Hg; ctx.Wm = Wm; ctx.Hm = Hm;
+    ctx.cfa = cfa; ctx.threads = work.num_threads;
+    const int band = std::max(16, std::min(Ho, (int)((48ull << 20) / ((size_t)Wo * 3 * 4 * 2))));
     std::vector<float> rgb, ones;
     std::vector<uint16_t> row16;
     const double t_m = prof_now_ms();
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
-        if (!merge_denoise_band(alts, base, ctx, y0, y1, true, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
+        if (!merge_band(merge_frames, ctx, y0, y1, gpu, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
             report("Error: SABRE merge failed", 1.f);
             writer.close();
             return Image();
@@ -1487,13 +1484,13 @@ static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& load
         writer.write_rows(row16.data(), bh);
         report("SABRE: merging", 0.48f + 0.50f * (float)y1 / Ho);
     }
-    prof_add_cpu("sabre:merge+denoise", prof_now_ms() - t_m);
+    prof_add_cpu("sabre:merge", prof_now_ms() - t_m);
     writer.close();
     if (work.robustness_save_mask && have_keep)
         write_robustness_mask_pgm(keep_sum, (int)frames.size(), dng_path, "", Hr, Wr);
     if (prof_enabled()) {
         char hdr[160];
-        std::snprintf(hdr, sizeof(hdr), "\nSABRE 6.1 burst wall %.1f ms over %d frames\n", prof_now_ms() - t_burst, frame_count);
+        std::snprintf(hdr, sizeof(hdr), "\nSABRE 8.2 burst wall %.1f ms over %d frames\n", prof_now_ms() - t_burst, frame_count);
         const std::string prof = prof_report() + hdr;
         std::printf("%s", prof.c_str());
         std::fflush(stdout);
@@ -1543,9 +1540,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         return im;
     };
 
-    // GCam SABRE 6.1: when on, everything after alignment is SABRE (see process_burst_sabre61).
+    // GCam SABRE 8.2: when on, everything after alignment is SABRE (see process_burst_sabre).
     if (cfg.robustness_gcam_enabled)
-        return process_burst_sabre61(frame_count, loader, cfg, dng_path, progress, maxPreviewDim);
+        return process_burst_sabre(frame_count, loader, cfg, dng_path, progress, maxPreviewDim);
 
     prof_reset();
     prof_mark_memory("burst:begin");
