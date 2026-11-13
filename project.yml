@@ -53,6 +53,7 @@ targets:
           - "mann.cpp"
           - "fb_confidence.cpp"
           - "burst_consensus.cpp"
+          - "sabre61.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"
@@ -70,7 +71,9 @@ targets:
           - "prof.mm"
           - "neural_flow.mm"
           - "robustness_nn.mm"
+          - "sabre61_metal.mm"
           - "HHSRKernels.metal"
+          - "Sabre61Kernels.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.

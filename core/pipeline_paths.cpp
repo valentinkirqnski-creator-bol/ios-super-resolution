@@ -21,6 +21,7 @@
 #include "fb_confidence.h"
 #include "burst_consensus.h"
 #include "cref.h"
+#include "sabre61.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1260,6 +1261,248 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 
 } // namespace
 
+// ================================================================================================
+// GCam 6.1.021 SABRE (Config::robustness_gcam_enabled). Everything after ALIGNMENT is SABRE:
+//   per frame : guide + structure tensor + kernel covariance (STAGE 1), rejection vs the base guide
+//               (STAGE 2), 5x5 dilate, copy_mask into the R8 accumulated frame weights
+//   per band  : merge of every alt frame (STAGE 3), base last with undercoverage kernel widening and
+//               the normalising blend, then the 3-level post-merge denoiser (STAGE 4)
+// Alignment is ours, unchanged (pre-align plan, global warp, block match / LK, half-tile / dense /
+// feature-metric refinements); its result is handed to SABRE as GCam's flow texture (one vector per
+// tile, NEAREST). None of the hhsr robustness / kernel / merge / mask-editor stages run.
+// Per-pixel math: core/sabre61_shared.h. Reference: Documents/super/SABRE_6.1_COMPLETE_REFERENCE.md.
+static Image process_burst_sabre61(int frame_count, const RawFrameLoaderFn& loader,
+                                   const Config& cfg, const std::string& dng_path,
+                                   const ProgressFn& progress, int maxPreviewDim) {
+    using namespace sabre61;
+    prof_reset();
+    const double t_burst = prof_now_ms();
+    auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
+    Config work = cfg;
+    work.burst_frame_count = frame_count;
+
+    report("SABRE: loading reference", 0.02f);
+    Image first_ref = loader(0, work, true, 0, 0);
+    if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
+    PrealignPlan prealign = build_prealign_plan_from_first(frame_count, loader, work, first_ref, progress);
+    const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
+    Image ref;
+    if (ref_index == 0) ref = std::move(first_ref);
+    else { first_ref = Image(); ref = loader(ref_index, work, true, 0, 0); }
+    if (ref.h <= 0 || ref.w <= 0 || ref.data.size() < (size_t)ref.h * ref.w) {
+        report("Error: SABRE needs the reference pixels on the host", 1.f);
+        return Image();
+    }
+    if (!work.bayer_mode || (ref.h & 1) || (ref.w & 1)) {
+        report("Error: SABRE needs an even-sized Bayer frame", 1.f);
+        return Image();
+    }
+    clear_align_ref_ica_cache();
+    f32 ref_brightness = 0.f;
+    tune_config_snr(ref, work, &ref_brightness);   // alignment tile size + the rest of the aligner's tuning
+#if defined(__APPLE__)
+    metal_set_grey_force_host(true);               // our aligner runs on host greys here (no frame residency)
+#endif
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    int halftile_levels = 0;
+    if (work.halftile_refine_enabled) {
+        const int target = work.halftile_refine_target_ts;
+        if (target <= 0) halftile_levels = 1;
+        else {
+            int t = tile_size;
+            while (t > target && halftile_levels < 4) { t >>= 1; ++halftile_levels; }
+            if (halftile_levels < 1) halftile_levels = 1;
+        }
+    }
+    const int merge_ts = std::max(1, tile_size >> halftile_levels);
+    Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, work.grey_tile_size(tile_size)), work.bm_factors);
+
+    const int Wr = ref.w, Hr = ref.h, Wg = Wr / 2, Hg = Hr / 2;
+    const int Wo = (int)std::lround(work.scale * Wr), Ho = (int)std::lround(work.scale * Hr);
+    const S61Cfa cfa = cfa_from(work.cfa);
+    float slope[3], offset[3], lut[80], yuv[4];
+    noise_model_s2(work, slope, offset);
+    build_noise_lut(slope, offset, cfa, lut);
+    yuv_noise_model(slope, offset, yuv);
+    {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "SABRE 6.1: %dx%d -> %dx%d, %d frames, noise %s, LUT std floor %.3g..%.3g",
+                      Wr, Hr, Wo, Ho, frame_count, work.has_noise_profile ? "DNG" : "fallback", lut[3], lut[9 * 4 + 3]);
+        report(buf, 0.05f);
+    }
+    auto to_half = [](const std::vector<float>& v) {
+        std::vector<uint16_t> h(v.size());
+        for (size_t i = 0; i < v.size(); ++i) h[i] = s61_f2h_bits(v[i]);
+        return h;
+    };
+    // Every SABRE stage runs on the GPU; the CPU versions (same arithmetic, core/sabre61_shared.h) are the
+    // fallback if Metal is unavailable or a command buffer fails.
+    const double t_g0 = prof_now_ms();
+    Guide base_guide;
+    std::vector<uint16_t> base_cov_h;
+    bool gpu = false;
+#if defined(__APPLE__)
+    gpu = metal_base_guide(ref, cfa, lut, base_guide, base_cov_h);
+    struct S61BurstGuard { ~S61BurstGuard() { metal_end_burst(); } } s61_burst_guard;
+#endif
+    if (!gpu) {
+        base_guide = compute_guide(ref, cfa, lut, work.num_threads);
+        base_cov_h = to_half(base_guide.cov3);
+        base_guide.cov3.clear();
+    }
+    prof_add_cpu("sabre:guide", prof_now_ms() - t_g0);
+    report(gpu ? "SABRE: running on the GPU" : "SABRE: running on the CPU", 0.055f);
+
+    std::vector<uint8_t> acc((size_t)Wg * Hg, 0);         // accumulated_frame_weights (R8)
+    std::vector<std::unique_ptr<Image>> comp_raws;
+    std::vector<std::unique_ptr<MergeFrame>> frames;
+    Image keep_sum;                                       // save-mask export: sum of keep masks
+    bool have_keep = false;
+    int pos = 0;
+    for (int k = 0; k < frame_count; ++k) {
+        if (k == ref_index) continue;
+        report("SABRE: frame " + std::to_string(pos + 1) + "/" + std::to_string(frame_count - 1),
+               0.06f + 0.40f * (float)pos / std::max(1, frame_count - 1));
+        ++pos;
+        Image comp = loader(k, work, false, ref.h, ref.w);
+        if (comp.h != ref.h || comp.w != ref.w || comp.data.size() < (size_t)comp.h * comp.w) continue;
+        // ---- alignment (ours, unchanged) ----
+        const double t_al = prof_now_ms();
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        PrealignTransform init;
+        if (k < (int)prealign.from_reference.size()) init = prealign.from_reference[(size_t)k];
+        const f32 gsx = (f32)ref_grey.w / (f32)Wr, gsy = (f32)ref_grey.h / (f32)Hr;
+        GlobalWarp gw = estimate_global_warp(ref_grey, comp_grey, comp.h, comp.w, k, work);
+        const Image* align_comp = gw.warped ? &gw.warped_grey : &comp_grey;
+#if defined(__APPLE__)
+        metal_invalidate_sticky_grey();
+#endif
+        FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
+                               gw.warped ? 0.f : init.dx * gsx, gw.warped ? 0.f : init.dy * gsy,
+                               gw.warped ? 0.f : init.angle);
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile_size,
+                                     work.r_Mt, work.num_threads, work.grey_tile_size(tile_size));
+        if (gw.warped) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i];
+            flow.has_global_h = true;
+        }
+        if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
+        const Image& cg = gw.warped ? gw.warped_grey : comp_grey;
+        for (int lvl = 0; lvl < halftile_levels; ++lvl) {
+            const int level_ts = std::max(2, tile_size >> lvl);
+            const bool last = (lvl == halftile_levels - 1);
+            halftile_subdivide_refine(flow, ref_grey, cg, work, level_ts, comp.h, comp.w, !(last && merge_ts <= 4));
+        }
+        if (work.dense_flow_enabled) {
+            const int Dd = std::max(1, work.dense_flow_downsample);
+            if (Dd > 1) dense_lk_refine(flow, downsample_box_grey(ref_grey, Dd), downsample_box_grey(cg, Dd),
+                                        work, merge_ts, comp.h, comp.w);
+            else dense_lk_refine(flow, ref_grey, cg, work, merge_ts, comp.h, comp.w);
+        }
+        if (work.feat_metric_refine_enabled) {
+            const int Dd = std::max(1, work.feat_metric_downsample);
+            if (Dd > 1) feat_metric_refine(flow, downsample_box_grey(ref_grey, Dd), downsample_box_grey(cg, Dd),
+                                           work, merge_ts, comp.h, comp.w);
+            else feat_metric_refine(flow, ref_grey, cg, work, merge_ts, comp.h, comp.w);
+        }
+        comp_grey = Image();
+        gw = GlobalWarp();
+        prof_add_cpu("sabre:align", prof_now_ms() - t_al);
+        if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) continue;
+
+        // ---- SABRE per-frame stages ----
+        const double t_s = prof_now_ms();
+        auto mf = std::make_unique<MergeFrame>();
+        mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work);
+        bool done = false;
+#if defined(__APPLE__)
+        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, mf->cov_h, mf->keep, acc);
+#endif
+        if (!done) {
+            Guide g = compute_guide(comp, cfa, lut, work.num_threads);
+            std::vector<uint8_t> rej;
+            rejection(base_guide, g, mf->flow, lut, rej, work.num_threads);
+            dilate(rej, Wg, Hg, mf->keep, work.num_threads);
+            copy_mask_accumulate(mf->keep, acc);
+            mf->cov_h = to_half(g.cov3);
+        }
+        prof_add_cpu("sabre:guide+reject+dilate", prof_now_ms() - t_s);
+        if (work.robustness_save_mask) {
+            if (!have_keep) { keep_sum = Image(Hg, Wg, 1); have_keep = true; }
+            for (size_t i = 0; i < mf->keep.size(); ++i) keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
+        }
+        comp_raws.push_back(std::make_unique<Image>(std::move(comp)));
+        mf->raw = comp_raws.back().get();
+        frames.push_back(std::move(mf));
+    }
+    ref_pyr = Pyramid();
+    ref_grey = Image();
+    clear_align_ref_ica_cache();
+    if (frames.empty()) report("SABRE: no comparison frame aligned - reference only", 0.46f);
+
+    MergeFrame base;
+    base.raw = &ref;
+    base.cov_h = std::move(base_cov_h);
+    base.flow = zero_flow_tex(frames.empty() ? std::max(1, Wr / merge_ts) : frames[0]->flow.nx,
+                              frames.empty() ? std::max(1, Hr / merge_ts) : frames[0]->flow.ny, merge_ts, Wr, Hr);
+    base_guide = Guide();
+    std::vector<const MergeFrame*> alts;
+    for (auto& f : frames) alts.push_back(f.get());
+
+    // ---- output ----
+    const int nch = 3;
+    DngStreamWriter writer;
+    const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
+    const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
+    const CaptureExif dng_exif = DngStreamWriter::exif_from_config(work);
+    if (!writer.open(dng_path, Wo, Ho, model, work.orientation,
+                     work.has_color_matrix ? work.color_matrix : nullptr, work.white_balance,
+                     work.bake_srgb, make, work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
+                     work.raw_prewhitened && !dng_unwhiten_active(work, nch),
+                     work.dng_codec, &dng_exif, work.num_threads)) {
+        report("Error: cannot open output DNG", 1.f);
+        return Image();
+    }
+    const float pscale = std::min(1.f, (float)maxPreviewDim / (float)std::max(Ho, Wo));
+    const int ph = std::max(1, (int)(Ho * pscale)), pw = std::max(1, (int)(Wo * pscale));
+    Image preview(ph, pw, 3);
+    BandContext ctx;
+    ctx.Wo = Wo; ctx.Ho = Ho; ctx.Wr = Wr; ctx.Hr = Hr; ctx.Wg = Wg; ctx.Hg = Hg;
+    ctx.cfa = cfa; for (int i = 0; i < 4; ++i) ctx.yuv_noise[i] = yuv[i];
+    ctx.acc = &acc; ctx.threads = work.num_threads; ctx.use_rejection = true;
+    const int band = std::max(16, std::min(Ho, (int)((48ull << 20) / ((size_t)Wo * 3 * 4 * 3))));
+    std::vector<float> rgb, ones;
+    std::vector<uint16_t> row16;
+    const double t_m = prof_now_ms();
+    for (int y0 = 0; y0 < Ho; y0 += band) {
+        const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
+        if (!merge_denoise_band(alts, base, ctx, y0, y1, true, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
+            report("Error: SABRE merge failed", 1.f);
+            writer.close();
+            return Image();
+        }
+        if (ones.size() < rgb.size()) ones.assign(rgb.size(), 1.f);
+        encode_band_rows_ptr(rgb.data(), ones.data(), y0, bh, work, nch, preview, pscale, ph, pw, Wo, row16);
+        writer.write_rows(row16.data(), bh);
+        report("SABRE: merging", 0.48f + 0.50f * (float)y1 / Ho);
+    }
+    prof_add_cpu("sabre:merge+denoise", prof_now_ms() - t_m);
+    writer.close();
+    if (work.robustness_save_mask && have_keep)
+        write_robustness_mask_pgm(keep_sum, (int)frames.size(), dng_path, "", Hr, Wr);
+    if (prof_enabled()) {
+        char hdr[160];
+        std::snprintf(hdr, sizeof(hdr), "\nSABRE 6.1 burst wall %.1f ms over %d frames\n", prof_now_ms() - t_burst, frame_count);
+        const std::string prof = prof_report() + hdr;
+        std::printf("%s", prof.c_str());
+        std::fflush(stdout);
+        prof_save_report(prof);
+    }
+    report("Done", 1.f);
+    return preview;
+}
+
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
                                   const Config& cfg, const std::string& dng_path,
                                   const ProgressFn& progress, int maxPreviewDim) {
@@ -1299,6 +1542,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         return im;
     };
+
+    // GCam SABRE 6.1: when on, everything after alignment is SABRE (see process_burst_sabre61).
+    if (cfg.robustness_gcam_enabled)
+        return process_burst_sabre61(frame_count, loader, cfg, dng_path, progress, maxPreviewDim);
 
     prof_reset();
     prof_mark_memory("burst:begin");
