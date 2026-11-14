@@ -369,6 +369,7 @@ struct TuningParams: Equatable, Codable {
     /// Offset-unit / size calibration for the GCam kernel (P = ln2 * scale * rr).
     var gcam_cov_scale: Float = 1.0
     var sabre_noise_scale: Float = 1.0
+    var sabre_noise_blind: Bool = false
     var sabre_resid_shift_enabled: Bool = false
     /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
     /// literal RGB value is 0.090. Defaulted off because our variances are already
@@ -626,7 +627,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_resid_shift_enabled,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_resid_shift_enabled,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -810,6 +811,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_kernel = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_kernel) ?? gcam_sabre_kernel
         gcam_cov_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_cov_scale) ?? gcam_cov_scale
         sabre_noise_scale = try c.decodeIfPresent(Float.self, forKey: .sabre_noise_scale) ?? sabre_noise_scale
+        sabre_noise_blind = try c.decodeIfPresent(Bool.self, forKey: .sabre_noise_blind) ?? sabre_noise_blind
         sabre_resid_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .sabre_resid_shift_enabled) ?? sabre_resid_shift_enabled
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
@@ -2695,6 +2697,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_kernel": NSNumber(value: tuningParams.gcam_sabre_kernel),
             "gcam_cov_scale": NSNumber(value: tuningParams.gcam_cov_scale),
             "sabre_noise_scale": NSNumber(value: tuningParams.sabre_noise_scale),
+            "sabre_noise_blind": NSNumber(value: tuningParams.sabre_noise_blind),
             "sabre_resid_shift_enabled": NSNumber(value: tuningParams.sabre_resid_shift_enabled),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
@@ -2820,6 +2823,17 @@ final class CameraModel: NSObject, ObservableObject {
             var robURLs = maskSuffixes
                 .map { URL(fileURLWithPath: base + $0) }
                 .filter { FileManager.default.fileExists(atPath: $0.path) }
+            // SABRE 8.2 per-frame keep masks (<stem>_keep_fNN.pgm, quarter raw res, white = kept),
+            // written by process_burst_sabre beside the average mask.
+            if tuningParams.robustness_save_mask && tuningParams.robustness_gcam_enabled {
+                let dir = outURL.deletingLastPathComponent()
+                let prefix = outURL.deletingPathExtension().lastPathComponent + "_keep_f"
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+                robURLs += names
+                    .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".pgm") }
+                    .sorted()
+                    .map { dir.appendingPathComponent($0) }
+            }
             // Structure maps: one per frame, reference included
             // (<stem>_structure_fNN[_ref].ppm, written by core/structure_map.cpp).
             if tuningParams.structure_map_save {

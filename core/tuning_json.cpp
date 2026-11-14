@@ -278,6 +278,8 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_cov_blurred_sigma"))  cfg.gcam_cov_blurred_sigma = fv("gcam_cov_blurred_sigma");
     if (has("gcam_cov_gradient_transition")) cfg.gcam_cov_gradient_transition = fv("gcam_cov_gradient_transition");
     if (has("gcam_cov_scale"))          cfg.gcam_cov_scale = fv("gcam_cov_scale");
+    if (has("sabre_noise_scale"))          cfg.sabre_noise_scale = fv("sabre_noise_scale");
+    if (has("sabre_noise_blind"))          cfg.sabre_noise_blind = bv("sabre_noise_blind");
     if (has("sabre_resid_shift_enabled"))  cfg.sabre_resid_shift_enabled = bv("sabre_resid_shift_enabled");
     if (has("sabre_resid_shift_tol_px"))   cfg.sabre_resid_shift_tol_px = fv("sabre_resid_shift_tol_px");
     if (has("sabre_resid_shift_width_px")) cfg.sabre_resid_shift_width_px = fv("sabre_resid_shift_width_px");

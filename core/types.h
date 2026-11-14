@@ -1726,6 +1726,11 @@ struct Config {
     // rejection subtracts / floors against. 1 = the LUT as filled from the DNG NoiseProfile; higher keeps
     // more of each comparison frame (brighter mask), 0 = noise-blind.
     float sabre_noise_scale = 1.0f;
+    // SABRE 8.2 as it runs on a Mali-G71 (Galaxy A20e etc.): the RGBA32F noise LUT is sampled with LINEAR
+    // filtering, which the driver treats as an incomplete texture and reads as 0, so GCam there is noise-blind
+    // in BOTH the guide (green-only switch) and the rejection. When on, the LUT is zeroed before either stage
+    // (CPU and GPU). The SNR estimate / kernel curves and the Unblocker (CPU-side in GCam) keep the noise model.
+    bool  sabre_noise_blind = false;
     // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
     // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
     // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on

@@ -1327,6 +1327,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
     build_noise_lut(slope, offset, lut);
+    if (work.sabre_noise_blind) std::fill(lut, lut + 80, 0.f);   // Mali-G71: the LINEAR RGBA32F LUT reads 0
     // Per-capture kernel covariance: EstimateSnr on the green noise model at the reference's mean level,
     // K = sqrt(N/12)*SNR through the 6 MergeOptions curves (same for every frame of the burst).
     const CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
@@ -1449,6 +1450,17 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         }
         prof_add_cpu("sabre:frame", prof_now_ms() - t_s);
         if (work.robustness_save_mask) {
+            // This frame's keep mask as GCam's MASKOP texture: quarter raw res, 255 = keep fully.
+            // <stem>_keep_fNN.pgm beside the DNG (NN = burst index of the comparison frame).
+            std::string mp = dng_path;
+            if (mp.size() >= 4 && mp.compare(mp.size() - 4, 4, ".dng") == 0) mp.resize(mp.size() - 4);
+            char sfx[32];
+            std::snprintf(sfx, sizeof(sfx), "_keep_f%02d.pgm", k);
+            if (FILE* f = std::fopen((mp + sfx).c_str(), "wb")) {
+                std::fprintf(f, "P5\n%d %d\n255\n", Wm, Hm);
+                std::fwrite(mf->keep.data(), 1, std::min(mf->keep.size(), (size_t)Wm * Hm), f);
+                std::fclose(f);
+            }
             if (!have_keep) { keep_sum = Image(Hm, Wm, 1); have_keep = true; }
             for (size_t i = 0; i < mf->keep.size() && i < keep_sum.data.size(); ++i)
                 keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
