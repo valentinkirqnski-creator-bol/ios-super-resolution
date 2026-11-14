@@ -74,6 +74,12 @@ targets:
           - "sabre82_metal.mm"
           - "HHSRKernels.metal"
           - "Sabre82Kernels.metal"
+      # SABRE Mali-G71 bit-exact kernels: shipped as SOURCE (not in default.metallib) and compiled at run time
+      # without fast math by core/sabre82_metal.mm, which splices the shared header into the kernel text.
+      - path: core/Sabre82MaliKernels.metal
+        buildPhase: resources
+      - path: core/sabre82_shared.h
+        buildPhase: resources
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.

@@ -789,6 +789,16 @@ struct Config {
     // third.
     bool flow_upsample_candidates = true;
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
+    // GCam 8.2 EstimateGlobalAlignment (AlignPyramid::AlignAlt, libgcastartup FUN_01415400 / FUN_01419004 /
+    // FUN_01419280): after the coarsest level, every tile's displacement votes (truncated to an integer, clamped
+    // to +-64) into a 129x129 histogram; the peak if it has >= 10 votes, else the vote-weighted mean, is ONE
+    // global translation. GCam hands it to UpsampleAlignmentHalide as "external_candidates": at each finer
+    // level's candidate upsample it is a 4th candidate per tile next to the parent and its two neighbours, and a
+    // tile takes it only when its block-match cost is lower (cost x align_global_candidate_bias). Translation
+    // only -- no rotation, no pixel warp. Only acts with flow_upsample_candidates (the bilinear upsampler has no
+    // candidate test). Off by default.
+    bool align_global_candidate = false;
+    float align_global_candidate_bias = 1.0f;
 
     // Sub-pixel block matching (HDR+, Hasinoff et al. 2016 supplement): after a
     // level's integer search, fit a least-squares quadratic to the 3x3 L2 cost
@@ -1733,9 +1743,22 @@ struct Config {
     bool  sabre_noise_blind = false;
     // SABRE 8.2 bit-exact to a Mali-G71 (A20e) run: the device's rasterizer tex_coord, fixed-point LINEAR
     // sampler with fp16 accumulation, exact NEAREST, fp16 gathers, FMA bicubic taps and the zero-reading noise LUT
-    // (implies sabre_noise_blind). Base reference, rejection and dilate run on the CPU (the fast-math Metal
-    // build can't hold them to the bit); the merge stays on the GPU. See s82m_* in core/sabre82_shared.h.
+    // (noise-blind unless sabre_mali_noise_model). See s82m_* in core/sabre82_shared.h.
     bool  sabre_mali_exact = false;
+    // sabre_mali_exact's guide / base reference / rejection / dilate on the GPU: core/Sabre82MaliKernels.metal,
+    // compiled at first use with fast math off (the same s82m_* text as the CPU model; byte-identical to it in a
+    // CPU emulation of the GPU arithmetic). Falls back to the CPU stages if that library can't be built (the
+    // progress line says why). false = the CPU stages (reference).
+    bool  sabre_mali_gpu = true;
+    // sabre_mali_exact with the noise model ON: keep the DNG-derived noise LUT instead of the Mali's zero read
+    // (overrides sabre_noise_blind in this mode). The guide's green-only switch and the rejection's noise
+    // subtraction / floor / boost threshold then follow GCam's formulas; everything else stays Mali-exact.
+    bool  sabre_mali_noise_model = false;
+    // SABRE 8.2: save the accumulated robustness mask on its own: <stem>_robustness_accumulated.pgm beside the
+    // DNG, on GCam's mask grid (quarter raw res, the MASKOP texture size), value = mean keep over the
+    // comparison frames (255 = every frame kept fully). The same quantity as GCam's AccumulateMergeMask
+    // (which stores sum / 15). Independent of robustness_save_mask (which also writes every per-frame mask).
+    bool  sabre_save_accumulated_mask = false;
     // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
     // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
     // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on

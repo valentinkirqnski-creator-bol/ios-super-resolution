@@ -6,6 +6,7 @@
 #include "sabre82_shared.h"
 #include "types.h"
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace hhsr {
@@ -156,13 +157,17 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
 // GPU per-frame stages (core/sabre82_metal.mm); false = not run, the caller uses the CPU stages.
 // metal_base_stages: guide + kernel of the base frame and its BaseFrameRefColor, kept resident for the burst;
 // returns the guide (host copy) and the base reference colour (host copy) for a CPU fallback.
+// mali: the Mali-G71 bit-exact kernels (core/Sabre82MaliKernels.metal, compiled at first use); the caller passes
+// gcam_bayer_input() as the frame. False if that library is unavailable (metal_mali_available says why).
 bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80], const GuideTuning& t,
-                       Guide& guide, std::vector<float>& base_ref);
+                       Guide& guide, std::vector<float>& base_ref, bool mali = false);
 // metal_frame_stages: guide + kernel of one comparison frame, rejection against the resident base reference,
 // dilate. Returns the kernel covariance codes and the dilated mask.
 bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cfa, const float lut[80],
                         const GuideTuning& t, float noise_scale, const Unblocker& unb, const ResidShift& rs,
-                        std::vector<uint16_t>& cov, std::vector<uint8_t>& keep);
+                        std::vector<uint16_t>& cov, std::vector<uint8_t>& keep, bool mali = false);
+// Compiles the Mali-exact library on first call; *status = the variant that compiled, or the failure.
+bool metal_mali_available(std::string* status);
 void metal_end_burst();
 bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandContext& ctx, int y0, int y1,
                       std::vector<float>& out_rgb);

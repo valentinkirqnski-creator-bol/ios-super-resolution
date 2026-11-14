@@ -32,7 +32,10 @@
 #define s82_sqrt(x) sqrt(x)
 #define s82_exp2(x) exp2(x)
 #define s82_fabs(x) fabs(x)
-static inline float s82_q16(float x) { return float(half(x)); }
+#define S82_U32 uint
+#define S82_U16 ushort
+#define S82_F2U(f) as_type<uint>(f)
+#define S82_U2F(u) as_type<float>(u)
 #else
 #include <math.h>
 #include <stdint.h>
@@ -44,40 +47,52 @@ static inline float s82_q16(float x) { return float(half(x)); }
 #define s82_sqrt(x) sqrtf(x)
 #define s82_exp2(x) exp2f(x)
 #define s82_fabs(x) fabsf(x)
+#define S82_U32 uint32_t
+#define S82_U16 uint16_t
+S82_INLINE uint32_t s82_f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+S82_INLINE float s82_u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+#define S82_F2U(f) s82_f2u(f)
+#define S82_U2F(u) s82_u2f(u)
+#endif
 // fp32 <-> fp16 bits, round-to-nearest-even (what storing into an RGBA16F texture does), portable.
-S82_INLINE uint16_t s82_f2h_bits(float f) {
-    uint32_t u; memcpy(&u, &f, 4);
-    const uint32_t sign = (u >> 16) & 0x8000u;
-    uint32_t a = u & 0x7fffffffu;
-    if (a >= 0x7f800000u) return (uint16_t)(sign | 0x7c00u | (a > 0x7f800000u ? 0x200u : 0u));
-    if (a >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u);
-    uint32_t h;
+S82_INLINE S82_U16 s82_f2h_bits(float f) {
+    const S82_U32 u = S82_F2U(f);
+    const S82_U32 sign = (u >> 16) & 0x8000u;
+    S82_U32 a = u & 0x7fffffffu;
+    if (a >= 0x7f800000u) return (S82_U16)(sign | 0x7c00u | (a > 0x7f800000u ? 0x200u : 0u));
+    if (a >= 0x477ff000u) return (S82_U16)(sign | 0x7c00u);
+    S82_U32 h;
     if (a < 0x38800000u) {
         const int e = (int)(a >> 23);
         if (e < 102) { h = 0; }
         else {
-            const uint32_t m = (a & 0x7fffffu) | 0x800000u;
+            const S82_U32 m = (a & 0x7fffffu) | 0x800000u;
             const int shift = 126 - e;
-            const uint32_t q = m >> shift, rem = m & ((1u << shift) - 1u), hf = 1u << (shift - 1);
+            const S82_U32 q = m >> shift, rem = m & ((1u << shift) - 1u), hf = 1u << (shift - 1);
             h = q + ((rem > hf || (rem == hf && (q & 1u))) ? 1u : 0u);
         }
     } else {
-        const uint32_t m = a & 0x1fffu;
+        const S82_U32 m = a & 0x1fffu;
         h = ((a - 0x38000000u) >> 13);
         if (m > 0x1000u || (m == 0x1000u && (h & 1u))) h += 1u;
     }
-    return (uint16_t)(sign | h);
+    return (S82_U16)(sign | h);
 }
-S82_INLINE float s82_h2f(uint16_t hb) {
-    const uint32_t he = (hb >> 10) & 0x1fu, hm = hb & 0x3ffu, sign = (uint32_t)(hb & 0x8000u) << 16;
-    uint32_t r;
+S82_INLINE float s82_h2f(S82_U16 hb) {
+    const S82_U32 he = (hb >> 10) & 0x1fu, hm = hb & 0x3ffu, sign = (S82_U32)(hb & 0x8000u) << 16;
+    S82_U32 r;
     if (he == 0) {
         if (hm == 0) r = sign;
-        else { float v = (float)hm * (1.0f / 16777216.0f); memcpy(&r, &v, 4); r |= sign; }
+        else r = S82_F2U((float)hm * (1.0f / 16777216.0f)) | sign;
     } else if (he == 31) r = sign | 0x7f800000u | (hm << 13);
     else r = sign | ((he + 112u) << 23) | (hm << 13);
-    float o; memcpy(&o, &r, 4); return o;
+    return S82_U2F(r);
 }
+// RGBA16F store. The CPU and the Mali-exact GPU library (S82_Q16_SOFT) round in software; the default GPU
+// library uses the hardware conversion.
+#if defined(__METAL_VERSION__) && !defined(S82_Q16_SOFT)
+static inline float s82_q16(float x) { return float(half(x)); }
+#else
 S82_INLINE float s82_q16(float f) { return s82_h2f(s82_f2h_bits(f)); }
 #endif
 
@@ -102,7 +117,9 @@ S82_INLINE S82F4 s82_f4(float x, float y, float z, float w) { S82F4 r; r.x = x; 
 #define S82_RS_CLIP_LUMA 9000.0f         // residual-shift test: luma at/above = a force-rejected texel
 
 // R, G1 (RGGB-order y), G2 (z), B site positions in each 2x2 quad. st_gbrg selects the GRBG/GBRG structure-
-// tensor formula; GCam's guard is `#if defined(BAYER_GBRG) || defined(BAYER_GBRG)` (sic), so only GBRG takes it.
+// tensor formula, for BOTH green-first patterns. The 8.2 text reads `#if defined(BAYER_GBRG) || defined(BAYER_GBRG)`,
+// but the device takes this branch for GRBG: GCam's own kernel covariance on burst12_GT (GRBG, LMC 8.4 on the A20e)
+// is 98.6-99.9% code-exact with it and 11-59% with the RGGB formula (mirrored kernel orientation on edges).
 struct S82Cfa { int ry, rx, g1y, g1x, g2y, g2x, by, bx; int st_gbrg; };
 
 struct S82GuideParams {
@@ -482,7 +499,7 @@ S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, i
     return 1.0f - r;
 }
 
-// ------------------------------------------------------------------------------- Mali-G71 emulation (CPU only)
+// ------------------------------------------------------------------------------- Mali-G71 emulation
 // Config::sabre_mali_exact: GCam 8.2 SABRE exactly as a Mali-G71 (Galaxy A20e, driver r26p0) executes it,
 // measured with on-device GLES probes and fitted to its dumps (2026-11-14). Fed GCam's inputs: base reference
 // 100% bit-exact, rejection 99.998% (c2_GT2), dilate 99.998%; whole pipeline on GCam's own car frames with
@@ -502,34 +519,104 @@ S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, i
 //  - `x < 0.0` is true for -0 (the guide's green-only flag on flat clipped patches is -0).
 //  - guide: MADD/moment FMAs, products with fp32 1/9 and 1/18 (s82m_guide_pixel).
 //  - R8 stores round half to even.
-// Not in the Metal kernels: the app's Metal library is built with fast math (approximate divide, free FMA
-// contraction), which can't hold this to the bit, so the pipeline runs these stages on the CPU in this mode.
-#ifndef __METAL_VERSION__
+// The GPU runs this same text (core/Sabre82MaliKernels.metal): that library is compiled at run time with fast
+// math OFF and S82M_CONTRACT_PRAGMA defined (no FMA contraction), and s82_q16 in software (S82_Q16_SOFT), so
+// the only operations not pinned to the bit are exp2 (precise::exp2 vs the C library) and the portable kernel
+// covariance cov3; every fused multiply-add the Mali compiler emitted is an explicit fma().
+//
+// The noise LUT is read through s82_lut_linear exactly as the portable path does. The Mali reads it as 0 (the
+// caller zeroes it, the default in this mode) and the terms below then reduce bit-for-bit to the noise-blind
+// arithmetic the device runs; Config::sabre_mali_noise_model keeps the DNG-derived LUT instead.
+// Compiled into the run-time Mali library only (S82M_GPU), never into the app's fast-math default.metallib.
+#if !defined(__METAL_VERSION__) || defined(S82M_GPU)
+#ifdef __METAL_VERSION__
+#ifdef S82M_CONTRACT_PRAGMA
+#define S82M_NOCONTRACT _Pragma("clang fp contract(off)")
+#else
+#define S82M_NOCONTRACT
+#endif
+#define S82M_I64 long
+S82_INLINE float s82m_fma(float a, float b, float c) { return fma(a, b, c); }
+#ifdef S82M_PLAIN_MATH
+S82_INLINE float s82m_div(float a, float b) { return a / b; }
+S82_INLINE float s82m_sqrt(float a) { return sqrt(a); }
+S82_INLINE float s82m_exp2(float a) { return exp2(a); }
+#else
+S82_INLINE float s82m_div(float a, float b) { return precise::divide(a, b); }
+S82_INLINE float s82m_sqrt(float a) { return precise::sqrt(a); }
+S82_INLINE float s82m_exp2(float a) { return precise::exp2(a); }
+#endif
+S82_INLINE float s82m_rint(float a) { return rint(a); }
+S82_INLINE bool s82m_signbit(float a) { return (as_type<uint>(a) >> 31) != 0u; }
+#else
 #if defined(__clang__)
 #define S82M_NOCONTRACT _Pragma("clang fp contract(off)")
 #else
 #define S82M_NOCONTRACT
 #endif
+#define S82M_I64 int64_t
 // a*b exact in double, one rounding of the sum: fma for the operand ranges here (as the numpy model
 // that matched the device; avoids depending on the C library fmaf).
+#ifdef S82M_EMULATE_GPU   // test builds only: the GPU library's fma / tex_coord on the CPU
+S82_INLINE float s82m_fma(float a, float b, float c) { return fmaf(a, b, c); }
+#else
 S82_INLINE float s82m_fma(float a, float b, float c) { return (float)((double)a * (double)b + (double)c); }
+#endif
+S82_INLINE float s82m_div(float a, float b) { return a / b; }
+S82_INLINE float s82m_sqrt(float a) { return sqrtf(a); }
+S82_INLINE float s82m_exp2(float a) { return exp2f(a); }
+S82_INLINE float s82m_rint(float a) { return nearbyintf(a); }
+S82_INLINE bool s82m_signbit(float a) { return signbit(a) != 0; }
+#endif
+// fp32 1/n (n a texture size < 2^24, exact in fp32): one correctly rounded divide. Equal to the CPU model's
+// (float)(1.0 / (double)n) for every n up to 65536 (checked: no double-rounding case in that range).
+S82_INLINE float s82m_recip(int n) { return s82m_div(1.0f, (float)n); }
 // floor(u * n * 2^fb) for any fp32 u, exactly (64-bit integer arithmetic on the mantissa).
-S82_INLINE int64_t s82m_fix(float u, int n, int fb) {
-    uint32_t b;
-    memcpy(&b, &u, 4);
+S82_INLINE S82M_I64 s82m_fix(float u, int n, int fb) {
+    const S82_U32 b = S82_F2U(u);
     const int ex = (int)((b >> 23) & 0xffu);
-    const bool neg = (b >> 31) != 0;
-    const int64_t big = (int64_t)1 << 40;
-    if (ex == 0) return (neg && (b & 0x7fffffffu)) ? -1 : 0;           // +-0 / denormals
+    const bool neg = (b >> 31) != 0u;
+    const S82M_I64 big = (S82M_I64)1 << 40;
+    if (ex == 0) return (neg && (b & 0x7fffffffu) != 0u) ? (S82M_I64)-1 : (S82M_I64)0;   // +-0 / denormals
     if (ex == 255) return neg ? -big : big;
-    int64_t p = (int64_t)((b & 0x7fffffu) | 0x800000u) * (int64_t)n;  // |u|*n = p * 2^(ex-150)
+    S82M_I64 p = (S82M_I64)((b & 0x7fffffu) | 0x800000u) * (S82M_I64)n;  // |u|*n = p * 2^(ex-150)
     if (neg) p = -p;
     const int sh = ex - 150 + fb;
-    if (sh >= 0) return sh > 16 ? (neg ? -big : big) : p * ((int64_t)1 << sh);
-    if (sh <= -62) return p < 0 ? -1 : 0;
+    if (sh >= 0) return sh > 16 ? (neg ? -big : big) : p * ((S82M_I64)1 << sh);
+    if (sh <= -62) return p < 0 ? (S82M_I64)-1 : (S82M_I64)0;
     return p >> (-sh);                                                  // arithmetic shift = floor
 }
-// The rasterizer's interpolated tex_coord for pixel (x, y) of a W x H full-viewport-triangle draw.
+// round(p / 2^sh), ties to even (p >= 0, sh >= 1).
+S82_INLINE S82M_I64 s82m_rhe_shift(S82M_I64 p, int sh) {
+    const S82M_I64 q = p >> sh, rem = p - (q << sh), half = (S82M_I64)1 << (sh - 1);
+    return q + ((rem > half || (rem == half && (q & 1) != 0)) ? 1 : 0);
+}
+// The rasterizer's interpolated tex_coord for pixel (x, y) of a W x H full-viewport-triangle draw, in integer
+// arithmetic: R = fp32(1/A) = m * 2^-(sh+24) (correctly rounded), b = round_half_even(e * R * 2^24) =
+// round_half_even(e * m / 2^sh). Identical to the double-precision form below on every pixel of every size
+// checked (core/sabre82_shared.h's CPU model; W, H up to 4200 x 3200).
+S82_INLINE void s82m_tex_coord_int(int W, int H, int x, int y, S82_THREAD float* u, S82_THREAD float* v) {
+    const S82M_I64 A = (S82M_I64)4 * (S82M_I64)W * (S82M_I64)H;      // 2x triangle area, screen space
+    int sh = 0;
+    while (((S82M_I64)1 << (sh + 1)) <= A) ++sh;                        // 2^sh <= A < 2^(sh+1)
+    const S82M_I64 num = (S82M_I64)1 << (sh + 24);
+    S82M_I64 m = num / A;
+    const S82M_I64 r = num - m * A;
+    if (2 * r > A || (2 * r == A && (m & 1) != 0)) ++m;
+    if (m >= ((S82M_I64)1 << 24)) { m >>= 1; --sh; }                   // A a power of two
+    const S82M_I64 e2 = (S82M_I64)(2 * y + 1) * (S82M_I64)W;           // edge functions (exact integers)
+    const S82M_I64 e0 = A - (S82M_I64)(2 * x + 1) * (S82M_I64)H - e2;
+    const S82M_I64 b0 = s82m_rhe_shift(e0 * m, sh), b2 = s82m_rhe_shift(e2 * m, sh);
+    const float k = 1.0f / 8388608.0f;                                  // 2^-23: u = 2*b1, v = 2*b2
+    *u = (float)(((S82M_I64)1 << 24) - b0 - b2) * k;
+    *v = (float)b2 * k;
+}
+#if defined(__METAL_VERSION__) || defined(S82M_EMULATE_GPU)
+S82_INLINE void s82m_tex_coord(int W, int H, int x, int y, S82_THREAD float* u, S82_THREAD float* v) {
+    s82m_tex_coord_int(W, H, x, y, u, v);
+}
+#else
+// The CPU model (fitted to the device): double-precision form of the same arithmetic.
 S82_INLINE void s82m_tex_coord(int W, int H, int x, int y, float* u, float* v) {
     const double A = 4.0 * (double)W * (double)H;                      // 2x triangle area, screen space
     const double R = (double)(float)(1.0 / A);                          // fp32 reciprocal
@@ -540,14 +627,15 @@ S82_INLINE void s82m_tex_coord(int W, int H, int x, int y, float* u, float* v) {
     *u = (float)((s - b0 - b2) * (2.0 / s));
     *v = (float)(b2 * (2.0 / s));
 }
+#endif
 S82_INLINE int s82m_nearest(float u, int n) {
-    const int64_t i = s82m_fix(u, n, 0);
+    const S82M_I64 i = s82m_fix(u, n, 0);
     return i < 0 ? 0 : (i > n - 1 ? n - 1 : (int)i);
 }
 // LINEAR fetch of an RGBA16F texture held as fp16-valued floats (4 interleaved channels).
-S82_INLINE void s82m_linear4(const float* p, int W, int H, float u, float v, float* out) {
-    int64_t X = s82m_fix(u, W, 8) - 128, Y = s82m_fix(v, H, 8) - 128;
-    const int64_t mx = (int64_t)(W - 1) * 256, my = (int64_t)(H - 1) * 256;
+S82_INLINE void s82m_linear4(const S82_DEVICE float* p, int W, int H, float u, float v, S82_THREAD float* out) {
+    S82M_I64 X = s82m_fix(u, W, 8) - 128, Y = s82m_fix(v, H, 8) - 128;
+    const S82M_I64 mx = (S82M_I64)(W - 1) * 256, my = (S82M_I64)(H - 1) * 256;
     X = X < 0 ? 0 : (X > mx ? mx : X);
     Y = Y < 0 ? 0 : (Y > my ? my : Y);
     const int x0 = (int)(X >> 8), y0 = (int)(Y >> 8), qx = (int)(X & 255), qy = (int)(Y & 255);
@@ -556,10 +644,10 @@ S82_INLINE void s82m_linear4(const float* p, int W, int H, float u, float v, flo
     const float k = 1.0f / 256.0f;
     const float w00 = (float)((ax * ay + 128) >> 8) * k, w01 = (float)((bx * ay + 128) >> 8) * k;
     const float w10 = (float)((ax * by + 127) >> 8) * k, w11 = (float)((bx * by + 127) >> 8) * k;
-    const float* A = p + ((size_t)y0 * W + x0) * 4;
-    const float* B = p + ((size_t)y0 * W + x1) * 4;
-    const float* C = p + ((size_t)y1 * W + x0) * 4;
-    const float* D = p + ((size_t)y1 * W + x1) * 4;
+    const S82_DEVICE float* A = p + ((S82M_I64)y0 * W + x0) * 4;
+    const S82_DEVICE float* B = p + ((S82M_I64)y0 * W + x1) * 4;
+    const S82_DEVICE float* C = p + ((S82M_I64)y1 * W + x0) * 4;
+    const S82_DEVICE float* D = p + ((S82M_I64)y1 * W + x1) * 4;
     for (int c = 0; c < 4; ++c)   // an fp16 value times an 8-bit weight is exact in fp32
         out[c] = s82_q16(s82_q16(s82_q16(s82_q16(A[c] * w00) + s82_q16(B[c] * w01)) + s82_q16(C[c] * w10)) +
                          s82_q16(D[c] * w11));
@@ -568,11 +656,12 @@ S82_INLINE void s82m_linear4(const float* p, int W, int H, float u, float v, flo
 // pixels whose keep/reject hinges on the weights summing to exactly 1, and to c2_GT2): uv*size + 0.5 one FMA,
 // every polynomial a*x + y fused, g0 = fma(1/6, P0, w1) and g1 = fma(1/6, P2, w3) (one (1/6)*P folded into the
 // add), taps multiplied by texelSize (fp32 1/size).
-S82_INLINE void s82m_bicubic_axis(float c0, int n, float* g0, float* g1, float* p0, float* p1) {
+S82_INLINE void s82m_bicubic_axis(float c0, int n, S82_THREAD float* g0, S82_THREAD float* g1,
+                                  S82_THREAD float* p0, S82_THREAD float* p1) {
     S82M_NOCONTRACT
-    const float rz = (float)(1.0 / (double)n);
+    const float rz = s82m_recip(n);
     const float c = s82m_fma(c0, (float)n, 0.5f);
-    const float i = floorf(c), a = c - i;
+    const float i = s82_floor(c), a = c - i;
     const float s6 = 1.0f / 6.0f;
     const float P0 = s82m_fma(a, s82m_fma(a, -a + 3.0f, -3.0f), 1.0f);
     const float P1 = s82m_fma(a * a, s82m_fma(3.0f, a, -6.0f), 4.0f);
@@ -581,11 +670,11 @@ S82_INLINE void s82m_bicubic_axis(float c0, int n, float* g0, float* g1, float* 
     const float w1 = s6 * P1, w3 = s6 * P3;
     *g0 = s82m_fma(s6, P0, w1);
     *g1 = s82m_fma(s6, P2, w3);
-    const float h0 = -1.0f + w1 / *g0, h1 = 1.0f + w3 / *g1;
+    const float h0 = -1.0f + s82m_div(w1, *g0), h1 = 1.0f + s82m_div(w3, *g1);
     *p0 = ((i + h0) - 0.5f) * rz;
     *p1 = ((i + h1) - 0.5f) * rz;
 }
-S82_INLINE S82F4 s82m_bicubic_abs(const float* tex, int W, int H, float u, float v) {
+S82_INLINE S82F4 s82m_bicubic_abs(const S82_DEVICE float* tex, int W, int H, float u, float v) {
     S82M_NOCONTRACT
     float g0x, g1x, p0x, p1x, g0y, g1y, p0y, p1y;
     s82m_bicubic_axis(u, W, &g0x, &g1x, &p0x, &p1x);
@@ -597,37 +686,39 @@ S82_INLINE S82F4 s82m_bicubic_abs(const float* tex, int W, int H, float u, float
     s82m_linear4(tex, W, H, p1x, p1y, t3);
     float o[4];
     for (int c = 0; c < 4; ++c)
-        o[c] = s82m_fma(g0y, s82m_fma(g0x, fabsf(t0[c]), g1x * fabsf(t1[c])),
-                        g1y * s82m_fma(g0x, fabsf(t2[c]), g1x * fabsf(t3[c])));
+        o[c] = s82m_fma(g0y, s82m_fma(g0x, s82_fabs(t0[c]), g1x * s82_fabs(t1[c])),
+                        g1y * s82m_fma(g0x, s82_fabs(t2[c]), g1x * s82_fabs(t3[c])));
     return s82_f4(o[0], o[1], o[2], o[3]);
 }
 // R8 store: round half to even.
-S82_INLINE uint8_t s82m_to_u8(float v) { return (uint8_t)(int)nearbyintf(s82_clampf(v, 0.0f, 1.0f) * 255.0f); }
+S82_INLINE uint8_t s82m_to_u8(float v) { return (uint8_t)(int)s82m_rint(s82_clampf(v, 0.0f, 1.0f) * 255.0f); }
 // kBaseFrameRefColorEntryPoint on the Mali.
-S82_INLINE S82F4 s82m_base_ref_pixel(const float* guide, int Wg, int Hg, int gx, int gy) {
+S82_INLINE S82F4 s82m_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int Hg, int gx, int gy) {
     float u, v;
     s82m_tex_coord(Wg, Hg, gx, gy, &u, &v);
     S82F4 r = s82m_bicubic_abs(guide, Wg, Hg, u, v);
     float c[4];
     s82m_linear4(guide, Wg, Hg, u, v, c);
-    if (signbit(c[3])) r.w = -r.w;   // the Mali's `< 0.0` is true for -0 (see s82m_rejection_pixel)
+    if (s82m_signbit(c[3])) r.w = -r.w;   // the Mali's `< 0.0` is true for -0 (see s82m_rejection_pixel)
     return r;
 }
-// kRejectionEntryPoint + ComputeFrameWeight on the Mali (noise LUT reads 0). Same contract as
-// s82_rejection_pixel; P.noise_scale and the LUT are not read.
-S82_INLINE float s82m_rejection_pixel(const float* base_ref, const float* alt_guide, const float* flow,
-                                      const uint8_t* unb, S82RejParams P, int gx, int gy, float* it_out) {
+// kRejectionEntryPoint + ComputeFrameWeight on the Mali. Same contract as s82_rejection_pixel. With the LUT
+// zeroed (the device) every noise term is exactly 0 and this is the noise-blind arithmetic the Mali runs.
+S82_INLINE float s82m_rejection_pixel(const S82_DEVICE float* base_ref, const S82_DEVICE float* alt_guide,
+                                      const S82_DEVICE float* flow, const S82_DEVICE float* lut,
+                                      const S82_DEVICE uint8_t* unb, S82RejParams P, int gx, int gy,
+                                      S82_THREAD float* it_out) {
     S82M_NOCONTRACT
     float tcx, tcy;
     s82m_tex_coord(P.Wg, P.Hg, gx, gy, &tcx, &tcy);
     const float fu = tcx * P.fso[0] + P.fso[2], fv = tcy * P.fso[1] + P.fso[3];
-    const float* fl = flow + ((size_t)s82m_nearest(fv, P.fny) * P.fnx + s82m_nearest(fu, P.fnx)) * 4;
+    const S82_DEVICE float* fl = flow + ((S82M_I64)s82m_nearest(fv, P.fny) * P.fnx + s82m_nearest(fu, P.fnx)) * 4;
     float wuv[2];
     wuv[0] = tcx + fl[0];
     wuv[1] = tcy + fl[1];
     s82_mirror(wuv, P.fbp);
-    float unblocker =
-        (float)unb[s82m_nearest(tcy * P.uscale[1], P.uny) * P.unx + s82m_nearest(tcx * P.uscale[0], P.unx)] / 255.0f;
+    float unblocker = s82m_div(
+        (float)unb[s82m_nearest(tcy * P.uscale[1], P.uny) * P.unx + s82m_nearest(tcx * P.uscale[0], P.unx)], 255.0f);
     const float lfv = fl[2];
     bool prior = false;
     if (lfv < P.ub_thr) unblocker = 0.0f;
@@ -637,41 +728,50 @@ S82_INLINE float s82m_rejection_pixel(const float* base_ref, const float* alt_gu
     // `reference.w < 0.0` is true for -0 on the Mali: a flat clipped patch (guide variance stored as -0) takes
     // the green-only path (green difference 0 -> kept), not RGB (colour difference / 0 -> rejected). Measured
     // on realshot2's clipped window (12k px of ROBUST_k).
-    const bool green_only = signbit(rv[3]);
-    float ref_w = fabsf(rv[3]);
+    const bool green_only = s82m_signbit(rv[3]);
+    float ref_w = s82_fabs(rv[3]);
     const S82F4 cur = s82m_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
     float cur_w = cur.w;
     {
         const float lc = (cur.x + cur.y + cur.z) * (1.0f / 3.0f), lr = (rv[0] + rv[1] + rv[2]) * (1.0f / 3.0f);
         *it_out = (lc < S82_RS_CLIP_LUMA && lr < S82_RS_CLIP_LUMA) ? lc - lr : 0.0f;
     }
+    // reference / current noise and min_variance: 0 on the Mali (zeroed LUT); s82_rejection_pixel's terms otherwise
+    const float luma = green_only ? rv[1] : (rv[0] * (1.0f / 3.0f) + rv[1] * (1.0f / 3.0f) + rv[2] * (1.0f / 3.0f));
+    const S82F4 rn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 0.0f * P.nsb[1] + P.nsb[3]);
+    const S82F4 cn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 1.0f * P.nsb[1] + P.nsb[3]);
     const float kf = green_only ? S82_KFVS_GREEN : S82_KFVS_RGB;
+    const float ns = P.noise_scale * kf;
+    const float rn0 = rn4.x * ns, rn1 = rn4.y * ns, rn2 = rn4.z * ns;
+    const float cn0 = cn4.x * ns, cn1 = cn4.y * ns, cn2 = cn4.z * ns;
     ref_w *= kf;
     cur_w *= kf;
     float pixel_variance = s82_min(ref_w, cur_w);
-    // reference / current noise and min_variance all read 0 from the incomplete LUT texture
+    const float min_variance = green_only ? rn1 : (rn0 * (1.0f / 3.0f) + rn1 * (1.0f / 3.0f) + rn2 * (1.0f / 3.0f));
     float boost = 1.0f;
-    if (ref_w > 0.0f && prior) boost = P.boost;
+    if (ref_w > P.boost_var_thr * min_variance && prior) boost = P.boost;
+    const float nv0 = rn0 + cn0, nv1 = rn1 + cn1, nv2 = rn2 + cn2;
     pixel_variance *= 2.0f;
     float d0 = (cur.x - rv[0]) * (cur.x - rv[0]);
     float d1 = (cur.y - rv[1]) * (cur.y - rv[1]);
     float d2 = (cur.z - rv[2]) * (cur.z - rv[2]);
-    const float vv = s82_max(pixel_variance, 0.0f);
-    d0 = vv > 0.0f ? d0 / vv : (d0 > 0.0f ? 3.0e38f : 0.0f);
-    d1 = vv > 0.0f ? d1 / vv : (d1 > 0.0f ? 3.0e38f : 0.0f);
-    d2 = vv > 0.0f ? d2 / vv : (d2 > 0.0f ? 3.0e38f : 0.0f);
+    d0 = s82_max(0.0f, d0 - nv0); d1 = s82_max(0.0f, d1 - nv1); d2 = s82_max(0.0f, d2 - nv2);
+    const float v0 = s82_max(pixel_variance, nv0), v1 = s82_max(pixel_variance, nv1), v2 = s82_max(pixel_variance, nv2);
+    d0 = v0 > 0.0f ? s82m_div(d0, v0) : (d0 > 0.0f ? 3.0e38f : 0.0f);
+    d1 = v1 > 0.0f ? s82m_div(d1, v1) : (d1 > 0.0f ? 3.0e38f : 0.0f);
+    d2 = v2 > 0.0f ? s82m_div(d2, v2) : (d2 > 0.0f ? 3.0e38f : 0.0f);
     float distance = green_only ? P.cdm[1] * d1
                                 : P.cdm[0] * (d0 * (1.0f / 3.0f) + d1 * (1.0f / 3.0f) + d2 * (1.0f / 3.0f));
     distance *= boost;
-    const float w = exp2f(s82_min(-distance, 0.0f));
+    const float w = s82m_exp2(s82_min(-distance, 0.0f));
     const float weight = s82_min(1.0f - unblocker, w);
     return 1.0f - weight;
 }
 // kDilateMaskEntryPoint on the Mali: s82_dilate_pixel's window and summation order, gathered texels fp16.
-S82_INLINE float s82m_dilate_pixel(const uint8_t* rej, int W, int H, int ox, int oy) {
+S82_INLINE float s82m_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, int ox, int oy) {
     S82M_NOCONTRACT
     float g[4];
-#define S82M_T(yy, xx) s82_q16((float)rej[s82_clampi(yy, 0, H - 1) * W + s82_clampi(xx, 0, W - 1)] / 255.0f)
+#define S82M_T(yy, xx) s82_q16(s82m_div((float)rej[s82_clampi(yy, 0, H - 1) * W + s82_clampi(xx, 0, W - 1)], 255.0f))
 #define S82M_GATHER(dx, dy)                                     \
     {                                                           \
         const int i0 = 2 * ox + (dx), j0 = 2 * oy + (dy);       \
@@ -695,7 +795,7 @@ S82_INLINE float s82m_dilate_pixel(const uint8_t* rej, int W, int H, int ox, int
 #undef S82M_GATHER
 #undef S82M_T
     r -= 0.2f;
-    r /= 2.0f;
+    r = s82m_div(r, 2.0f);
     return 1.0f - r;
 }
 // kGuideImageEntryPoint reference colour on the Mali (ref4 only; cov3 is the portable result). Measured against
@@ -704,17 +804,18 @@ S82_INLINE float s82m_dilate_pixel(const uint8_t* rej, int W, int H, int ox, int
 // FMA, the green second moment adds fma(g1, g1, g2*g2) per quad, /9 and /18 are products with the fp32
 // reciprocals. With the noise LUT reading 0 the green-only switch behaves as (m1 - m0*m0 >= 0) BEFORE the
 // max(0, .) clamp: a flat clipped patch (every green exactly 1.0, variance exactly 0) goes green-only (stored
-// -0), and only a negative rounding residue keeps RGB (100% branch agreement with the device).
+// -0), and only a negative rounding residue keeps RGB (100% branch agreement with the device). With a nonzero
+// noise LUT (Config::sabre_mali_noise_model) the switch is GCam's green_variance > 3 * green_variance_noise.
 // The caller's raw plane is our normalized data; GCam forms it as one FMA (DN * gains + black*gains).
 // (Both this and the rejection's `w < 0.0` behave as if the Mali orders -0 below +0.)
-S82_INLINE void s82m_guide_pixel(const float* raw, S82GuideParams P, const float* lut, int gx, int gy,
-                                 float* ref4, float* cov3) {
+S82_INLINE void s82m_guide_pixel(const S82_DEVICE float* raw, S82GuideParams P, const S82_DEVICE float* lut,
+                                 int gx, int gy, S82_THREAD float* ref4, S82_THREAD float* cov3) {
     S82M_NOCONTRACT
     s82_guide_pixel(raw, P, lut, gx, gy, ref4, cov3);   // cov3 (and the clip test inputs) as before
     float tcm[2];
     s82m_tex_coord(P.Wg, P.Hg, gx, gy, &tcm[0], &tcm[1]);
     s82_mirror(tcm, P.fbp);
-    const float tsz = (float)(1.0 / (double)P.Wg), tsw = (float)(1.0 / (double)P.Hg);
+    const float tsz = s82m_recip(P.Wg), tsw = s82m_recip(P.Hg);
     float avr = 0.0f, avg = 0.0f, avb = 0.0f, m0r = 0.0f, m0g = 0.0f, m0b = 0.0f, m1r = 0.0f, m1g = 0.0f, m1b = 0.0f;
     float m0_green = 0.0f, m1_green = 0.0f, center_green = 0.0f;
     for (int y = -1; y <= 1; y += 1) {
@@ -722,10 +823,10 @@ S82_INLINE void s82m_guide_pixel(const float* raw, S82GuideParams P, const float
         for (int x = -1; x <= 1; x += 1) {
             const int qx = s82m_nearest(tcm[0] + tsz * (float)x, P.Wg);
             const int bx = 2 * qx, by = 2 * qy;
-            const float r = sqrtf(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.rx, by + P.cfa.ry)));
-            const float g1 = sqrtf(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g1x, by + P.cfa.g1y)));
-            const float g2 = sqrtf(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g2x, by + P.cfa.g2y)));
-            const float b = sqrtf(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.bx, by + P.cfa.by)));
+            const float r = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.rx, by + P.cfa.ry)));
+            const float g1 = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g1x, by + P.cfa.g1y)));
+            const float g2 = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g2x, by + P.cfa.g2y)));
+            const float b = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.bx, by + P.cfa.by)));
             const float cr = r, cg = 0.5f * (g1 + g2), cb = b;
             const float w = s82_weight(x) * s82_weight(y);
             avr = s82m_fma(cr, w, avr); avg = s82m_fma(cg, w, avg); avb = s82m_fma(cb, w, avb);
@@ -742,7 +843,10 @@ S82_INLINE void s82m_guide_pixel(const float* raw, S82GuideParams P, const float
     const float vr = s82_max(0.0f, m1r - m0r * m0r), vg = s82_max(0.0f, m1g - m0g * m0g), vb = s82_max(0.0f, m1b - m0b * m0b);
     const float raw_gv = m1_green - m0_green * m0_green;
     const float green_variance = s82_max(0.0f, raw_gv);
-    if (raw_gv >= 0.0f && P.force_rgb == 0) {
+    const float average_luma = avr * 0.25f + avg * 0.5f + avb * 0.25f;
+    const float gvn = 2.0f * s82_lut_linear(lut, average_luma * P.nsb[0] + P.nsb[2], 1.0f * P.nsb[1] + P.nsb[3]).y;
+    const bool green_only = gvn > 0.0f ? green_variance > 3.0f * gvn : raw_gv >= 0.0f;
+    if (green_only && P.force_rgb == 0) {
         ref4[0] = avr; ref4[1] = center_green; ref4[2] = avb;
         ref4[3] = -s82_max(vg, green_variance);
     } else {
@@ -751,7 +855,7 @@ S82_INLINE void s82m_guide_pixel(const float* raw, S82GuideParams P, const float
     }
     if (center_green >= P.green_clip) { ref4[0] = S82_FORCE_REJECT_COLOR; ref4[1] = S82_FORCE_REJECT_COLOR; ref4[2] = S82_FORCE_REJECT_COLOR; }
 }
-#endif  // !__METAL_VERSION__
+#endif  // !__METAL_VERSION__ || S82M_GPU
 
 // ------------------------------------------------------------------------------------ residual-shift test
 // hhsr EXTENSION, not GCam (Config::sabre_resid_shift_enabled). SABRE's rejection divides the colour difference by

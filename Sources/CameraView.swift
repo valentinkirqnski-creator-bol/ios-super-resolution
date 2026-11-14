@@ -1173,6 +1173,11 @@ struct CameraView: View {
                          How the motion field is passed from each coarse pyramid level to the next finer one. OFF (default) = 460-main's candidate upsampling: each finer tile tests three candidate vectors (its own and two neighbours) against the actual pixels and keeps the best — robust at motion edges, but it can snap to a neighbour's vector and produce blocky flow. ON = Python 1.4's plain bilinear resize of the flow field — smooth flow that never re-tests against the image, so coarse-level mistakes are interpolated into the fine levels instead of being corrected. A/B on real bursts; affects the aligner on both the GPU and CPU paths.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("GCam Global Alignment Candidate", isOn: $cam.tuningParams.align_global_candidate)
+                    Text("""
+                         GCam 8.2's EstimateGlobalAlignment. After the coarsest pyramid level, every tile's motion vector votes into a histogram; the most common whole-pixel shift (if at least 10 tiles agree, otherwise the average) becomes one global translation for the frame. At each finer level it is offered to every tile as an extra candidate next to its own and two neighbours' vectors, and a tile takes it only if it matches the pixels better. Helps tiles on weak texture or repeated patterns snap back to the dominant motion. Translation only; nothing is warped. Needs Bilinear Flow Upsample OFF. Runs on GPU and CPU aligners. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Sub-Pixel Block Matching", isOn: $cam.tuningParams.bm_subpixel_enabled)
                     Text("""
                          HDR+'s quadratic sub-pixel refinement: after each pyramid level's integer search, a quadratic is fitted to the 3×3 cost surface around the best shift and the flow moves to its analytic minimum (L2 levels only, with positive-definite and ±1 px safeguards). Removes the ±0.5 px per-level quantisation before it is multiplied by the upsample factor on the way to finer levels. The final Lucas–Kanade refinement already provides sub-pixel at the finest level, so expect the effect between levels, mostly on fine texture and larger motion. Runs on both GPU and CPU aligners.
@@ -1249,7 +1254,22 @@ struct CameraView: View {
                         Text("Runs SABRE the way GCam runs on a Mali-G71 phone such as the Galaxy A20e: there the GPU reads GCam's noise table as all zeros, so both the guide's green-only switch and the rejection ignore noise. Much stricter: darker masks, less noise reduction. With Save Robustness Mask on, each frame's own mask is also saved (quarter resolution, white = kept), the same layout as GCam's mask. Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("SABRE Mali-G71 Bit-Exact (A20e)", isOn: $cam.tuningParams.sabre_mali_exact)
-                        Text("Reproduces GCam's masks to the bit as a Mali-G71 phone (Galaxy A20e) computes them: the GPU's exact texture-coordinate rounding, fixed-point bilinear sampling with half-precision accumulation, and its zero-reading noise table (so this includes No Noise Model). Given the same frames and flow as GCam, the masks match the A20e's bit-for-bit on 99.4-99.8% of pixels (rejection 99.998% on GCam's own guides). Masks differ from No Noise Model alone by at most 1 step in 255, so you won't see it; it is for exact comparisons. The mask stages run on the CPU in this mode (slower); the merge stays on the GPU. Off by default.")
+                        Text("Reproduces GCam's masks to the bit as a Mali-G71 phone (Galaxy A20e) computes them: the GPU's exact texture-coordinate rounding, fixed-point bilinear sampling with half-precision accumulation, and its zero-reading noise table (so this includes No Noise Model unless Use Noise Model below is on). Given the same frames and flow as GCam, the masks match the A20e's bit-for-bit on 99.4-99.8% of pixels (rejection 99.998% on GCam's own guides). Masks differ from No Noise Model alone by at most 1 step in 255, so you won't see it; it is for exact comparisons. Off by default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.sabre_mali_exact {
+                            Toggle("Mali Bit-Exact on GPU", isOn: $cam.tuningParams.sabre_mali_gpu)
+                                .padding(.leading, 16)
+                            Text("Runs the bit-exact guide, rejection and dilate on the iPhone GPU (a separate shader library built without fast math the first time it is used, about a second). Same arithmetic as the CPU version. If that library can't be built the CPU version runs instead and the progress line says why. Turn off to use the CPU version as a reference. On by default.")
+                                .font(.footnote).foregroundColor(.secondary)
+                                .padding(.leading, 16)
+                            Toggle("Mali Bit-Exact: Use Noise Model", isOn: $cam.tuningParams.sabre_mali_noise_model)
+                                .padding(.leading, 16)
+                            Text("Keeps GCam's noise table (from the DNG noise profile) instead of the zeros the Mali reads, so the green-only switch and the rejection subtract and floor against noise as GCam does on phones whose GPU reads the table. Everything else stays Mali-exact. Brighter masks, more noise reduction. Overrides No Noise Model while Mali Bit-Exact is on. Off by default.")
+                                .font(.footnote).foregroundColor(.secondary)
+                                .padding(.leading, 16)
+                        }
+                        Toggle("SABRE Save Accumulated Mask", isOn: $cam.tuningParams.sabre_save_accumulated_mask)
+                        Text("Saves one extra image to Photos with the DNG: the accumulated robustness mask, i.e. how much of all comparison frames was kept at each spot (white = every frame kept fully, black = only the reference frame used). Same grid as GCam's mask (a quarter of the raw resolution) and the same quantity GCam accumulates, so it can be compared with GCam's directly. Works without Save Robustness Mask (which also saves every frame's own mask). Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("SABRE Edge Shift Test (not GCam)", isOn: $cam.tuningParams.sabre_resid_shift_enabled)
                         Text("Adds a check GCam doesn't have. SABRE judges a frame by its colour difference relative to the local contrast, so on strong edges it keeps frames that are 0.3-1 px misaligned; those show as doubled, colour-fringed edges. This measures how far each frame's edge sits from the reference edge after alignment and reduces that frame's weight on strong edges when it is more than about 0.15 px off. Off by default.")

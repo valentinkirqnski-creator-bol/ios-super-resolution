@@ -990,12 +990,44 @@ static FlowField upscale_flow_bilinear_14(const FlowField& in,
     return out;
 }
 
+// GCam 8.2 EstimateGlobalAlignment (see Config::align_global_candidate). FUN_01419004 votes each tile's
+// (int)dx, (int)dy -- truncated toward zero, then clamped to [-64, 64] -- into a 129x129 accumulator;
+// FUN_01419280 scans it row by row (dy outer, dx inner) keeping the FIRST strict maximum and the vote-weighted
+// sums; AlignAlt keeps the peak when it has >= 10 votes and otherwise the mean (sum / number of tiles).
+bool gcam_estimate_global_alignment(const f32* flow_xy, int n_tiles, f32& gdx, f32& gdy) {
+    gdx = gdy = 0.f;
+    if (!flow_xy || n_tiles <= 0) return false;
+    constexpr int R = 64, N = 2 * R + 1;
+    std::vector<f32> hist((size_t)N * N, 0.f);
+    for (int i = 0; i < n_tiles; ++i) {
+        const f32 fx = flow_xy[2 * i], fy = flow_xy[2 * i + 1];
+        if (!std::isfinite(fx) || !std::isfinite(fy)) continue;
+        const int dx = std::max(-R, std::min(R, (int)std::max(-1.0e6f, std::min(1.0e6f, fx))));
+        const int dy = std::max(-R, std::min(R, (int)std::max(-1.0e6f, std::min(1.0e6f, fy))));
+        hist[(size_t)(dy + R) * N + (dx + R)] += 1.f;
+    }
+    f32 peak = 0.f; int px = 0, py = 0;
+    f32 sum_v = 0.f, sum_xv = 0.f, sum_yv = 0.f;
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) {
+            const f32 v = hist[(size_t)(dy + R) * N + (dx + R)];
+            if (v > peak) { peak = v; px = dx; py = dy; }
+            sum_xv += (f32)dx * v; sum_yv += (f32)dy * v; sum_v += v;
+        }
+    if (sum_v <= 0.f) return false;
+    if (peak >= 10.0f) { gdx = (f32)px; gdy = (f32)py; }
+    else { gdx = sum_xv / sum_v; gdy = sum_yv / sum_v; }
+    return true;
+}
+
 static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                                   const FlowField& in, int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
                                   int prev_tile_size,
                                   bool fallback_on_ambiguous = false,
-                                  f32 ambiguity_ratio = 1.10f) {
+                                  f32 ambiguity_ratio = 1.10f,
+                                  const f32* ext_candidate = nullptr,   // GCam external candidate (this level's px)
+                                  f32 ext_bias = 1.f) {
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
     if (repeat_factor < 1) repeat_factor = 1;
@@ -1029,21 +1061,23 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             const int y_shift = (2 * ups_y + 1 > repeat_factor) ? 1 : -1;
             const int cand_y = std::max(0, std::min(in.ny - 1, prev_y + y_shift));
             const int cand_x = std::max(0, std::min(in.nx - 1, prev_x + x_shift));
-            f32 cand[3][2] = {
+            f32 cand[4][2] = {
                 {in.dx(prev_y, prev_x) * (f32)upsample_factor,
                  in.dy(prev_y, prev_x) * (f32)upsample_factor},
                 {in.dx(cand_y, prev_x) * (f32)upsample_factor,
                  in.dy(cand_y, prev_x) * (f32)upsample_factor},
                 {in.dx(prev_y, cand_x) * (f32)upsample_factor,
                  in.dy(prev_y, cand_x) * (f32)upsample_factor},
+                {ext_candidate ? ext_candidate[0] : 0.f, ext_candidate ? ext_candidate[1] : 0.f},
             };
+            const int n_cand = ext_candidate ? 4 : 3;
 
             const int ox = tx * new_tile_size;
             const int oy = ty * new_tile_size;
             f32 best_dist = std::numeric_limits<f32>::infinity();
             f32 second_dist = std::numeric_limits<f32>::infinity();
             int best_i = 0;
-            for (int ci = 0; ci < 3; ++ci) {
+            for (int ci = 0; ci < n_cand; ++ci) {
                 f32 dist = 0.f;
                 bool valid = true;
                 for (int i = 0; i < new_tile_size && valid; ++i) {
@@ -1061,6 +1095,7 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                     }
                 }
                 if (!valid) dist = std::numeric_limits<f32>::infinity();
+                else if (ci == 3) dist *= ext_bias;
                 if (dist < best_dist) {
                     second_dist = best_dist;
                     best_dist = dist;
@@ -2205,6 +2240,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     Pyramid mov_pyr = build_pyramid(moving_padded, cfg.bm_factors);
 
     FlowField flow;
+    // GCam external candidate: estimated once from the coarsest level, then scaled by each upsample factor.
+    const bool want_global = cfg.align_global_candidate && cfg.use_candidate_flow_upsample();
+    bool have_global = false;
+    f32 global_xy[2] = {0.f, 0.f};
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[lvl];
@@ -2233,13 +2272,19 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1])
                           : ts;
+            if (want_global && !have_global)
+                have_global = gcam_estimate_global_alignment(flow.flow.data(), flow.ny * flow.nx,
+                                                             global_xy[0], global_xy[1]);
+            if (have_global) { global_xy[0] *= (f32)upsample_factor; global_xy[1] *= (f32)upsample_factor; }
             if (!cfg.use_candidate_flow_upsample())
                 flow = upscale_flow_bilinear_14(flow, ny, nx, upsample_factor,
                                                 ts, prev_ts);
             else
                 flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts,
                                         cfg.align_ambiguous_fallback_enabled,
-                                        clamped_ambiguity_ratio(cfg));
+                                        clamped_ambiguity_ratio(cfg),
+                                        have_global ? global_xy : nullptr,
+                                        std::max(0.f, cfg.align_global_candidate_bias));
         }
 
         std::string metric = "L2";

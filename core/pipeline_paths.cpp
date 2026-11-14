@@ -1327,9 +1327,11 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
     build_noise_lut(slope, offset, lut);
-    // Mali-G71: the LINEAR RGBA32F LUT is an incomplete texture and reads 0 (guide and rejection).
-    const bool mali = work.sabre_mali_exact;   // + the device rasterizer / sampler arithmetic (CPU stages)
-    if (work.sabre_noise_blind || mali) std::fill(lut, lut + 80, 0.f);
+    // Mali-G71: the LINEAR RGBA32F LUT is an incomplete texture and reads 0 (guide and rejection), unless
+    // sabre_mali_noise_model keeps the noise model (it overrides sabre_noise_blind in this mode).
+    const bool mali = work.sabre_mali_exact;   // + the device rasterizer / sampler arithmetic
+    const bool zero_lut = mali ? !work.sabre_mali_noise_model : work.sabre_noise_blind;
+    if (zero_lut) std::fill(lut, lut + 80, 0.f);
     // Per-capture kernel covariance: EstimateSnr on the green noise model at the reference's mean level,
     // K = sqrt(N/12)*SNR through the 6 MergeOptions curves (same for every frame of the burst).
     const CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
@@ -1351,8 +1353,16 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     Guide base_guide;
     std::vector<float> base_ref;
     bool gpu = false;
+    std::string mali_gpu_status;   // Mali-exact: the GPU library variant in use, or why the CPU stages run
 #if defined(__APPLE__)
     if (!mali) gpu = metal_base_stages(ref, cfa, lut, base_t, base_guide, base_ref);
+    else if (work.sabre_mali_gpu) {
+        if (metal_mali_available(&mali_gpu_status))
+            gpu = metal_base_stages(gcam_bayer_input(ref, work, 1.f), cfa, lut, base_t, base_guide, base_ref, true);
+        if (gpu) mali_gpu_status = "(" + mali_gpu_status.substr(5) + ")";   // the variant that compiled
+        else if (mali_gpu_status.empty() || mali_gpu_status.compare(0, 4, "GPU,") == 0)
+            mali_gpu_status = "GPU base stages failed";
+    }
     struct S82BurstGuard { ~S82BurstGuard() { metal_end_burst(); } } s82_burst_guard;
 #endif
     if (!gpu) {
@@ -1364,14 +1374,17 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     const ResidShift rs = resid_shift_setup(base_ref, Wg, Hg, work, work.num_threads);
     prof_add_cpu("sabre:base", prof_now_ms() - t_g0);
     {
-        char buf[320];
+        char buf[768];
         std::snprintf(buf, sizeof(buf),
-                      "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g, SNR %.3g K %.3g "
-                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s",
-                      gpu ? "GPU" : (mali ? "CPU, Mali-G71 exact" : "CPU"), Wr, Hr, Wo, Ho, frame_count,
-                      work.has_noise_profile ? "DNG" : "fallback", noise_scale, cov_t.snr, cov_t.K,
+                      "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g%s, SNR %.3g K %.3g "
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s%s%s%s",
+                      gpu ? (mali ? "GPU, Mali-G71 exact" : "GPU") : (mali ? "CPU, Mali-G71 exact" : "CPU"),
+                      Wr, Hr, Wo, Ho, frame_count, work.has_noise_profile ? "DNG" : "fallback", noise_scale,
+                      zero_lut ? " (noise LUT off)" : "", cov_t.snr, cov_t.K,
                       cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1],
-                      rs.enabled ? ", edge shift test on" : "", base_t.force_rgb ? ", force RGB (SNR <= 10)" : "");
+                      rs.enabled ? ", edge shift test on" : "", base_t.force_rgb ? ", force RGB (SNR <= 10)" : "",
+                      mali_gpu_status.empty() ? "" : (gpu ? " " : " [Mali GPU unavailable: "),
+                      mali_gpu_status.c_str(), mali_gpu_status.empty() || gpu ? "" : "]");
         report(buf, 0.05f);
     }
 
@@ -1440,7 +1453,11 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         extract_eps(work, work.cfa, Kf, mf->eps);
         bool done = false;
 #if defined(__APPLE__)
-        if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, rs, mf->cov, mf->keep);
+        if (gpu && mali)
+            done = metal_frame_stages(gcam_bayer_input(comp, work, Kf), mf->flow, cfa, lut, ft, noise_scale, unb, rs,
+                                      mf->cov, mf->keep, true);
+        else if (gpu)
+            done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, rs, mf->cov, mf->keep);
 #endif
         if (!done) {
             Guide g = mali ? compute_guide(gcam_bayer_input(comp, work, Kf), cfa, lut, ft, work.num_threads, true)
@@ -1453,6 +1470,11 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
             mf->cov = std::move(g.cov);
         }
         prof_add_cpu("sabre:frame", prof_now_ms() - t_s);
+        if (work.robustness_save_mask || work.sabre_save_accumulated_mask) {
+            if (!have_keep) { keep_sum = Image(Hm, Wm, 1); have_keep = true; }
+            for (size_t i = 0; i < mf->keep.size() && i < keep_sum.data.size(); ++i)
+                keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
+        }
         if (work.robustness_save_mask) {
             // This frame's keep mask as GCam's MASKOP texture: quarter raw res, 255 = keep fully.
             // <stem>_keep_fNN.pgm beside the DNG (NN = burst index of the comparison frame).
@@ -1465,9 +1487,6 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
                 std::fwrite(mf->keep.data(), 1, std::min(mf->keep.size(), (size_t)Wm * Hm), f);
                 std::fclose(f);
             }
-            if (!have_keep) { keep_sum = Image(Hm, Wm, 1); have_keep = true; }
-            for (size_t i = 0; i < mf->keep.size() && i < keep_sum.data.size(); ++i)
-                keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
         }
         comp_raws.push_back(std::make_unique<Image>(std::move(comp)));
         mf->raw = comp_raws.back().get();
@@ -1530,6 +1549,9 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     writer.close();
     if (work.robustness_save_mask && have_keep)
         write_robustness_mask_pgm(keep_sum, (int)frames.size(), dng_path, "", Hr, Wr);
+    // The accumulated mask at its native (GCam MASKOP) resolution: <stem>_robustness_accumulated.pgm
+    if (work.sabre_save_accumulated_mask && have_keep)
+        write_robustness_mask_pgm(keep_sum, (int)frames.size(), dng_path, "_accumulated", Hm, Wm);
     if (prof_enabled()) {
         char hdr[160];
         std::snprintf(hdr, sizeof(hdr), "\nSABRE 8.2 burst wall %.1f ms over %d frames\n", prof_now_ms() - t_burst, frame_count);

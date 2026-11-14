@@ -220,6 +220,7 @@ struct TuningParams: Equatable, Codable {
     /// Forced OFF by align_match_14, which is what 1.4 does.
     /// Default true: 460-main uses the three-candidate content-aware upscale.
     var flow_upsample_candidates: Bool = true
+    var align_global_candidate: Bool = false
     /// HDR+ sub-pixel block matching: after each pyramid level's integer search,
     /// fit a quadratic to the 3x3 cost neighbourhood and move to its analytic
     /// minimum (L2 levels only, PD + range safeguards). Removes the ±0.5 px
@@ -371,6 +372,9 @@ struct TuningParams: Equatable, Codable {
     var sabre_noise_scale: Float = 1.0
     var sabre_noise_blind: Bool = false
     var sabre_mali_exact: Bool = false
+    var sabre_mali_gpu: Bool = true
+    var sabre_mali_noise_model: Bool = false
+    var sabre_save_accumulated_mask: Bool = false
     var sabre_resid_shift_enabled: Bool = false
     /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
     /// literal RGB value is 0.090. Defaulted off because our variances are already
@@ -618,7 +622,7 @@ struct TuningParams: Equatable, Codable {
         case global_homography_enabled
         case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
-        case real_rgb_guide, flow_upsample_candidates
+        case real_rgb_guide, flow_upsample_candidates, align_global_candidate
         case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled, halftile_refine_target_ts
         case dense_flow_enabled
         case feat_metric_refine_enabled
@@ -628,7 +632,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_resid_shift_enabled,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_resid_shift_enabled,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -757,6 +761,7 @@ struct TuningParams: Equatable, Codable {
         isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
         isa_prealign_refine_dim = try c.decodeIfPresent(Int.self, forKey: .isa_prealign_refine_dim) ?? isa_prealign_refine_dim
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
+        align_global_candidate = try c.decodeIfPresent(Bool.self, forKey: .align_global_candidate) ?? align_global_candidate
         bm_subpixel_enabled = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_enabled) ?? bm_subpixel_enabled
         lk_every_level_enabled = try c.decodeIfPresent(Bool.self, forKey: .lk_every_level_enabled) ?? lk_every_level_enabled
         halftile_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .halftile_refine_enabled) ?? halftile_refine_enabled
@@ -814,6 +819,9 @@ struct TuningParams: Equatable, Codable {
         sabre_noise_scale = try c.decodeIfPresent(Float.self, forKey: .sabre_noise_scale) ?? sabre_noise_scale
         sabre_noise_blind = try c.decodeIfPresent(Bool.self, forKey: .sabre_noise_blind) ?? sabre_noise_blind
         sabre_mali_exact = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_exact) ?? sabre_mali_exact
+        sabre_mali_gpu = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_gpu) ?? sabre_mali_gpu
+        sabre_mali_noise_model = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_noise_model) ?? sabre_mali_noise_model
+        sabre_save_accumulated_mask = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_accumulated_mask) ?? sabre_save_accumulated_mask
         sabre_resid_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .sabre_resid_shift_enabled) ?? sabre_resid_shift_enabled
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
@@ -2560,7 +2568,9 @@ final class CameraModel: NSObject, ObservableObject {
         // The output-resolution choice only means anything when nothing is
         // cropped away; any zoom is realised as crop-then-2x, which is what the
         // 2x lens button always did and is now what every magnification does.
-        let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
+        // Imported DNGs are never cropped (cropZoomForCapture is 1), so they follow the selector too; they
+        // used to be forced to 2x, which made the 12MP setting do nothing on imports.
+        let useSelectedOutputScale = cropZoomForCapture <= 1.0001
         let algorithmScale: Float = useSelectedOutputScale
             ? outputResolutionMode.algorithmScale
             : 2.0
@@ -2644,6 +2654,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
             "isa_prealign_refine_dim": NSNumber(value: tuningParams.isa_prealign_refine_dim),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
+            "align_global_candidate": NSNumber(value: tuningParams.align_global_candidate),
             "bm_subpixel_enabled": NSNumber(value: tuningParams.bm_subpixel_enabled),
             "lk_every_level_enabled": NSNumber(value: tuningParams.lk_every_level_enabled),
             "halftile_refine_enabled": NSNumber(value: tuningParams.halftile_refine_enabled),
@@ -2701,6 +2712,9 @@ final class CameraModel: NSObject, ObservableObject {
             "sabre_noise_scale": NSNumber(value: tuningParams.sabre_noise_scale),
             "sabre_noise_blind": NSNumber(value: tuningParams.sabre_noise_blind),
             "sabre_mali_exact": NSNumber(value: tuningParams.sabre_mali_exact),
+            "sabre_mali_gpu": NSNumber(value: tuningParams.sabre_mali_gpu),
+            "sabre_mali_noise_model": NSNumber(value: tuningParams.sabre_mali_noise_model),
+            "sabre_save_accumulated_mask": NSNumber(value: tuningParams.sabre_save_accumulated_mask),
             "sabre_resid_shift_enabled": NSNumber(value: tuningParams.sabre_resid_shift_enabled),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
@@ -2821,6 +2835,9 @@ final class CameraModel: NSObject, ObservableObject {
             var maskSuffixes: [String] = []
             if tuningParams.robustness_save_mask {
                 maskSuffixes.append("_robustness.pgm")
+            }
+            if tuningParams.sabre_save_accumulated_mask && tuningParams.robustness_gcam_enabled {
+                maskSuffixes.append("_robustness_accumulated.pgm")
             }
             let base = outURL.deletingPathExtension().path
             var robURLs = maskSuffixes

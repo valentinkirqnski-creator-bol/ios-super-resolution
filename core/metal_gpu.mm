@@ -4264,9 +4264,11 @@ struct AlignUpscaleParamsCPU {
     uint32_t carry_ambiguity = 0;   // 1 = propagate the block-matching ambiguity flag
     uint32_t fallback_on_ambiguous = 0; // 1 = keep parent candidate on a near-tie
     float ambiguity_ratio = 1.10f;
-    uint32_t _pad0 = 0;
+    uint32_t has_ext = 0;           // GCam external (global) candidate (Config::align_global_candidate)
+    float ext_dx = 0.f, ext_dy = 0.f;
+    float ext_bias = 1.f;
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 68, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 80, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -4384,7 +4386,9 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   id<MTLBuffer> b_amb_in = nil,
                                   __strong id<MTLBuffer>* b_amb_out = nullptr,
                                   bool fallback_on_ambiguous = false,
-                                  float ambiguity_ratio = 1.10f) {
+                                  float ambiguity_ratio = 1.10f,
+                                  const float* ext_candidate = nullptr,
+                                  float ext_bias = 1.f) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -4421,6 +4425,12 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.fallback_on_ambiguous = fallback_on_ambiguous ? 1u : 0u;
     if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
     p.ambiguity_ratio = std::max(ambiguity_ratio, 1.0f);
+    if (ext_candidate) {
+        p.has_ext = 1u;
+        p.ext_dx = ext_candidate[0];
+        p.ext_dy = ext_candidate[1];
+        p.ext_bias = std::max(0.f, ext_bias);
+    }
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -4603,6 +4613,11 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     int ambiguity_ny = 0, ambiguity_nx = 0;
     const bool want_amb = cfg.flow_reject_ambiguous_enabled;
     const bool ica_all = cfg.ica_every_level();
+    // GCam external candidate (Config::align_global_candidate): estimated once on the host from the coarsest
+    // level's flow (shared buffer, read after align_drain), then scaled by each upsample factor.
+    const bool want_global = cfg.align_global_candidate && cfg.use_candidate_flow_upsample();
+    bool have_global = false;
+    float global_xy[2] = {0.f, 0.f};
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[(size_t)lvl];
@@ -4638,6 +4653,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
             id<MTLBuffer> b_up = nil;
             id<MTLBuffer> b_amb_up = nil;
+            if (want_global && !have_global && align_drain())
+                have_global = gcam_estimate_global_alignment((const float*)[b_flow contents],
+                                                             flow_ny * flow_nx, global_xy[0], global_xy[1]);
+            if (have_global) { global_xy[0] *= (float)upsample_factor; global_xy[1] *= (float)upsample_factor; }
             if (!cfg.use_candidate_flow_upsample()) {
                 // Bilinear flow resize, no ambiguity carry -- 1.4's form, and
                 // what flow_upsample_candidates = false selects. The stale
@@ -4655,7 +4674,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                            want_amb ? b_ambiguity : nil,
                                            want_amb ? &b_amb_up : nullptr,
                                            cfg.align_ambiguous_fallback_enabled,
-                                           cfg.flow_reject_1d_ambiguity_ratio) || !b_up)
+                                           cfg.flow_reject_1d_ambiguity_ratio,
+                                           have_global ? global_xy : nullptr,
+                                           cfg.align_global_candidate_bias) || !b_up)
                     return false;
             }
             b_flow = b_up;

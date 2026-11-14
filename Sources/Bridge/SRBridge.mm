@@ -602,6 +602,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.isa_prealign_refine_dim = tuning[@"isa_prealign_refine_dim"].intValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
+    if (tuning[@"align_global_candidate"])
+        cfg.align_global_candidate = tuning[@"align_global_candidate"].boolValue;
     if (tuning[@"bm_subpixel_enabled"])
         cfg.bm_subpixel_enabled = tuning[@"bm_subpixel_enabled"].boolValue;
     if (tuning[@"lk_every_level_enabled"])
@@ -694,6 +696,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"sabre_noise_scale"])        cfg.sabre_noise_scale = tuning[@"sabre_noise_scale"].floatValue;
     if (tuning[@"sabre_noise_blind"])        cfg.sabre_noise_blind = tuning[@"sabre_noise_blind"].boolValue;
     if (tuning[@"sabre_mali_exact"])         cfg.sabre_mali_exact = tuning[@"sabre_mali_exact"].boolValue;
+    if (tuning[@"sabre_mali_gpu"])           cfg.sabre_mali_gpu = tuning[@"sabre_mali_gpu"].boolValue;
+    if (tuning[@"sabre_mali_noise_model"])   cfg.sabre_mali_noise_model = tuning[@"sabre_mali_noise_model"].boolValue;
+    if (tuning[@"sabre_save_accumulated_mask"]) cfg.sabre_save_accumulated_mask = tuning[@"sabre_save_accumulated_mask"].boolValue;
     if (tuning[@"sabre_resid_shift_enabled"]) cfg.sabre_resid_shift_enabled = tuning[@"sabre_resid_shift_enabled"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;

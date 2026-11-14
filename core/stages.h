@@ -146,6 +146,10 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
                                    int finest_h, int finest_w,
                                    f32 initial_dx, f32 initial_dy,
                                    f32 initial_rotation_rad);
+// GCam 8.2 EstimateGlobalAlignment on a tile flow field (interleaved dx,dy per tile, n tiles, that level's
+// pixels): 129x129 vote histogram of the truncated, +-64-clamped displacements; the peak if it has >= 10 votes,
+// else the vote-weighted mean. Returns false for an empty field. See Config::align_global_candidate.
+bool gcam_estimate_global_alignment(const f32* flow_xy, int n_tiles, f32& gdx, f32& gdy);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size,

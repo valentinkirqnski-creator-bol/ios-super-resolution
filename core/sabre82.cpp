@@ -53,8 +53,8 @@ S82Cfa cfa_from(const CFA& cfa) {
             else if (!g1) { s.g1y = i; s.g1x = j; g1 = true; }
             else { s.g2y = i; s.g2x = j; }
         }
-    // GBRG = G B / R G
-    s.st_gbrg = (cfa.p[0][0] == 1 && cfa.p[0][1] == 2 && cfa.p[1][0] == 0) ? 1 : 0;
+    // GRBG (G R / B G) and GBRG (G B / R G): green on the main diagonal -> GCam's GRBG/GBRG structure tensor
+    s.st_gbrg = (cfa.p[0][0] == 1 && cfa.p[1][1] == 1) ? 1 : 0;
     return s;
 }
 
@@ -493,7 +493,7 @@ void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowT
         for (int gx = 0; gx < alt.w; ++gx) {
             float it;
             const size_t i = (size_t)gy * alt.w + gx;
-            rej[i] = mali ? s82m_to_u8(s82m_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(),
+            rej[i] = mali ? s82m_to_u8(s82m_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut,
                                                             unb.data.data(), P, gx, gy, &it))
                           : s82_to_u8(s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut,
                                                           unb.data.data(), P, gx, gy, &it));

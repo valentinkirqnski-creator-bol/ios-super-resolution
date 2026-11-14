@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 namespace hhsr {
 namespace sabre82 {
@@ -63,6 +64,64 @@ id<MTLBuffer> buf(id<MTLDevice> d, const void* src, size_t bytes) {
     return src ? [d newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
                : [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
 }
+// Mali-G71 bit-exact stages (Config::sabre_mali_exact): core/Sabre82MaliKernels.metal + core/sabre82_shared.h ship
+// as bundle resources and are compiled here once, with fast math off, no FMA contraction (S82M_CONTRACT_PRAGMA)
+// and software fp16 stores (S82_Q16_SOFT). If the toolchain rejects a variant the next, looser one is tried;
+// `status` names the variant that compiled or why none did (the pipeline then runs these stages on the CPU).
+struct S82MaliGpu {
+    id<MTLComputePipelineState> guide = nil, base_ref = nil, reject = nil, dilate = nil;
+    bool ok = false;
+    std::string status = "not compiled";
+};
+S82MaliGpu& mali_gpu() {
+    static S82MaliGpu m;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        S82Gpu& g = gpu();
+        if (!g.device) { m.status = "no Metal device"; return; }
+        NSBundle* b = [NSBundle mainBundle];
+        NSString* kp = [b pathForResource:@"Sabre82MaliKernels" ofType:@"metal"];
+        NSString* hp = [b pathForResource:@"sabre82_shared" ofType:@"h"];
+        if (!kp || !hp) { m.status = "Mali kernel source missing from the app bundle"; return; }
+        NSString* ks = [NSString stringWithContentsOfFile:kp encoding:NSUTF8StringEncoding error:nil];
+        NSString* hs = [NSString stringWithContentsOfFile:hp encoding:NSUTF8StringEncoding error:nil];
+        if (!ks || !hs) { m.status = "cannot read the Mali kernel source"; return; }
+        NSString* src = [ks stringByReplacingOccurrencesOfString:@"#include \"sabre82_shared.h\"" withString:hs];
+        static const char* kVariant[3] = {"precise math, no contraction", "plain math, no contraction", "plain math"};
+        for (int v = 0; v < 3 && !m.ok; ++v) {
+            MTLCompileOptions* o = [[MTLCompileOptions alloc] init];
+            o.fastMathEnabled = NO;
+            NSMutableDictionary* mac = [NSMutableDictionary dictionary];
+            mac[@"S82M_GPU"] = @1;
+            mac[@"S82_Q16_SOFT"] = @1;
+            if (v < 2) mac[@"S82M_CONTRACT_PRAGMA"] = @1;
+            if (v >= 1) mac[@"S82M_PLAIN_MATH"] = @1;
+            o.preprocessorMacros = mac;
+            NSError* err = nil;
+            id<MTLLibrary> lib = [g.device newLibraryWithSource:src options:o error:&err];
+            if (!lib) {
+                std::string e = err ? std::string(err.localizedDescription.UTF8String) : std::string("unknown error");
+                if (e.size() > 400) e.resize(400);
+                m.status = "compile failed: " + e;
+                NSLog(@"SABRE Mali kernels (%s): %s", kVariant[v], e.c_str());
+                continue;
+            }
+            auto make = [&](NSString* name) -> id<MTLComputePipelineState> {
+                id<MTLFunction> f = [lib newFunctionWithName:name];
+                if (!f) return nil;
+                NSError* e2 = nil;
+                return [g.device newComputePipelineStateWithFunction:f error:&e2];
+            };
+            m.guide = make(@"s82m_guide_kernel");
+            m.base_ref = make(@"s82m_base_ref_kernel");
+            m.reject = make(@"s82m_rejection_kernel");
+            m.dilate = make(@"s82m_dilate_kernel");
+            m.ok = m.guide && m.base_ref && m.reject && m.dilate;
+            m.status = m.ok ? std::string("GPU, ") + kVariant[v] : std::string("pipeline creation failed");
+        }
+    });
+    return m;
+}
 void dispatch2d(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p, int w, int h) {
     const NSUInteger tw = std::min<NSUInteger>(16, p.threadExecutionWidth);
     const NSUInteger th = std::max<NSUInteger>(1, std::min<NSUInteger>(16, p.maxTotalThreadsPerThreadgroup / tw));
@@ -78,23 +137,35 @@ bool run(id<MTLCommandBuffer> cb) {
     [cb waitUntilCompleted];
     return cb.status == MTLCommandBufferStatusCompleted;
 }
-void encode_guide(id<MTLComputeCommandEncoder> e, S82Gpu& g, id<MTLBuffer> raw, id<MTLBuffer> lut,
-                  const S82GuideParams& P, id<MTLBuffer> r4, id<MTLBuffer> cov) {
-    [e setComputePipelineState:g.guide];
+void encode_guide(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> pso, id<MTLBuffer> raw,
+                  id<MTLBuffer> lut, const S82GuideParams& P, id<MTLBuffer> r4, id<MTLBuffer> cov) {
+    [e setComputePipelineState:pso];
     [e setBuffer:raw offset:0 atIndex:0];
     [e setBuffer:lut offset:0 atIndex:1];
     [e setBytes:&P length:sizeof(P) atIndex:2];
     [e setBuffer:r4 offset:0 atIndex:3];
     [e setBuffer:cov offset:0 atIndex:4];
-    dispatch2d(e, g.guide, P.Wg, P.Hg);
+    dispatch2d(e, pso, P.Wg, P.Hg);
 }
 }  // namespace
 
+bool metal_mali_available(std::string* status) {
+    S82MaliGpu& m = mali_gpu();
+    if (status) *status = m.status;
+    return m.ok && gpu().ok;
+}
+
 bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80], const GuideTuning& t,
-                       Guide& guide, std::vector<float>& base_ref) {
+                       Guide& guide, std::vector<float>& base_ref, bool mali) {
     @autoreleasepool {
         S82Gpu& g = gpu();
         if (!g.ok || ref.data.size() < (size_t)ref.w * ref.h) return false;
+        id<MTLComputePipelineState> p_guide = g.guide, p_base = g.base_ref;
+        if (mali) {
+            S82MaliGpu& m = mali_gpu();
+            if (!m.ok) return false;
+            p_guide = m.guide; p_base = m.base_ref;
+        }
         id<MTLDevice> d = g.device;
         const S82GuideParams P = guide_params(ref.w, ref.h, cfa, t);
         const size_t n = (size_t)P.Wg * P.Hg;
@@ -105,13 +176,13 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
         const int size[2] = {P.Wg, P.Hg};
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        encode_guide(e, g, raw, lb, P, r4, cov);
+        encode_guide(e, p_guide, raw, lb, P, r4, cov);
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [e setComputePipelineState:g.base_ref];
+        [e setComputePipelineState:p_base];
         [e setBuffer:r4 offset:0 atIndex:0];
         [e setBuffer:br offset:0 atIndex:1];
         [e setBytes:size length:sizeof(size) atIndex:2];
-        dispatch2d(e, g.base_ref, P.Wg, P.Hg);
+        dispatch2d(e, p_base, P.Wg, P.Hg);
         [e endEncoding];
         if (!run(cb)) return false;
         guide.w = P.Wg; guide.h = P.Hg;
@@ -125,12 +196,18 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
 
 bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cfa, const float lut[80],
                         const GuideTuning& t, float noise_scale, const Unblocker& unb, const ResidShift& rs,
-                        std::vector<uint16_t>& cov_out, std::vector<uint8_t>& keep) {
+                        std::vector<uint16_t>& cov_out, std::vector<uint8_t>& keep, bool mali) {
     @autoreleasepool {
         S82Gpu& g = gpu();
         if (!g.ok || !g.base_ref_buf || comp.w / 2 != g.Wg || comp.h / 2 != g.Hg ||
             comp.data.size() < (size_t)comp.w * comp.h)
             return false;
+        id<MTLComputePipelineState> p_guide = g.guide, p_rej = g.reject, p_dil = g.dilate;
+        if (mali) {
+            S82MaliGpu& m = mali_gpu();
+            if (!m.ok) return false;
+            p_guide = m.guide; p_rej = m.reject; p_dil = m.dilate;
+        }
         id<MTLDevice> d = g.device;
         const S82GuideParams GP = guide_params(comp.w, comp.h, cfa, t);
         const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale, unb);
@@ -155,9 +232,9 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         const int size4[4] = {g.Wg, g.Hg, Wm, Hm};
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        encode_guide(e, g, raw, lb, GP, r4, cov);
+        encode_guide(e, p_guide, raw, lb, GP, r4, cov);
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [e setComputePipelineState:g.reject];
+        [e setComputePipelineState:p_rej];
         [e setBuffer:g.base_ref_buf offset:0 atIndex:0];
         [e setBuffer:r4 offset:0 atIndex:1];
         [e setBuffer:fl offset:0 atIndex:2];
@@ -167,13 +244,13 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         [e setBuffer:ub offset:0 atIndex:6];
         [e setBuffer:g.gm_buf offset:0 atIndex:7];
         [e setBuffer:itg offset:0 atIndex:8];
-        dispatch2d(e, g.reject, g.Wg, g.Hg);
+        dispatch2d(e, p_rej, g.Wg, g.Hg);
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [e setComputePipelineState:g.dilate];
+        [e setComputePipelineState:p_dil];
         [e setBuffer:rej offset:0 atIndex:0];
         [e setBuffer:kp offset:0 atIndex:1];
         [e setBytes:size4 length:sizeof(size4) atIndex:2];
-        dispatch2d(e, g.dilate, Wm, Hm);
+        dispatch2d(e, p_dil, Wm, Hm);
         if (rs.enabled) {
             const S82ResidParams RS = rs.P;
             [e setComputePipelineState:g.resid_factor];

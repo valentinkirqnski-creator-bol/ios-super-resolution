@@ -4290,7 +4290,9 @@ struct AlignUpscaleParams {
     uint carry_ambiguity;   // 1 = propagate the block-matching ambiguity flag
     uint fallback_on_ambiguous; // 1 = keep parent candidate on a near-tie
     float ambiguity_ratio;
-    uint _pad0;
+    uint has_ext;           // 1 = GCam external (global) candidate present (Config::align_global_candidate)
+    float ext_dx, ext_dy;   // the global translation at this level, in this level's pixels
+    float ext_bias;         // its cost multiplier
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
@@ -4598,6 +4600,8 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
                           in_flow[(cand_y * p.in_nx + prev_x) * 2u + 1u] * sfac);
     float2 cand2 = float2(in_flow[(prev_y * p.in_nx + cand_x) * 2u + 0u] * sfac,
                           in_flow[(prev_y * p.in_nx + cand_x) * 2u + 1u] * sfac);
+    const float2 cand3 = float2(p.ext_dx, p.ext_dy);
+    const uint n_cand = (p.has_ext != 0u) ? 4u : 3u;
 
     int ox = int(gid.x) * p.ts;
     int oy = int(gid.y) * p.ts;
@@ -4605,8 +4609,8 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
     float second = INFINITY;
     float2 best_flow = cand0;
     uint best_ci = 0u;
-    for (uint ci = 0u; ci < 3u; ++ci) {
-        float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : cand2);
+    for (uint ci = 0u; ci < n_cand; ++ci) {
+        float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : ((ci == 2u) ? cand2 : cand3));
         // The sampled region is a full ts x ts rectangle in both images, so
         // "invalidate on the first out-of-bounds sample" is exactly rectangle
         // containment. Hoisting it removes eight comparisons per pixel from the
@@ -4630,6 +4634,7 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
             for (int j = 0; j < p.ts; ++j)
                 dist += fabs(ref[rrow + uint(j)] - mov[mrow + uint(j)]);
         }
+        if (ci == 3u) dist *= p.ext_bias;
         if (dist < best) {
             second = best;
             best = dist;

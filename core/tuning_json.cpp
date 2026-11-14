@@ -206,6 +206,8 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("isa_prealign_rot_range_deg")) cfg.isa_prealign_rot_range_deg = fv("isa_prealign_rot_range_deg");
     if (has("isa_prealign_refine_dim")) cfg.isa_prealign_refine_dim = iv("isa_prealign_refine_dim");
     if (has("flow_upsample_candidates")) cfg.flow_upsample_candidates = bv("flow_upsample_candidates");
+    if (has("align_global_candidate")) cfg.align_global_candidate = bv("align_global_candidate");
+    if (has("align_global_candidate_bias")) cfg.align_global_candidate_bias = fv("align_global_candidate_bias");
     if (has("bm_subpixel_enabled"))     cfg.bm_subpixel_enabled = bv("bm_subpixel_enabled");
     if (has("lk_every_level_enabled"))  cfg.lk_every_level_enabled = bv("lk_every_level_enabled");
     if (has("halftile_refine_enabled")) cfg.halftile_refine_enabled = bv("halftile_refine_enabled");
@@ -281,6 +283,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("sabre_noise_scale"))          cfg.sabre_noise_scale = fv("sabre_noise_scale");
     if (has("sabre_noise_blind"))          cfg.sabre_noise_blind = bv("sabre_noise_blind");
     if (has("sabre_mali_exact"))           cfg.sabre_mali_exact = bv("sabre_mali_exact");
+    if (has("sabre_mali_gpu"))             cfg.sabre_mali_gpu = bv("sabre_mali_gpu");
+    if (has("sabre_mali_noise_model"))     cfg.sabre_mali_noise_model = bv("sabre_mali_noise_model");
+    if (has("sabre_save_accumulated_mask")) cfg.sabre_save_accumulated_mask = bv("sabre_save_accumulated_mask");
     if (has("sabre_resid_shift_enabled"))  cfg.sabre_resid_shift_enabled = bv("sabre_resid_shift_enabled");
     if (has("sabre_resid_shift_tol_px"))   cfg.sabre_resid_shift_tol_px = fv("sabre_resid_shift_tol_px");
     if (has("sabre_resid_shift_width_px")) cfg.sabre_resid_shift_width_px = fv("sabre_resid_shift_width_px");
