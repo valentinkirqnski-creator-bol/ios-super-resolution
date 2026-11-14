@@ -157,7 +157,7 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
 // GPU per-frame stages (core/sabre82_metal.mm); false = not run, the caller uses the CPU stages.
 // metal_base_stages: guide + kernel of the base frame and its BaseFrameRefColor, kept resident for the burst;
 // returns the guide (host copy) and the base reference colour (host copy) for a CPU fallback.
-// mali: the Mali-G71 bit-exact kernels (core/Sabre82MaliKernels.metal, compiled at first use); the caller passes
+// mali: the Mali-G71 bit-exact kernels (core/Sabre82MaliKernels.msl, compiled at first use); the caller passes
 // gcam_bayer_input() as the frame. False if that library is unavailable (metal_mali_available says why).
 bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80], const GuideTuning& t,
                        Guide& guide, std::vector<float>& base_ref, bool mali = false);

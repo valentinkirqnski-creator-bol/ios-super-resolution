@@ -75,8 +75,10 @@ targets:
           - "HHSRKernels.metal"
           - "Sabre82Kernels.metal"
       # SABRE Mali-G71 bit-exact kernels: shipped as SOURCE (not in default.metallib) and compiled at run time
-      # without fast math by core/sabre82_metal.mm, which splices the shared header into the kernel text.
-      - path: core/Sabre82MaliKernels.metal
+      # without fast math by core/sabre82_metal.mm, which splices the shared header into the kernel text. The
+      # .msl extension keeps Xcode from compiling it: a .metal file is compiled even in the resources phase,
+      # which made a second default.metallib link ("Unexpected duplicate tasks: MetalLink").
+      - path: core/Sabre82MaliKernels.msl
         buildPhase: resources
       - path: core/sabre82_shared.h
         buildPhase: resources

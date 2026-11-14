@@ -519,7 +519,7 @@ S82_INLINE float s82_dilate_pixel(const S82_DEVICE uint8_t* rej, int W, int H, i
 //  - `x < 0.0` is true for -0 (the guide's green-only flag on flat clipped patches is -0).
 //  - guide: MADD/moment FMAs, products with fp32 1/9 and 1/18 (s82m_guide_pixel).
 //  - R8 stores round half to even.
-// The GPU runs this same text (core/Sabre82MaliKernels.metal): that library is compiled at run time with fast
+// The GPU runs this same text (core/Sabre82MaliKernels.msl): that library is compiled at run time with fast
 // math OFF and S82M_CONTRACT_PRAGMA defined (no FMA contraction), and s82_q16 in software (S82_Q16_SOFT), so
 // the only operations not pinned to the bit are exp2 (precise::exp2 vs the C library) and the portable kernel
 // covariance cov3; every fused multiply-add the Mali compiler emitted is an explicit fma().

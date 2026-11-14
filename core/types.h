@@ -1745,7 +1745,7 @@ struct Config {
     // sampler with fp16 accumulation, exact NEAREST, fp16 gathers, FMA bicubic taps and the zero-reading noise LUT
     // (noise-blind unless sabre_mali_noise_model). See s82m_* in core/sabre82_shared.h.
     bool  sabre_mali_exact = false;
-    // sabre_mali_exact's guide / base reference / rejection / dilate on the GPU: core/Sabre82MaliKernels.metal,
+    // sabre_mali_exact's guide / base reference / rejection / dilate on the GPU: core/Sabre82MaliKernels.msl,
     // compiled at first use with fast math off (the same s82m_* text as the CPU model; byte-identical to it in a
     // CPU emulation of the GPU arithmetic). Falls back to the CPU stages if that library can't be built (the
     // progress line says why). false = the CPU stages (reference).

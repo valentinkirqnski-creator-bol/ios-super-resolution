@@ -1,7 +1,8 @@
 // GCam 8.2.300 SABRE bit-exact to a Mali-G71 (Config::sabre_mali_exact) on the GPU: guide, base reference,
 // rejection, dilate. The arithmetic is the s82m_* text of core/sabre82_shared.h, the same the CPU model runs.
 //
-// NOT part of default.metallib: this file and core/sabre82_shared.h ship as bundle resources and
+// NOT part of default.metallib (hence .msl, not .metal: Xcode compiles any .metal file, even one listed as a
+// resource): this file and core/sabre82_shared.h ship as bundle resources and
 // core/sabre82_metal.mm compiles them at run time with fast math OFF, S82M_CONTRACT_PRAGMA (no FMA contraction)
 // and S82_Q16_SOFT (fp16 stores rounded in software), which the app's fast-math library can't hold to the bit.
 // The #include below is replaced with the header text before compiling. Buffer layouts are those of the

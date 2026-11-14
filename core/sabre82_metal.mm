@@ -64,7 +64,7 @@ id<MTLBuffer> buf(id<MTLDevice> d, const void* src, size_t bytes) {
     return src ? [d newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared]
                : [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
 }
-// Mali-G71 bit-exact stages (Config::sabre_mali_exact): core/Sabre82MaliKernels.metal + core/sabre82_shared.h ship
+// Mali-G71 bit-exact stages (Config::sabre_mali_exact): core/Sabre82MaliKernels.msl + core/sabre82_shared.h ship
 // as bundle resources and are compiled here once, with fast math off, no FMA contraction (S82M_CONTRACT_PRAGMA)
 // and software fp16 stores (S82_Q16_SOFT). If the toolchain rejects a variant the next, looser one is tried;
 // `status` names the variant that compiled or why none did (the pipeline then runs these stages on the CPU).
@@ -80,7 +80,7 @@ S82MaliGpu& mali_gpu() {
         S82Gpu& g = gpu();
         if (!g.device) { m.status = "no Metal device"; return; }
         NSBundle* b = [NSBundle mainBundle];
-        NSString* kp = [b pathForResource:@"Sabre82MaliKernels" ofType:@"metal"];
+        NSString* kp = [b pathForResource:@"Sabre82MaliKernels" ofType:@"msl"];
         NSString* hp = [b pathForResource:@"sabre82_shared" ofType:@"h"];
         if (!kp || !hp) { m.status = "Mali kernel source missing from the app bundle"; return; }
         NSString* ks = [NSString stringWithContentsOfFile:kp encoding:NSUTF8StringEncoding error:nil];
@@ -90,7 +90,12 @@ S82MaliGpu& mali_gpu() {
         static const char* kVariant[3] = {"precise math, no contraction", "plain math, no contraction", "plain math"};
         for (int v = 0; v < 3 && !m.ok; ++v) {
             MTLCompileOptions* o = [[MTLCompileOptions alloc] init];
-            o.fastMathEnabled = NO;
+            if (@available(iOS 18.0, macOS 15.0, *)) {   // fastMathEnabled's replacement
+                o.mathMode = MTLMathModeSafe;
+                o.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+            } else {
+                o.fastMathEnabled = NO;
+            }
             NSMutableDictionary* mac = [NSMutableDictionary dictionary];
             mac[@"S82M_GPU"] = @1;
             mac[@"S82_Q16_SOFT"] = @1;
