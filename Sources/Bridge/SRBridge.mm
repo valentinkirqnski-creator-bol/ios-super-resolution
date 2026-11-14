@@ -693,6 +693,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_cov_scale"])           cfg.gcam_cov_scale = tuning[@"gcam_cov_scale"].floatValue;
     if (tuning[@"sabre_noise_scale"])        cfg.sabre_noise_scale = tuning[@"sabre_noise_scale"].floatValue;
     if (tuning[@"sabre_noise_blind"])        cfg.sabre_noise_blind = tuning[@"sabre_noise_blind"].boolValue;
+    if (tuning[@"sabre_mali_exact"])         cfg.sabre_mali_exact = tuning[@"sabre_mali_exact"].boolValue;
     if (tuning[@"sabre_resid_shift_enabled"]) cfg.sabre_resid_shift_enabled = tuning[@"sabre_resid_shift_enabled"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;

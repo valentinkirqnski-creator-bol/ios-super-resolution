@@ -1327,7 +1327,9 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
     build_noise_lut(slope, offset, lut);
-    if (work.sabre_noise_blind) std::fill(lut, lut + 80, 0.f);   // Mali-G71: the LINEAR RGBA32F LUT reads 0
+    // Mali-G71: the LINEAR RGBA32F LUT is an incomplete texture and reads 0 (guide and rejection).
+    const bool mali = work.sabre_mali_exact;   // + the device rasterizer / sampler arithmetic (CPU stages)
+    if (work.sabre_noise_blind || mali) std::fill(lut, lut + 80, 0.f);
     // Per-capture kernel covariance: EstimateSnr on the green noise model at the reference's mean level,
     // K = sqrt(N/12)*SNR through the 6 MergeOptions curves (same for every frame of the burst).
     const CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
@@ -1350,12 +1352,13 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     std::vector<float> base_ref;
     bool gpu = false;
 #if defined(__APPLE__)
-    gpu = metal_base_stages(ref, cfa, lut, base_t, base_guide, base_ref);
+    if (!mali) gpu = metal_base_stages(ref, cfa, lut, base_t, base_guide, base_ref);
     struct S82BurstGuard { ~S82BurstGuard() { metal_end_burst(); } } s82_burst_guard;
 #endif
     if (!gpu) {
-        base_guide = compute_guide(ref, cfa, lut, base_t, work.num_threads);
-        base_ref = base_reference(base_guide, work.num_threads);
+        base_guide = mali ? compute_guide(gcam_bayer_input(ref, work, 1.f), cfa, lut, base_t, work.num_threads, true)
+                          : compute_guide(ref, cfa, lut, base_t, work.num_threads);
+        base_ref = base_reference(base_guide, work.num_threads, mali);
     }
     // Residual-shift test (hhsr extension): base-reference gradient + strong-edge threshold, once per burst.
     const ResidShift rs = resid_shift_setup(base_ref, Wg, Hg, work, work.num_threads);
@@ -1364,11 +1367,11 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         char buf[320];
         std::snprintf(buf, sizeof(buf),
                       "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g, SNR %.3g K %.3g "
-                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s",
-                      gpu ? "GPU" : "CPU", Wr, Hr, Wo, Ho, frame_count,
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s",
+                      gpu ? "GPU" : (mali ? "CPU, Mali-G71 exact" : "CPU"), Wr, Hr, Wo, Ho, frame_count,
                       work.has_noise_profile ? "DNG" : "fallback", noise_scale, cov_t.snr, cov_t.K,
                       cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1],
-                      rs.enabled ? ", edge shift test on" : "");
+                      rs.enabled ? ", edge shift test on" : "", base_t.force_rgb ? ", force RGB (SNR <= 10)" : "");
         report(buf, 0.05f);
     }
 
@@ -1440,11 +1443,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         if (gpu) done = metal_frame_stages(comp, mf->flow, cfa, lut, ft, noise_scale, unb, rs, mf->cov, mf->keep);
 #endif
         if (!done) {
-            Guide g = compute_guide(comp, cfa, lut, ft, work.num_threads);
+            Guide g = mali ? compute_guide(gcam_bayer_input(comp, work, Kf), cfa, lut, ft, work.num_threads, true)
+                           : compute_guide(comp, cfa, lut, ft, work.num_threads);
             std::vector<uint8_t> rej;
             std::vector<float> itg;
-            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rs, rej, itg, work.num_threads);
-            dilate(rej, Wg, Hg, mf->keep, work.num_threads);
+            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rs, rej, itg, work.num_threads, mali);
+            dilate(rej, Wg, Hg, mf->keep, work.num_threads, mali);
             resid_shift_apply(rs, itg, mf->keep, work.num_threads);
             mf->cov = std::move(g.cov);
         }
@@ -1512,7 +1516,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     const double t_m = prof_now_ms();
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
-        if (!merge_band(merge_frames, ctx, y0, y1, gpu, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
+        if (!merge_band(merge_frames, ctx, y0, y1, gpu || mali, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
             report("Error: SABRE merge failed", 1.f);
             writer.close();
             return Image();

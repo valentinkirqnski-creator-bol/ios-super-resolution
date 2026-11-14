@@ -1731,6 +1731,11 @@ struct Config {
     // in BOTH the guide (green-only switch) and the rejection. When on, the LUT is zeroed before either stage
     // (CPU and GPU). The SNR estimate / kernel curves and the Unblocker (CPU-side in GCam) keep the noise model.
     bool  sabre_noise_blind = false;
+    // SABRE 8.2 bit-exact to a Mali-G71 (A20e) run: the device's rasterizer tex_coord, fixed-point LINEAR
+    // sampler with fp16 accumulation, exact NEAREST, fp16 gathers, FMA bicubic taps and the zero-reading noise LUT
+    // (implies sabre_noise_blind). Base reference, rejection and dilate run on the CPU (the fast-math Metal
+    // build can't hold them to the bit); the merge stays on the GPU. See s82m_* in core/sabre82_shared.h.
+    bool  sabre_mali_exact = false;
     // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
     // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
     // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on

@@ -52,10 +52,13 @@ void extract_eps(const Config& cfg, const CFA& cfa, float K, float eps[4]);
 struct GuideTuning {
     float cov1[4], cov2[2];
     float green_clip;
-    int force_rgb = 0;        // force_reference_color_rgb.x (per shot in GCam; 0 = allow green-only)
+    int force_rgb = 0;        // force_reference_color_rgb.x: per shot, EstimateSnr <= 10 (set by guide_tuning)
 };
 GuideTuning guide_tuning(const CovTuning& cov, float green_clip);
-GuideTuning default_guide_tuning();   // the captured device values (K ~ 6.22), clip off
+GuideTuning default_guide_tuning();
+// Config::sabre_mali_exact: GCam's guide input from a loader plane -- the integer DN recovered, then
+// fma(DN, gains, black_levels_times_gains) with gains = (exposure ratio * capture WB) / (white - black).
+Image gcam_bayer_input(const Image& im, const Config& cfg, float exposure_gain);   // the captured device values (K ~ 6.22), clip off
 
 // Uniforms of each pass (per-shot values from the captured 8.x-family device run where the GLSL is silent).
 S82GuideParams guide_params(int Wr, int Hr, const S82Cfa& cfa, const GuideTuning& t);
@@ -103,9 +106,11 @@ struct Guide {
     std::vector<float> ref4;
     std::vector<uint16_t> cov;
 };
-Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads);
+Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads,
+                    bool mali = false);
 // BaseFrameRefColor pass: bicubic-filtered base guide, sign kept (RGBA16F).
-std::vector<float> base_reference(const Guide& base, int threads);
+// mali = Config::sabre_mali_exact (s82m_* in sabre82_shared.h: the Mali-G71 rasterizer and texture unit).
+std::vector<float> base_reference(const Guide& base, int threads, bool mali = false);
 // Residual-shift test (hhsr extension, Config::sabre_resid_shift_enabled; see sabre82_shared.h). Per burst:
 // |grad L| of the base reference and the strong-edge threshold (Config::sabre_resid_shift_edge_pct percentile).
 // gm is always filled (the rejection pass reads it); `enabled` gates the extra passes.
@@ -121,9 +126,9 @@ void resid_shift_apply(const ResidShift& rs, const std::vector<float>& itg, std:
 // rejection: also fills itg (Wg x Hg, It * |grad L|) for the residual-shift test when rs.enabled.
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
                float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
-               std::vector<float>& itg, int threads);
+               std::vector<float>& itg, int threads, bool mali = false);
 // DilateMask to the half-guide grid (Wg/2 x Hg/2).
-void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads);
+void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads, bool mali = false);
 
 struct MergeFrame {
     const Image* raw = nullptr;       // normalized Bayer (Wr x Hr)

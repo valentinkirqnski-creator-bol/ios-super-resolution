@@ -36,7 +36,8 @@ const float kBoostVarThr = 25.0f;
 const float kMotionThrGuidePx = 0.2016f;    // 1.9236641e-4 uv at a 1048-px guide
 // Residual-shift test (hhsr extension): raw px per 2|s| of the 7x7 across-edge LK (it under-reads a thin edge;
 // calibrated by s82_resid_cal: alt = base reference shifted by a known amount).
-const float kResidCal = 1.7f;   // s82_rcal on burst12: 1.98 across vertical edges, 1.46 across horizontal (geo mean)
+const float kResidCal = 1.7f;
+const float kForceRgbMaxSnr = 10.0f;   // FUN_012bcea8: force_reference_color_rgb = (snr <= 10)   // s82_rcal on burst12: 1.98 across vertical edges, 1.46 across horizontal (geo mean)
 const float kGuideBorderGuidePx = 1.25f;    // guide pass frame_border_padded
 const float kMergeBorderGuidePx = 0.75f;    // rejection + merge frame_border_padded (1.5 raw px)
 }  // namespace
@@ -170,7 +171,54 @@ GuideTuning guide_tuning(const CovTuning& cov, float green_clip) {
     for (int k = 0; k < 4; ++k) t.cov1[k] = cov.cov1[k];
     for (int k = 0; k < 2; ++k) t.cov2[k] = cov.cov2[k];
     t.green_clip = green_clip;
+    // force_reference_color_rgb (FUN_012bcea8): the per-shot merge option at +0x54 is
+    // `EstimateSnr(...) <= 10.0f` -- the same SNR that sets K. Low-SNR shots reject on filtered RGB only.
+    // Checked on every capture with known uniforms: car SNR 20.9 -> 0, house 6.5 -> 1, c2 7.3 -> 1.
+    t.force_rgb = cov.snr <= kForceRgbMaxSnr ? 1 : 0;
     return t;
+}
+
+Image gcam_bayer_input(const Image& im, const Config& cfg, float exposure_gain) {
+    // The loader delivered v = max(((DN + 1e-4) - black) / (white - black) * wbr, 0) * g (g = exposure gain,
+    // brightened sites capped at wbr). Recover the integer DN (the loader's rounding is far below half a DN),
+    // then form GCam's guide input: the guide reads the extracted Bayer as uvec4 (DN, the +1e-4 truncated)
+    // and applies one MADD, fma(DN, gains, black_levels_times_gains), with
+    //   gains = ((exposure ratio * wb[c]) / (white - black[c])),  black_levels_times_gains = -(gains' * black).
+    Image out(im.h, im.w, 1);
+    const float g = exposure_gain > 0.f ? exposure_gain : 1.f;
+    float gain[2][2], blt[2][2], wbr[2][2], blk[2][2], den[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            int c = cfg.cfa.p[i][j];
+            if (c < 0 || c > 2) c = 1;
+            float r = 1.f;
+            if (cfg.raw_prewhitened) {
+                const float q = cfg.white_balance[c] / cfg.white_balance[1];
+                if (std::isfinite(q) && q > 0.f) r = q;
+            }
+            const float black = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+            const float white = (float)(int)cfg.white_level;
+            const float d = white - black > 0.f ? white - black : 1.f;
+            const float gw = g * r;
+            wbr[i][j] = r; blk[i][j] = black; den[i][j] = d;
+            gain[i][j] = gw / d;
+            blt[i][j] = -(gw * black) / d;
+        }
+    const float dn_max = cfg.white_level > 0.f ? cfg.white_level : 65535.f;
+    parallel_rows(im.h, 0, [&](int y) {
+        for (int x = 0; x < im.w; ++x) {
+            const int i = y & 1, j = x & 1;
+            const float v = im.data[(size_t)y * im.w + x];
+            float dn;
+            if (!(v > 0.f)) dn = 0.f;                                          // at/below black
+            else if (g != 1.f && v >= wbr[i][j]) dn = dn_max;                  // capped by the exposure match
+            else dn = std::nearbyint((double)v / g / wbr[i][j] * den[i][j] + blk[i][j] - 1e-4);
+            dn = std::min(std::max(dn, 0.f), 65535.f);
+            out.data[(size_t)y * im.w + x] = s82m_fma(dn, gain[i][j], blt[i][j]);
+        }
+    });
+    out.exposure = im.exposure;
+    return out;
 }
 
 GuideTuning default_guide_tuning() {
@@ -399,7 +447,8 @@ FlowTex zero_flow_tex(int nx, int ny, int ts, int Wr, int Hr) {
 }
 
 // ------------------------------------------------------------------------------------------- per frame
-Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads) {
+Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], const GuideTuning& t, int threads,
+                    bool mali) {
     Guide g;
     g.w = raw.w / 2; g.h = raw.h / 2;
     g.ref4.assign((size_t)g.w * g.h * 4, 0.f);
@@ -409,7 +458,8 @@ Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], co
     parallel_rows(g.h, threads, [&](int gy) {
         for (int gx = 0; gx < g.w; ++gx) {
             float r4[4], c3[3];
-            s82_guide_pixel(rp, P, lut, gx, gy, r4, c3);
+            if (mali) s82m_guide_pixel(rp, P, lut, gx, gy, r4, c3);
+            else s82_guide_pixel(rp, P, lut, gx, gy, r4, c3);
             float* o = &g.ref4[((size_t)gy * g.w + gx) * 4];
             for (int k = 0; k < 4; ++k) o[k] = s82_q16(r4[k]);
             uint16_t* oc = &g.cov[((size_t)gy * g.w + gx) * 3];
@@ -419,11 +469,12 @@ Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], co
     return g;
 }
 
-std::vector<float> base_reference(const Guide& base, int threads) {
+std::vector<float> base_reference(const Guide& base, int threads, bool mali) {
     std::vector<float> out((size_t)base.w * base.h * 4);
     parallel_rows(base.h, threads, [&](int gy) {
         for (int gx = 0; gx < base.w; ++gx) {
-            const S82F4 r = s82_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy);
+            const S82F4 r = mali ? s82m_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy)
+                                 : s82_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy);
             float* o = &out[((size_t)gy * base.w + gx) * 4];
             o[0] = s82_q16(r.x); o[1] = s82_q16(r.y); o[2] = s82_q16(r.z); o[3] = s82_q16(r.w);
         }
@@ -433,7 +484,7 @@ std::vector<float> base_reference(const Guide& base, int threads) {
 
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
                float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
-               std::vector<float>& itg, int threads) {
+               std::vector<float>& itg, int threads, bool mali) {
     const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale, unb);
     rej.assign((size_t)alt.w * alt.h, 0);
     const bool want_it = rs.enabled && rs.gm.size() == rej.size();
@@ -442,8 +493,10 @@ void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowT
         for (int gx = 0; gx < alt.w; ++gx) {
             float it;
             const size_t i = (size_t)gy * alt.w + gx;
-            rej[i] = s82_to_u8(s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut,
-                                                   unb.data.data(), P, gx, gy, &it));
+            rej[i] = mali ? s82m_to_u8(s82m_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(),
+                                                            unb.data.data(), P, gx, gy, &it))
+                          : s82_to_u8(s82_rejection_pixel(base_ref.data(), alt.ref4.data(), flow.data.data(), lut,
+                                                          unb.data.data(), P, gx, gy, &it));
             if (want_it) itg[i] = it * rs.gm[i];
         }
     });
@@ -483,12 +536,13 @@ void resid_shift_apply(const ResidShift& rs, const std::vector<float>& itg, std:
     keep.swap(out);
 }
 
-void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads) {
+void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads, bool mali) {
     const int ow = std::max(1, w / 2), oh = std::max(1, h / 2);
     keep.assign((size_t)ow * oh, 0);
     parallel_rows(oh, threads, [&](int oy) {
         for (int ox = 0; ox < ow; ++ox)
-            keep[(size_t)oy * ow + ox] = s82_to_u8(s82_dilate_pixel(rej.data(), w, h, ow, oh, ox, oy));
+            keep[(size_t)oy * ow + ox] = mali ? s82m_to_u8(s82m_dilate_pixel(rej.data(), w, h, ox, oy))
+                                              : s82_to_u8(s82_dilate_pixel(rej.data(), w, h, ow, oh, ox, oy));
     });
 }
 
