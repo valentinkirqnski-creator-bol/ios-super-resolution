@@ -205,6 +205,19 @@ S82_INLINE float s82_nearest_u8(const S82_DEVICE uint8_t* p, int W, int H, float
     const int y = s82_clampi((int)s82_floor(v * (float)H), 0, H - 1);
     return (float)p[y * W + x] * (1.0f / 255.0f);
 }
+// LINEAR fetch of an R8 texture (value / 255). GCam's unblocker texture is sampled through this: on burst9_GT2
+// (LMC 8.4, full 198x149 unblocker uploaded) 92% of the rejection mismatches under NEAREST sat in its footprint.
+S82_INLINE float s82_linear_u8(const S82_DEVICE uint8_t* p, int W, int H, float u, float v) {
+    const float x = u * (float)W - 0.5f, y = v * (float)H - 0.5f;
+    const float fx = s82_floor(x), fy = s82_floor(y);
+    const float ax = x - fx, ay = y - fy;
+    const int x0 = s82_clampi((int)fx, 0, W - 1), x1 = s82_clampi((int)fx + 1, 0, W - 1);
+    const int y0 = s82_clampi((int)fy, 0, H - 1), y1 = s82_clampi((int)fy + 1, 0, H - 1);
+    const float k = 1.0f / 255.0f;
+    const float a = (float)p[y0 * W + x0] * k * (1.0f - ax) + (float)p[y0 * W + x1] * k * ax;
+    const float b = (float)p[y1 * W + x0] * k * (1.0f - ax) + (float)p[y1 * W + x1] * k * ax;
+    return a * (1.0f - ay) + b * ay;
+}
 S82_INLINE S82F4 s82_flow_nearest(const S82_DEVICE float* flow, int nx, int ny, float u, float v) {
     const int x = s82_clampi((int)s82_floor(u * (float)nx), 0, nx - 1);
     const int y = s82_clampi((int)s82_floor(v * (float)ny), 0, ny - 1);
@@ -416,7 +429,7 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
     float wuv[2];
     wuv[0] = tcx + fl.x; wuv[1] = tcy + fl.y;
     s82_mirror(wuv, P.fbp);
-    float unblocker = s82_nearest_u8(unb, P.unx, P.uny, tcx * P.uscale[0], tcy * P.uscale[1]);
+    float unblocker = s82_linear_u8(unb, P.unx, P.uny, tcx * P.uscale[0], tcy * P.uscale[1]);
     const float lfv = fl.z;
     bool prior = false;
     if (lfv < P.ub_thr) unblocker = 0.0f;
@@ -690,6 +703,20 @@ S82_INLINE S82F4 s82m_bicubic_abs(const S82_DEVICE float* tex, int W, int H, flo
                         g1y * s82m_fma(g0x, s82_fabs(t2[c]), g1x * s82_fabs(t3[c])));
     return s82_f4(o[0], o[1], o[2], o[3]);
 }
+// R8 LINEAR on the Mali (measured, maliprobe): 8-bit corner weights as in s82m_linear4, the integer sum of
+// texel * weight divided by 255*256, result fp16. Used for the unblocker.
+S82_INLINE float s82m_linear_u8(const S82_DEVICE uint8_t* p, int W, int H, float u, float v) {
+    S82M_I64 X = s82m_fix(u, W, 8) - 128, Y = s82m_fix(v, H, 8) - 128;
+    const S82M_I64 mx = (S82M_I64)(W - 1) * 256, my = (S82M_I64)(H - 1) * 256;
+    X = X < 0 ? 0 : (X > mx ? mx : X);
+    Y = Y < 0 ? 0 : (Y > my ? my : Y);
+    const int x0 = (int)(X >> 8), y0 = (int)(Y >> 8), qx = (int)(X & 255), qy = (int)(Y & 255);
+    const int x1 = x0 + 1 < W ? x0 + 1 : W - 1, y1 = y0 + 1 < H ? y0 + 1 : H - 1;
+    const int ax = 256 - qx, bx = qx, ay = 256 - qy, by = qy;
+    const int sum = (int)p[y0 * W + x0] * ((ax * ay + 128) >> 8) + (int)p[y0 * W + x1] * ((bx * ay + 128) >> 8) +
+                    (int)p[y1 * W + x0] * ((ax * by + 127) >> 8) + (int)p[y1 * W + x1] * ((bx * by + 127) >> 8);
+    return s82_q16(s82m_div((float)sum, 65280.0f));
+}
 // R8 store: round half to even.
 S82_INLINE uint8_t s82m_to_u8(float v) { return (uint8_t)(int)s82m_rint(s82_clampf(v, 0.0f, 1.0f) * 255.0f); }
 // kBaseFrameRefColorEntryPoint on the Mali.
@@ -717,8 +744,7 @@ S82_INLINE float s82m_rejection_pixel(const S82_DEVICE float* base_ref, const S8
     wuv[0] = tcx + fl[0];
     wuv[1] = tcy + fl[1];
     s82_mirror(wuv, P.fbp);
-    float unblocker = s82m_div(
-        (float)unb[s82m_nearest(tcy * P.uscale[1], P.uny) * P.unx + s82m_nearest(tcx * P.uscale[0], P.unx)], 255.0f);
+    float unblocker = s82m_linear_u8(unb, P.unx, P.uny, tcx * P.uscale[0], tcy * P.uscale[1]);
     const float lfv = fl[2];
     bool prior = false;
     if (lfv < P.ub_thr) unblocker = 0.0f;
@@ -924,7 +950,9 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
                                 S82_THREAD float* color3, S82_THREAD float* weight3) {
     const float tcx = ((float)ox + 0.5f) / (float)P.Wo, tcy = ((float)oy + 0.5f) / (float)P.Ho;
     float frame_weight = 1.0f;
-    if (P.use_mask) frame_weight = s82_nearest_u8(mask, P.Wm, P.Hm, tcx, tcy);
+    // The dilated mask is sampled LINEAR (burst9_GT2 teacher-forced merge: 99.7% of the >2% errors under NEAREST
+    // sat on mask-transition texels).
+    if (P.use_mask) frame_weight = s82_linear_u8(mask, P.Wm, P.Hm, tcx, tcy);
     const S82F4 fl = s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
     float s[2];
     s[0] = tcx + fl.x; s[1] = tcy + fl.y;
