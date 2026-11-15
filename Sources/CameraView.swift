@@ -1271,6 +1271,11 @@ struct CameraView: View {
                         Toggle("SABRE Save Accumulated Mask", isOn: $cam.tuningParams.sabre_save_accumulated_mask)
                         Text("Saves one extra image to Photos with the DNG: the accumulated robustness mask, i.e. how much of all comparison frames was kept at each spot (white = every frame kept fully, black = only the reference frame used). Same grid as GCam's mask (a quarter of the raw resolution) and the same quantity GCam accumulates, so it can be compared with GCam's directly. Works without Save Robustness Mask (which also saves every frame's own mask). Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SABRE Exposure Matching Off", isOn: Binding(
+                            get: { !cam.tuningParams.exposure_match_enabled },
+                            set: { cam.tuningParams.exposure_match_enabled = !$0 }))
+                        Text("Feeds the frames to SABRE at their captured brightness, as GCam receives them. Normally the app brightens each frame to the reference using the DNG's shutter x ISO (e.g. 1/2200 s -> 1/2000 s = x1.10). With this on, unmatched frames differ from the reference by a few percent everywhere, so the robustness mask rejects them wherever the flow is even slightly off, instead of letting ~1 px misaligned frames through (ghosts) - at the cost of merging far fewer frames when the exposure changed mid-burst. Same setting as Match Frame Brightness (inverted). Off by default (= matching on).")
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("SABRE Edge Shift Test (not GCam)", isOn: $cam.tuningParams.sabre_resid_shift_enabled)
                         Text("Adds a check GCam doesn't have. SABRE judges a frame by its colour difference relative to the local contrast, so on strong edges it keeps frames that are 0.3-1 px misaligned; those show as doubled, colour-fringed edges. This measures how far each frame's edge sits from the reference edge after alignment and reduces that frame's weight on strong edges when it is more than about 0.15 px off. Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
