@@ -1765,6 +1765,12 @@ struct Config {
     // the guides) and, on edges above the edge_pct percentile of |grad|, scales the frame's keep mask by
     // exp(-((shift - tol) / width)^2) (raw px). Off by default.
     bool  sabre_resid_shift_enabled = false;
+    // GCam runs SABRE at true 1x (no zoom) with its REJECTION_ONLY shader variant: the guide stays in linear
+    // light (no SQRT_COLOR_SPACE), the base reference and the current frame are sampled biquadratically
+    // (SampleBiquadraticAbsolute) instead of bicubically, kFilterVarianceScale 0.25 (green) / 0.0976597 (RGB),
+    // and a straight-line noise LUT. Captured from GCam on burst9_1x_GT / burst12_1x_GT. On: the SABRE 8.2 path
+    // uses that variant whenever the output is 1x; the super-res (bicubic, sqrt) variant otherwise.
+    bool  sabre_rejection_only_1x = true;
     float sabre_resid_shift_tol_px = 0.15f;
     float sabre_resid_shift_width_px = 0.2f;
     float sabre_resid_shift_edge_pct = 90.0f;

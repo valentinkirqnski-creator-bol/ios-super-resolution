@@ -1271,6 +1271,9 @@ struct CameraView: View {
                         Toggle("SABRE Save Accumulated Mask", isOn: $cam.tuningParams.sabre_save_accumulated_mask)
                         Text("Saves one extra image to Photos with the DNG: the accumulated robustness mask, i.e. how much of all comparison frames was kept at each spot (white = every frame kept fully, black = only the reference frame used). Same grid as GCam's mask (a quarter of the raw resolution) and the same quantity GCam accumulates, so it can be compared with GCam's directly. Works without Save Robustness Mask (which also saves every frame's own mask). Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SABRE GCam 1x Mode", isOn: $cam.tuningParams.sabre_rejection_only_1x)
+                        Text("At 1x output, runs SABRE the way GCam does at 1x (its REJECTION_ONLY variant): the guide images stay in linear light instead of square-root space, the reference and each frame are sampled with GCam's biquadratic filter instead of bicubic, and the noise allowances use GCam's 1x constants. With GCam's flow on GCam's own 1x frames this reproduces its rejection masks; the 2x path is unchanged. On by default.")
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("SABRE Exposure Matching Off", isOn: Binding(
                             get: { !cam.tuningParams.exposure_match_enabled },
                             set: { cam.tuningParams.exposure_match_enabled = !$0 }))

@@ -178,7 +178,7 @@ bool metal_base_stages(const Image& ref, const S82Cfa& cfa, const float lut[80],
         id<MTLBuffer> lb = buf(d, lut, 80 * 4);
         id<MTLBuffer> r4 = buf(d, nullptr, n * 16), cov = buf(d, nullptr, n * 6), br = buf(d, nullptr, n * 16);
         if (!raw || !lb || !r4 || !cov || !br) return false;
-        const int size[2] = {P.Wg, P.Hg};
+        const int size[4] = {P.Wg, P.Hg, P.rejection_only, 0};
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         encode_guide(e, p_guide, raw, lb, P, r4, cov);
@@ -215,7 +215,7 @@ bool metal_frame_stages(const Image& comp, const FlowTex& flow, const S82Cfa& cf
         }
         id<MTLDevice> d = g.device;
         const S82GuideParams GP = guide_params(comp.w, comp.h, cfa, t);
-        const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale, unb);
+        const S82RejParams RP = rej_params(g.Wg, g.Hg, flow, noise_scale, unb, t.rejection_only);
         const int Wm = std::max(1, g.Wg / 2), Hm = std::max(1, g.Hg / 2);
         const size_t n = (size_t)g.Wg * g.Hg, nm = (size_t)Wm * Hm;
         if (unb.data.size() < (size_t)unb.w * unb.h || rs.gm.size() != n) return false;

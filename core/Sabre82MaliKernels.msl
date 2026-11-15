@@ -28,14 +28,15 @@ kernel void s82m_guide_kernel(device const float* raw        [[buffer(0)]],
     for (int k = 0; k < 3; ++k) cov[i * 3 + k] = (ushort)s82_unorm10_code(c3[k]);
 }
 
+// size = (Wg, Hg, rejection_only, 0)
 kernel void s82m_base_ref_kernel(device const float* guide [[buffer(0)]],
                                  device float* out         [[buffer(1)]],
-                                 constant int2& size       [[buffer(2)]],
+                                 constant int4& size       [[buffer(2)]],
                                  uint2 gid [[thread_position_in_grid]])
 {
     const int gx = (int)gid.x, gy = (int)gid.y;
     if (gx >= size.x || gy >= size.y) return;
-    const S82F4 r = s82m_base_ref_pixel(guide, size.x, size.y, gx, gy);
+    const S82F4 r = s82m_base_ref_pixel(guide, size.x, size.y, gx, gy, size.z);
     const int i = (gy * size.x + gx) * 4;
     out[i] = s82_q16(r.x); out[i + 1] = s82_q16(r.y); out[i + 2] = s82_q16(r.z); out[i + 3] = s82_q16(r.w);
 }

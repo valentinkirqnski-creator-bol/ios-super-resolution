@@ -1326,7 +1326,10 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     const float noise_scale = std::max(0.f, work.sabre_noise_scale);
     float slope[3], offset[3], lut[80];
     noise_model_s2(work, slope, offset);
-    build_noise_lut(slope, offset, lut);
+    // GCam's true-1x variant (REJECTION_ONLY, linear-light guide) whenever the output is 1x.
+    const bool ro1x = work.sabre_rejection_only_1x && Wo == Wr && Ho == Hr;
+    if (ro1x) build_noise_lut_linear(slope, offset, lut);
+    else build_noise_lut(slope, offset, lut);
     // Mali-G71: the LINEAR RGBA32F LUT is an incomplete texture and reads 0 (guide and rejection), unless
     // sabre_mali_noise_model keeps the noise model (it overrides sabre_noise_blind in this mode).
     const bool mali = work.sabre_mali_exact;   // + the device rasterizer / sampler arithmetic
@@ -1341,7 +1344,8 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         const float g = std::min(1.5f, std::max(0.67f, ref.exposure / im.exposure));
         return std::fabs(g - 1.f) > 0.002f ? g : 1.f;
     };
-    const GuideTuning base_t = guide_tuning(cov_t, green_clip_point(1.f, work.white_level));
+    GuideTuning base_t = guide_tuning(cov_t, green_clip_point(1.f, work.white_level));
+    base_t.rejection_only = ro1x ? 1 : 0;
     // Unblocker: once per burst from the base frame, read by every rejection pass.
     const double t_ub = prof_now_ms();
     const Unblocker unb = compute_unblocker(ref, work, slope[1], offset[1]);
@@ -1368,7 +1372,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     if (!gpu) {
         base_guide = mali ? compute_guide(gcam_bayer_input(ref, work, 1.f), cfa, lut, base_t, work.num_threads, true)
                           : compute_guide(ref, cfa, lut, base_t, work.num_threads);
-        base_ref = base_reference(base_guide, work.num_threads, mali);
+        base_ref = base_reference(base_guide, work.num_threads, mali, ro1x);
     }
     // Residual-shift test (hhsr extension): base-reference gradient + strong-edge threshold, once per burst.
     const ResidShift rs = resid_shift_setup(base_ref, Wg, Hg, work, work.num_threads);
@@ -1377,11 +1381,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         char buf[768];
         std::snprintf(buf, sizeof(buf),
                       "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g%s, SNR %.3g K %.3g "
-                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s%s%s%s",
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s%s%s%s%s",
                       gpu ? (mali ? "GPU, Mali-G71 exact" : "GPU") : (mali ? "CPU, Mali-G71 exact" : "CPU"),
                       Wr, Hr, Wo, Ho, frame_count, work.has_noise_profile ? "DNG" : "fallback", noise_scale,
                       zero_lut ? " (noise LUT off)" : "", cov_t.snr, cov_t.K,
                       cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1],
+                      ro1x ? ", GCam 1x variant (linear guide, biquadratic)" : "",
                       rs.enabled ? ", edge shift test on" : "", base_t.force_rgb ? ", force RGB (SNR <= 10)" : "",
                       mali_gpu_status.empty() ? "" : (gpu ? " " : " [Mali GPU unavailable: "),
                       mali_gpu_status.c_str(), mali_gpu_status.empty() || gpu ? "" : "]");
@@ -1449,7 +1454,8 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         auto mf = std::make_unique<MergeFrame>();
         mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work);
         const float Kf = applied_gain(comp);
-        const GuideTuning ft = guide_tuning(cov_t, green_clip_point(Kf, work.white_level));
+        GuideTuning ft = guide_tuning(cov_t, green_clip_point(Kf, work.white_level));
+        ft.rejection_only = ro1x ? 1 : 0;
         extract_eps(work, work.cfa, Kf, mf->eps);
         bool done = false;
 #if defined(__APPLE__)
@@ -1464,7 +1470,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
                            : compute_guide(comp, cfa, lut, ft, work.num_threads);
             std::vector<uint8_t> rej;
             std::vector<float> itg;
-            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rs, rej, itg, work.num_threads, mali);
+            rejection(base_ref, g, mf->flow, lut, noise_scale, unb, rs, rej, itg, work.num_threads, mali, ro1x);
             dilate(rej, Wg, Hg, mf->keep, work.num_threads, mali);
             resid_shift_apply(rs, itg, mf->keep, work.num_threads);
             mf->cov = std::move(g.cov);

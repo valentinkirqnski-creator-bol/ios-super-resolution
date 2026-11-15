@@ -287,6 +287,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("sabre_mali_noise_model"))     cfg.sabre_mali_noise_model = bv("sabre_mali_noise_model");
     if (has("sabre_save_accumulated_mask")) cfg.sabre_save_accumulated_mask = bv("sabre_save_accumulated_mask");
     if (has("sabre_resid_shift_enabled"))  cfg.sabre_resid_shift_enabled = bv("sabre_resid_shift_enabled");
+    if (has("sabre_rejection_only_1x"))    cfg.sabre_rejection_only_1x = bv("sabre_rejection_only_1x");
     if (has("sabre_resid_shift_tol_px"))   cfg.sabre_resid_shift_tol_px = fv("sabre_resid_shift_tol_px");
     if (has("sabre_resid_shift_width_px")) cfg.sabre_resid_shift_width_px = fv("sabre_resid_shift_width_px");
     if (has("sabre_resid_shift_edge_pct")) cfg.sabre_resid_shift_edge_pct = fv("sabre_resid_shift_edge_pct");

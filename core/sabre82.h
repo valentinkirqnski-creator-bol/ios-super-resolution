@@ -26,6 +26,9 @@ void noise_model_s2(const Config& cfg, float slope[3], float offset[3]);
 // recovered). Checked against a captured device LUT (dbgpull texid11): rows equal and R / avg-G / B
 // semantics confirmed, within ~5% from L = 3/9 up; the three darkest rows differ (12% rms overall).
 void build_noise_lut(const float slope[3], const float offset[3], float lut[80]);
+// The same LUT for a linear-light guide (REJECTION_ONLY / true 1x): variance = offset + slope * luma at luma i/9,
+// green halved (mean of two independent sites). GCam's 1x captures hold exactly this straight-line LUT.
+void build_noise_lut_linear(const float slope[3], const float offset[3], float lut[80]);
 
 // ---- per-capture covariance tuning (sabre_tuning.cc / frame_metadata.cc / sabre_merge.cc) ----
 // EvalCurve (FUN_01410b64): piecewise-linear (x, y) knots, clamped to the end knots, upper-bound search,
@@ -54,6 +57,8 @@ struct GuideTuning {
     float cov1[4], cov2[2];
     float green_clip;
     int force_rgb = 0;        // force_reference_color_rgb.x: per shot, EstimateSnr <= 10 (set by guide_tuning)
+    int rejection_only = 0;   // GCam's true-1x variant (Config::sabre_rejection_only_1x): linear-light guide,
+                              // biquadratic base reference + current frame, REJECTION_ONLY kFilterVarianceScale
 };
 GuideTuning guide_tuning(const CovTuning& cov, float green_clip);
 GuideTuning default_guide_tuning();
@@ -98,7 +103,8 @@ Unblocker unblocker_dn(const uint16_t* raw, int W, int H, bool green_on_even, fl
 // white, noise model (slope_g, offset_g in normalized units) scaled to DN (shot*range, read*range^2).
 // Returns zero_unblocker when the DNG black / white levels are unknown.
 Unblocker compute_unblocker(const Image& base, const Config& cfg, float slope_g, float offset_g);
-S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, const Unblocker& unb);
+S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, const Unblocker& unb,
+                        int rejection_only = 0);
 
 // Guide pass output at guide resolution (Wr/2 x Hr/2): ref4 = RGBA16F (fp16-rounded floats), cov = the
 // RGB10_A2 kernel covariance as 10-bit codes (3 per pixel).
@@ -111,7 +117,7 @@ Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], co
                     bool mali = false);
 // BaseFrameRefColor pass: bicubic-filtered base guide, sign kept (RGBA16F).
 // mali = Config::sabre_mali_exact (s82m_* in sabre82_shared.h: the Mali-G71 rasterizer and texture unit).
-std::vector<float> base_reference(const Guide& base, int threads, bool mali = false);
+std::vector<float> base_reference(const Guide& base, int threads, bool mali = false, bool rejection_only = false);
 // Residual-shift test (hhsr extension, Config::sabre_resid_shift_enabled; see sabre82_shared.h). Per burst:
 // |grad L| of the base reference and the strong-edge threshold (Config::sabre_resid_shift_edge_pct percentile).
 // gm is always filled (the rejection pass reads it); `enabled` gates the extra passes.
@@ -127,7 +133,7 @@ void resid_shift_apply(const ResidShift& rs, const std::vector<float>& itg, std:
 // rejection: also fills itg (Wg x Hg, It * |grad L|) for the residual-shift test when rs.enabled.
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
                float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
-               std::vector<float>& itg, int threads, bool mali = false);
+               std::vector<float>& itg, int threads, bool mali = false, bool rejection_only = false);
 // DilateMask to the half-guide grid (Wg/2 x Hg/2).
 void dilate(const std::vector<uint8_t>& rej, int w, int h, std::vector<uint8_t>& keep, int threads, bool mali = false);
 

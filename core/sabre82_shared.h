@@ -111,6 +111,8 @@ S82_INLINE S82F4 s82_f4(float x, float y, float z, float w) { S82F4 r; r.x = x; 
 // family on device (captures/fresh/dbgpull, 2x daylight): see S82Defaults in sabre82.cpp.
 #define S82_KFVS_RGB 0.0898866f          // kFilterVarianceScale, bicubic path, RGB
 #define S82_KFVS_GREEN 0.211665f         // kFilterVarianceScale, bicubic path, green only
+#define S82_KFVS_RO_RGB 0.0976597f       // kFilterVarianceScale, REJECTION_ONLY (biquadratic) path, RGB
+#define S82_KFVS_RO_GREEN 0.25f          // kFilterVarianceScale, REJECTION_ONLY (biquadratic) path, green only
 #define S82_KEPSILON 0.00005f            // GetKernelWeight kEpsilon
 #define S82_DEHOMOG_EPS 0.0000001f       // SabreDehomogenize kEpsilon
 #define S82_FORCE_REJECT_COLOR 10000.0f  // kForceRejectReferenceColor
@@ -135,6 +137,8 @@ struct S82GuideParams {
     float cov2[2];            // covariance_parameters2: x blurred, y gradient transition
     float pack_rg[4];         // cov_range_rg_factors
     float pack_b[2];          // cov_range_b_factor
+    int rejection_only;       // GCam's true-1x variant: guide in LINEAR light (no SQRT_COLOR_SPACE), base
+                              // reference SampleBiquadraticAbsolute (see S82RejParams::rejection_only)
 };
 
 struct S82RejParams {
@@ -150,6 +154,8 @@ struct S82RejParams {
     float noise_scale;        // 1 = the LUT as filled (exposed as a tuning knob)
     int unx, uny;             // unblocker texture (R8, one texel per 8x8 guide pixels)
     float uscale[2];          // unblocker_scale
+    int rejection_only;       // REJECTION_ONLY shader variant (GCam at true 1x): the current frame sampled
+                              // SampleBiquadraticAbsolute, kFilterVarianceScale 0.25 / 0.0976597
 };
 
 struct S82MergeParams {
@@ -252,6 +258,22 @@ S82_INLINE S82F4 s82_sample_bicubic_abs(const S82_DEVICE float* tex, int W, int 
         o[c] = g0y * (g0x * s82_fabs(t0[c]) + g1x * s82_fabs(t1[c])) + g1y * (g0x * s82_fabs(t2[c]) + g1x * s82_fabs(t3[c]));
     return s82_f4(o[0], o[1], o[2], o[3]);
 }
+// SampleBiquadraticAbsolute (Dodgson's approximating quadratic, 4 LINEAR taps, abs of each, mean).
+S82_INLINE S82F4 s82_sample_biquad_abs(const S82_DEVICE float* tex, int W, int H, float u, float v) {
+    const float zx = 1.0f / (float)W, zy = 1.0f / (float)H;
+    const float px = u * (float)W, py = v * (float)H;
+    const float fx = px - s82_floor(px), fy = py - s82_floor(py);
+    const float cx = fx * fx - fx + 0.5f, cy = fy * fy - fy + 0.5f;
+    const float w0x = u - cx * zx, w1x = u + cx * zx, w0y = v - cy * zy, w1y = v + cy * zy;
+    float a[4], b[4], c[4], d[4];
+    s82_linear_plane(tex, W, H, 4, 0, H, w0x, w0y, a);
+    s82_linear_plane(tex, W, H, 4, 0, H, w0x, w1y, b);
+    s82_linear_plane(tex, W, H, 4, 0, H, w1x, w1y, c);
+    s82_linear_plane(tex, W, H, 4, 0, H, w1x, w0y, d);
+    float o[4];
+    for (int k = 0; k < 4; ++k) o[k] = (((s82_fabs(a[k]) + s82_fabs(b[k])) + s82_fabs(c[k])) + s82_fabs(d[k])) / 4.0f;
+    return s82_f4(o[0], o[1], o[2], o[3]);
+}
 // kFunctionMirrorUVs
 S82_INLINE void s82_mirror(S82_THREAD float* uv, const S82_THREAD float* fbp) {
     if (uv[0] <= fbp[0]) uv[0] = 2.0f * fbp[0] - uv[0];
@@ -275,6 +297,8 @@ S82_INLINE int s82_unorm10_code(float v) {   // RGB10_A2 store: 10-bit unorm cod
 S82_INLINE float s82_weight(int x) { return x == 0 ? 0.5f : ((x == 1 || x == -1) ? 0.25f : 0.0f); }
 
 // kGuideImageEntryPoint (COMPUTE_GUIDE_COLOR, SQRT_COLOR_SPACE, Bayer path) for guide pixel (gx, gy).
+// P.rejection_only: GCam's true-1x build, without SQRT_COLOR_SPACE (guide colour, variance and structure tensor
+// in linear light; burst9/burst12 1x captures: GCam guide = linear, our sqrt guide squared fits it at 0.986).
 //   ref4 = o_frag_color  (RGB reference colour, signed variance; caller stores RGBA16F)
 //   cov3 = o_gauss_cov   (PACK_COV-remapped covariance in [0,1]; caller stores RGB10_A2)
 S82_INLINE void s82_guide_pixel(const S82_DEVICE float* raw, S82GuideParams P, const S82_DEVICE float* lut,
@@ -301,8 +325,10 @@ S82_INLINE void s82_guide_pixel(const S82_DEVICE float* raw, S82GuideParams P, c
             float g1 = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g1x, by + P.cfa.g1y);
             float g2 = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g2x, by + P.cfa.g2y);
             float b = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.bx, by + P.cfa.by);
-            r = s82_sqrt(s82_max(0.0f, r)); g1 = s82_sqrt(s82_max(0.0f, g1));
-            g2 = s82_sqrt(s82_max(0.0f, g2)); b = s82_sqrt(s82_max(0.0f, b));
+            if (!P.rejection_only) {
+                r = s82_sqrt(s82_max(0.0f, r)); g1 = s82_sqrt(s82_max(0.0f, g1));
+                g2 = s82_sqrt(s82_max(0.0f, g2)); b = s82_sqrt(s82_max(0.0f, b));
+            }
             const float cr = r, cg = 0.5f * (g1 + g2), cb = b;
             g0v[(y + 1) * 3 + x + 1] = g1;
             g1v[(y + 1) * 3 + x + 1] = g2;
@@ -406,10 +432,11 @@ S82_INLINE void s82_guide_pixel(const S82_DEVICE float* raw, S82GuideParams P, c
     cov3[2] = s82_clampf(rr01 * P.pack_b[1] + P.pack_b[0], 0.0f, 1.0f);      // PACK_COV_B
 }
 
-// kBaseFrameRefColorEntryPoint (bicubic path) for guide pixel (gx, gy) of the base guide.
-S82_INLINE S82F4 s82_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int Hg, int gx, int gy) {
+// kBaseFrameRefColorEntryPoint for guide pixel (gx, gy) of the base guide: bicubic, or biquadratic when
+// rejection_only (REJECTION_ONLY variant).
+S82_INLINE S82F4 s82_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int Hg, int gx, int gy, int rejection_only) {
     const float u = ((float)gx + 0.5f) / (float)Wg, v = ((float)gy + 0.5f) / (float)Hg;
-    S82F4 r = s82_sample_bicubic_abs(guide, Wg, Hg, u, v);
+    S82F4 r = rejection_only ? s82_sample_biquad_abs(guide, Wg, Hg, u, v) : s82_sample_bicubic_abs(guide, Wg, Hg, u, v);
     float c[4];
     s82_linear_plane(guide, Wg, Hg, 4, 0, Hg, u, v, c);
     if (c[3] < 0.0f) r.w = -r.w;
@@ -439,7 +466,8 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
     s82_linear_plane(base_ref, P.Wg, P.Hg, 4, 0, P.Hg, tcx, tcy, rv);
     const bool green_only = rv[3] < 0.0f;
     float ref_w = s82_fabs(rv[3]);
-    const S82F4 cur = s82_sample_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
+    const S82F4 cur = P.rejection_only ? s82_sample_biquad_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1])
+                                       : s82_sample_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
     float cur_w = cur.w;
     {
         const float lc = (cur.x + cur.y + cur.z) * (1.0f / 3.0f), lr = (rv[0] + rv[1] + rv[2]) * (1.0f / 3.0f);
@@ -448,7 +476,8 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
     const float luma = green_only ? rv[1] : (rv[0] * (1.0f / 3.0f) + rv[1] * (1.0f / 3.0f) + rv[2] * (1.0f / 3.0f));
     const S82F4 rn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 0.0f * P.nsb[1] + P.nsb[3]);
     const S82F4 cn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 1.0f * P.nsb[1] + P.nsb[3]);
-    const float kf = green_only ? S82_KFVS_GREEN : S82_KFVS_RGB;
+    const float kf = P.rejection_only ? (green_only ? S82_KFVS_RO_GREEN : S82_KFVS_RO_RGB)
+                                      : (green_only ? S82_KFVS_GREEN : S82_KFVS_RGB);
     const float ns = P.noise_scale * kf;
     const float rn0 = rn4.x * ns, rn1 = rn4.y * ns, rn2 = rn4.z * ns;
     const float cn0 = cn4.x * ns, cn1 = cn4.y * ns, cn2 = cn4.z * ns;
@@ -703,6 +732,26 @@ S82_INLINE S82F4 s82m_bicubic_abs(const S82_DEVICE float* tex, int W, int H, flo
                         g1y * s82m_fma(g0x, s82_fabs(t2[c]), g1x * s82_fabs(t3[c])));
     return s82_f4(o[0], o[1], o[2], o[3]);
 }
+// SampleBiquadraticAbsolute on the Mali: four RGBA16F LINEAR taps (s82m_linear4), offsets with the fp32 1/size,
+// the abs taps summed in fp16 in order (each add rounded), then /4. Fitted on burst9_1x_GT: GCam's base
+// reference 100% bit-exact from its own guide (an fp32 sum: 0.07%); FMA forms of the offsets scored lower.
+S82_INLINE S82F4 s82m_biquad_abs(const S82_DEVICE float* tex, int W, int H, float u, float v) {
+    S82M_NOCONTRACT
+    const float zx = s82m_recip(W), zy = s82m_recip(H);
+    const float px = u * (float)W, py = v * (float)H;
+    const float fx = px - s82_floor(px), fy = py - s82_floor(py);
+    const float cx = (fx * fx - fx) + 0.5f, cy = (fy * fy - fy) + 0.5f;
+    const float w0x = u - cx * zx, w1x = u + cx * zx, w0y = v - cy * zy, w1y = v + cy * zy;
+    float a[4], b[4], c[4], d[4];
+    s82m_linear4(tex, W, H, w0x, w0y, a);
+    s82m_linear4(tex, W, H, w0x, w1y, b);
+    s82m_linear4(tex, W, H, w1x, w1y, c);
+    s82m_linear4(tex, W, H, w1x, w0y, d);
+    float o[4];
+    for (int k = 0; k < 4; ++k)
+        o[k] = s82_q16(s82_q16(s82_q16(s82_fabs(a[k]) + s82_fabs(b[k])) + s82_fabs(c[k])) + s82_fabs(d[k])) / 4.0f;
+    return s82_f4(o[0], o[1], o[2], o[3]);
+}
 // R8 LINEAR on the Mali (measured, maliprobe): 8-bit corner weights as in s82m_linear4, the integer sum of
 // texel * weight divided by 255*256, result fp16. Used for the unblocker.
 S82_INLINE float s82m_linear_u8(const S82_DEVICE uint8_t* p, int W, int H, float u, float v) {
@@ -720,10 +769,10 @@ S82_INLINE float s82m_linear_u8(const S82_DEVICE uint8_t* p, int W, int H, float
 // R8 store: round half to even.
 S82_INLINE uint8_t s82m_to_u8(float v) { return (uint8_t)(int)s82m_rint(s82_clampf(v, 0.0f, 1.0f) * 255.0f); }
 // kBaseFrameRefColorEntryPoint on the Mali.
-S82_INLINE S82F4 s82m_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int Hg, int gx, int gy) {
+S82_INLINE S82F4 s82m_base_ref_pixel(const S82_DEVICE float* guide, int Wg, int Hg, int gx, int gy, int rejection_only) {
     float u, v;
     s82m_tex_coord(Wg, Hg, gx, gy, &u, &v);
-    S82F4 r = s82m_bicubic_abs(guide, Wg, Hg, u, v);
+    S82F4 r = rejection_only ? s82m_biquad_abs(guide, Wg, Hg, u, v) : s82m_bicubic_abs(guide, Wg, Hg, u, v);
     float c[4];
     s82m_linear4(guide, Wg, Hg, u, v, c);
     if (s82m_signbit(c[3])) r.w = -r.w;   // the Mali's `< 0.0` is true for -0 (see s82m_rejection_pixel)
@@ -756,7 +805,8 @@ S82_INLINE float s82m_rejection_pixel(const S82_DEVICE float* base_ref, const S8
     // on realshot2's clipped window (12k px of ROBUST_k).
     const bool green_only = s82m_signbit(rv[3]);
     float ref_w = s82_fabs(rv[3]);
-    const S82F4 cur = s82m_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
+    const S82F4 cur = P.rejection_only ? s82m_biquad_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1])
+                                       : s82m_bicubic_abs(alt_guide, P.Wg, P.Hg, wuv[0], wuv[1]);
     float cur_w = cur.w;
     {
         const float lc = (cur.x + cur.y + cur.z) * (1.0f / 3.0f), lr = (rv[0] + rv[1] + rv[2]) * (1.0f / 3.0f);
@@ -766,7 +816,8 @@ S82_INLINE float s82m_rejection_pixel(const S82_DEVICE float* base_ref, const S8
     const float luma = green_only ? rv[1] : (rv[0] * (1.0f / 3.0f) + rv[1] * (1.0f / 3.0f) + rv[2] * (1.0f / 3.0f));
     const S82F4 rn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 0.0f * P.nsb[1] + P.nsb[3]);
     const S82F4 cn4 = s82_lut_linear(lut, luma * P.nsb[0] + P.nsb[2], 1.0f * P.nsb[1] + P.nsb[3]);
-    const float kf = green_only ? S82_KFVS_GREEN : S82_KFVS_RGB;
+    const float kf = P.rejection_only ? (green_only ? S82_KFVS_RO_GREEN : S82_KFVS_RO_RGB)
+                                      : (green_only ? S82_KFVS_GREEN : S82_KFVS_RGB);
     const float ns = P.noise_scale * kf;
     const float rn0 = rn4.x * ns, rn1 = rn4.y * ns, rn2 = rn4.z * ns;
     const float cn0 = cn4.x * ns, cn1 = cn4.y * ns, cn2 = cn4.z * ns;
@@ -849,10 +900,14 @@ S82_INLINE void s82m_guide_pixel(const S82_DEVICE float* raw, S82GuideParams P, 
         for (int x = -1; x <= 1; x += 1) {
             const int qx = s82m_nearest(tcm[0] + tsz * (float)x, P.Wg);
             const int bx = 2 * qx, by = 2 * qy;
-            const float r = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.rx, by + P.cfa.ry)));
-            const float g1 = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g1x, by + P.cfa.g1y)));
-            const float g2 = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g2x, by + P.cfa.g2y)));
-            const float b = s82m_sqrt(s82_max(0.0f, s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.bx, by + P.cfa.by)));
+            const float r_l = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.rx, by + P.cfa.ry);
+            const float r = P.rejection_only ? r_l : s82m_sqrt(s82_max(0.0f, r_l));
+            const float g1_l = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g1x, by + P.cfa.g1y);
+            const float g1 = P.rejection_only ? g1_l : s82m_sqrt(s82_max(0.0f, g1_l));
+            const float g2_l = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.g2x, by + P.cfa.g2y);
+            const float g2 = P.rejection_only ? g2_l : s82m_sqrt(s82_max(0.0f, g2_l));
+            const float b_l = s82_raw(raw, P.Wr, P.Hr, P.row0, P.nrows, bx + P.cfa.bx, by + P.cfa.by);
+            const float b = P.rejection_only ? b_l : s82m_sqrt(s82_max(0.0f, b_l));
             const float cr = r, cg = 0.5f * (g1 + g2), cb = b;
             const float w = s82_weight(x) * s82_weight(y);
             avr = s82m_fma(cr, w, avr); avg = s82m_fma(cg, w, avg); avb = s82m_fma(cb, w, avb);

@@ -700,6 +700,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"sabre_mali_noise_model"])   cfg.sabre_mali_noise_model = tuning[@"sabre_mali_noise_model"].boolValue;
     if (tuning[@"sabre_save_accumulated_mask"]) cfg.sabre_save_accumulated_mask = tuning[@"sabre_save_accumulated_mask"].boolValue;
     if (tuning[@"sabre_resid_shift_enabled"]) cfg.sabre_resid_shift_enabled = tuning[@"sabre_resid_shift_enabled"].boolValue;
+    if (tuning[@"sabre_rejection_only_1x"]) cfg.sabre_rejection_only_1x = tuning[@"sabre_rejection_only_1x"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])

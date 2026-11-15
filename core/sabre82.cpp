@@ -105,6 +105,19 @@ void build_noise_lut(const float slope[3], const float offset[3], float lut[80])
     }
 }
 
+void build_noise_lut_linear(const float slope[3], const float offset[3], float lut[80]) {
+    std::memset(lut, 0, sizeof(float) * 80);
+    for (int i = 0; i < 10; ++i) {
+        const double L = (double)i / 9.0;
+        for (int row = 0; row < 2; ++row) {
+            float* o = lut + (row * 10 + i) * 4;
+            for (int c = 0; c < 3; ++c) o[c] = (float)std::max(0.0, (double)slope[c] * L + (double)offset[c]);
+            o[1] *= 0.5f;                                     // .y = 0.5*(G1 + G2), independent sites
+            o[3] = 0.f;
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------- tuning
 float eval_curve(const float* xy, int n, float K) {
     if (n <= 0) return 0.f;
@@ -234,6 +247,7 @@ S82GuideParams guide_params(int Wr, int Hr, const S82Cfa& cfa, const GuideTuning
     P.Wr = Wr; P.Hr = Hr; P.Wg = Wr / 2; P.Hg = Hr / 2; P.row0 = 0; P.nrows = Hr; P.cfa = cfa;
     P.force_rgb = t.force_rgb;
     P.green_clip = t.green_clip;
+    P.rejection_only = t.rejection_only;
     P.fbp[0] = kGuideBorderGuidePx / P.Wg; P.fbp[1] = kGuideBorderGuidePx / P.Hg;
     P.fbp[2] = 1.f - kGuideBorderGuidePx / P.Wg; P.fbp[3] = 1.f - kGuideBorderGuidePx / P.Hg;
     for (int k = 0; k < 4; ++k) { P.nsb[k] = kNsb[k]; P.cov1[k] = t.cov1[k]; P.pack_rg[k] = kPackRG[k]; }
@@ -356,7 +370,8 @@ Unblocker compute_unblocker(const Image& base, const Config& cfg, float slope_g,
     return unblocker_dn(dn.data(), W, H, goe, slope_g * range, offset_g * range * range, black);
 }
 
-S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, const Unblocker& unb) {
+S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, const Unblocker& unb,
+                        int rejection_only) {
     S82RejParams P{};
     P.unx = unb.w; P.uny = unb.h; P.uscale[0] = unb.scale[0]; P.uscale[1] = unb.scale[1];
     P.Wg = Wg; P.Hg = Hg; P.fnx = flow.nx; P.fny = flow.ny;
@@ -368,6 +383,7 @@ S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, 
     P.mot_thr = kMotionThrGuidePx / (float)Wg;
     P.ub_thr = kMotionThrGuidePx / (float)Wg;
     P.noise_scale = noise_scale;
+    P.rejection_only = rejection_only;
     return P;
 }
 
@@ -469,12 +485,13 @@ Guide compute_guide(const Image& raw, const S82Cfa& cfa, const float lut[80], co
     return g;
 }
 
-std::vector<float> base_reference(const Guide& base, int threads, bool mali) {
+std::vector<float> base_reference(const Guide& base, int threads, bool mali, bool rejection_only) {
     std::vector<float> out((size_t)base.w * base.h * 4);
     parallel_rows(base.h, threads, [&](int gy) {
         for (int gx = 0; gx < base.w; ++gx) {
-            const S82F4 r = mali ? s82m_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy)
-                                 : s82_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy);
+            const int ro = rejection_only ? 1 : 0;
+            const S82F4 r = mali ? s82m_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy, ro)
+                                 : s82_base_ref_pixel(base.ref4.data(), base.w, base.h, gx, gy, ro);
             float* o = &out[((size_t)gy * base.w + gx) * 4];
             o[0] = s82_q16(r.x); o[1] = s82_q16(r.y); o[2] = s82_q16(r.z); o[3] = s82_q16(r.w);
         }
@@ -484,8 +501,8 @@ std::vector<float> base_reference(const Guide& base, int threads, bool mali) {
 
 void rejection(const std::vector<float>& base_ref, const Guide& alt, const FlowTex& flow, const float lut[80],
                float noise_scale, const Unblocker& unb, const ResidShift& rs, std::vector<uint8_t>& rej,
-               std::vector<float>& itg, int threads, bool mali) {
-    const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale, unb);
+               std::vector<float>& itg, int threads, bool mali, bool rejection_only) {
+    const S82RejParams P = rej_params(alt.w, alt.h, flow, noise_scale, unb, rejection_only ? 1 : 0);
     rej.assign((size_t)alt.w * alt.h, 0);
     const bool want_it = rs.enabled && rs.gm.size() == rej.size();
     if (want_it) itg.assign(rej.size(), 0.f); else itg.clear();
