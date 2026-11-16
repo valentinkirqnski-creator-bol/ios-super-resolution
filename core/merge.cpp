@@ -452,6 +452,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
 } // namespace
 
+void merge_comp_band_cpu(const Image& comp_raw, const FlowField& flow, const CovField& covs,
+                         const Image& robustness, int tile_size, Image& num_band, Image& den_band, int y0,
+                         const Config& cfg) {
+    accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg, nullptr);
+}
+
+void merge_ref_band_cpu(const Image& ref_raw, const CovField& covs, Image& num_band, Image& den_band, int y0,
+                        const Config& cfg) {
+    accumulate_ref(ref_raw, covs, nullptr, num_band, den_band, y0, cfg);
+}
+
 bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,

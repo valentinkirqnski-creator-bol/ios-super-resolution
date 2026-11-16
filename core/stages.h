@@ -150,6 +150,11 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
 // pixels): 129x129 vote histogram of the truncated, +-64-clamped displacements; the peak if it has >= 10 votes,
 // else the vote-weighted mean. Returns false for an empty field. See Config::align_global_candidate.
 bool gcam_estimate_global_alignment(const f32* flow_xy, int n_tiles, f32& gdx, f32& gdy);
+// GCam 6.1 half-overlap flow (Config::sabre_overlap_lk): re-measure every vector of a raw-grid flow (cells of
+// raw_tile_size raw px) with translation LK on a 2x-cell window centred on the cell, in grey coordinates; keep a
+// cell's result only when its window SSD beats the seed's. Grid unchanged.
+void overlap_lk_refine(FlowField& flow, const Image& ref_grey, const Image& comp_grey, int raw_tile_size,
+                       int raw_h, int raw_w, int iters, int threads);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size,
@@ -551,6 +556,13 @@ CovField estimate_kernels(const Image& raw, const Config& cfg);
 // callers ignore it -- a band a frame cannot contribute to is normal -- but the
 // online path merges each frame exactly once, so false there means the frame is
 // simply absent from the output.
+// The Wronski merge on the CPU regardless of platform (the GPU twins need the Wronski pipeline's frame residency
+// and band command buffers). Used by the SABRE path's Config::sabre_wronski_kernels.
+void merge_comp_band_cpu(const Image& comp_raw, const FlowField& flow, const CovField& covs,
+                         const Image& robustness, int tile_size, Image& num_band, Image& den_band, int y0,
+                         const Config& cfg);
+void merge_ref_band_cpu(const Image& ref_raw, const CovField& covs, Image& num_band, Image& den_band, int y0,
+                        const Config& cfg);
 bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,

@@ -142,6 +142,14 @@ struct MergeFrame {
     std::vector<uint16_t> cov;        // 10-bit codes, guide res x 3
     FlowTex flow;
     std::vector<uint8_t> keep;        // dilated mask (half-guide res); empty for the base
+    // Base frame only (Config::sabre_base_kernel_blur): keep = accumulated comparison keep / blur_acc_scale (u8).
+    int blur_base = 0;
+    float blur_thr = 0.f, blur_mult = 1.f, blur_acc_scale = 0.f;
+    // Config::sabre_wronski_kernels (Wronski kernels + Wronski merge): this frame's tile flow (the SAME vectors as
+    // `flow`, in raw px), Wronski kernel covariance (estimate_kernels) and the keep mask at guide resolution.
+    FlowField wflow;
+    CovField wcov;
+    Image wrob;
     float eps[4] = {0.f, 0.f, 0.f, 0.f};   // extract_eps of this frame
 };
 struct BandContext {

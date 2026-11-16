@@ -174,6 +174,11 @@ struct S82MergeParams {
     float unpack_b[2];        // cov_range_b
     float eps[4];             // ExtractBayer's +1e-4 DN in our normalized units, per site (y&1)*2+(x&1)
     S82Cfa cfa;
+    // GCam 6.1 BASE_FRAME kernel blurring (Config::sabre_base_kernel_blur): base frame only. `mask` then holds the
+    // accumulated comparison keep weight (u8, x blur_acc_scale = frames); where it is below blur_thr the
+    // covariance (precision) is multiplied by blur_mult.
+    int blur_base;
+    float blur_thr, blur_mult, blur_acc_scale;
 };
 
 // ------------------------------------------------------------------------------------------------ samplers
@@ -1017,6 +1022,10 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
     c[0] = c[0] * P.unpack_rg[1] + P.unpack_rg[0];   // UNPACK_COV_RG
     c[1] = c[1] * P.unpack_rg[3] + P.unpack_rg[2];
     c[2] = c[2] * P.unpack_b[1] + P.unpack_b[0];     // UNPACK_COV_B
+    if (P.blur_base && !P.use_mask) {                 // 6.1 BASE_FRAME: widen the kernel where coverage is low
+        const float weight_so_far = s82_linear_u8(mask, P.Wm, P.Hm, tcx, tcy) * P.blur_acc_scale;
+        if (weight_so_far < P.blur_thr) { c[0] *= P.blur_mult; c[1] *= P.blur_mult; c[2] *= P.blur_mult; }
+    }
     // SampleNeighborhoodRBF (Bayer path): coord in raw pixels, 3x3 around the containing pixel
     const float csx = s[0] * ((float)P.Wg * 2.0f), csy = s[1] * ((float)P.Hg * 2.0f);
     const int px = (int)csx, py = (int)csy;

@@ -377,6 +377,10 @@ struct TuningParams: Equatable, Codable {
     var sabre_save_accumulated_mask: Bool = false
     var sabre_resid_shift_enabled: Bool = false
     var sabre_rejection_only_1x: Bool = true
+    var sabre_frame_drop: Bool = false
+    var sabre_wronski_kernels: Bool = false
+    var sabre_overlap_lk: Bool = false
+    var sabre_base_kernel_blur: Bool = false
     /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
     /// literal RGB value is 0.090. Defaulted off because our variances are already
     /// measured on the filtered guide (see the Config comment).
@@ -633,7 +637,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_resid_shift_enabled, sabre_rejection_only_1x,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_resid_shift_enabled, sabre_rejection_only_1x, sabre_frame_drop, sabre_wronski_kernels, sabre_overlap_lk, sabre_base_kernel_blur,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -825,6 +829,10 @@ struct TuningParams: Equatable, Codable {
         sabre_save_accumulated_mask = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_accumulated_mask) ?? sabre_save_accumulated_mask
         sabre_resid_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .sabre_resid_shift_enabled) ?? sabre_resid_shift_enabled
         sabre_rejection_only_1x = try c.decodeIfPresent(Bool.self, forKey: .sabre_rejection_only_1x) ?? sabre_rejection_only_1x
+        sabre_frame_drop = try c.decodeIfPresent(Bool.self, forKey: .sabre_frame_drop) ?? sabre_frame_drop
+        sabre_wronski_kernels = try c.decodeIfPresent(Bool.self, forKey: .sabre_wronski_kernels) ?? sabre_wronski_kernels
+        sabre_overlap_lk = try c.decodeIfPresent(Bool.self, forKey: .sabre_overlap_lk) ?? sabre_overlap_lk
+        sabre_base_kernel_blur = try c.decodeIfPresent(Bool.self, forKey: .sabre_base_kernel_blur) ?? sabre_base_kernel_blur
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
         robustness_bicubic_guide = try c.decodeIfPresent(Bool.self, forKey: .robustness_bicubic_guide) ?? robustness_bicubic_guide
@@ -2719,6 +2727,10 @@ final class CameraModel: NSObject, ObservableObject {
             "sabre_save_accumulated_mask": NSNumber(value: tuningParams.sabre_save_accumulated_mask),
             "sabre_resid_shift_enabled": NSNumber(value: tuningParams.sabre_resid_shift_enabled),
             "sabre_rejection_only_1x": NSNumber(value: tuningParams.sabre_rejection_only_1x),
+            "sabre_frame_drop": NSNumber(value: tuningParams.sabre_frame_drop),
+            "sabre_wronski_kernels": NSNumber(value: tuningParams.sabre_wronski_kernels),
+            "sabre_overlap_lk": NSNumber(value: tuningParams.sabre_overlap_lk),
+            "sabre_base_kernel_blur": NSNumber(value: tuningParams.sabre_base_kernel_blur),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
             "robustness_bicubic_guide": NSNumber(value: tuningParams.robustness_bicubic_guide),

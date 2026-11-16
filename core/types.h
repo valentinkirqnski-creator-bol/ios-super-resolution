@@ -1771,6 +1771,36 @@ struct Config {
     // and a straight-line noise LUT. Captured from GCam on burst9_1x_GT / burst12_1x_GT. On: the SABRE 8.2 path
     // uses that variant whenever the output is 1x; the super-res (bicubic, sqrt) variant otherwise.
     bool  sabre_rejection_only_1x = true;
+    // GCam's SABRE frame dropping (sharpness-driven, not motion-driven): before alignment each comparison frame
+    // gets score = sharpness * (1 - |idx - idx_base| / 150) and is left out of the merge when
+    // score <= ratio * base sharpness. Sharpness = mean squared Sobel gradient of the frame's grey image over its
+    // central 80%, divided by its squared mean level. Night mode (burst SNR <= night_snr) keeps every frame, and
+    // a frame is kept anyway when dropping it would leave fewer than min_frames (base included): the SNR-budget
+    // release. Off by default.
+    bool  sabre_frame_drop = false;
+    // SABRE path: Wronski kernels AND the Wronski merge after GCam's rejection. Alignment and the SABRE guide /
+    // rejection / dilated keep masks run as usual; the merge is then the non-GCam path's (merge.cpp accumulate /
+    // accumulate_ref, CPU) with that path's kernels (estimate_kernels: structure tensor on the GAT grey, k_detail /
+    // k_shrink / k_stretch / k_denoise / D_th / D_tr, SNR auto-tune as usual), each comparison frame weighted by its
+    // SABRE keep mask (bilinear) and warped by the same tile vectors the rejection graded. Off.
+    bool  sabre_wronski_kernels = false;
+    // GCam 6.1 flow layout (libgcam_jni FUN_008a45d4: tile = merge_tile, stride = tile/2): every flow vector of the
+    // SABRE grid (one per merge tile) is RE-MEASURED with sub-pixel Lucas-Kanade (translation, inverse
+    // compositional, up to sabre_overlap_lk_iters steps) on a window TWICE the cell (16 grey px for an 8-px cell),
+    // centred on the cell -- the half-tile overlap GCam estimates on -- seeded by our flow. A cell keeps the result
+    // only when its window SSD beats the seed's. Same grid, NEAREST, 3x3 median downstream. Off by default.
+    bool  sabre_overlap_lk = false;
+    int   sabre_overlap_lk_iters = 6;
+    // GCam 6.1 merge BASE_FRAME: `if (weight_so_far < kernel_blurring_params.x) covariance *= kernel_blurring_params.y`
+    // with weight_so_far = accumulated comparison-frame keep weight at the pixel (sum of keep masks, in frames). The
+    // base kernel is widened where little else was merged (stops 1-2-frame zipper / stair-steps at super-res).
+    // The 6.1 uniform VALUES are not known; thr (frames) and mult (precision factor, < 1 widens) are placeholders.
+    bool  sabre_base_kernel_blur = false;
+    float sabre_base_blur_thr = 1.0f;
+    float sabre_base_blur_mult = 0.25f;
+    float sabre_frame_drop_ratio = 0.85f;
+    int   sabre_frame_drop_min_frames = 3;
+    float sabre_frame_drop_night_snr = 6.0f;
     float sabre_resid_shift_tol_px = 0.15f;
     float sabre_resid_shift_width_px = 0.2f;
     float sabre_resid_shift_edge_pct = 90.0f;

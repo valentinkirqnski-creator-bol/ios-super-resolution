@@ -1273,6 +1273,32 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 // 8.2's post-merge spatial-merge / RAISR resolve chain is not part of the reference; the dehomogenized
 // merge is the output. Per-pixel math: core/sabre82_shared.h. Reference:
 // Documents/super/SABRE_8.2_COMPLETE_REFERENCE.md.
+// Sharpness of a grey frame for SABRE frame dropping (Config::sabre_frame_drop): mean squared Sobel gradient over
+// the central 80% (every 2nd pixel), divided by the squared mean level so a brightness difference between frames is
+// not read as sharpness.
+static double sabre_frame_sharpness(const Image& g) {
+    if (g.h < 8 || g.w < 8 || g.data.size() < (size_t)g.h * g.w) return 0.0;
+    const int y0 = std::max(1, g.h / 10), y1 = std::min(g.h - 1, g.h - g.h / 10);
+    const int x0 = std::max(1, g.w / 10), x1 = std::min(g.w - 1, g.w - g.w / 10);
+    double s = 0.0, m = 0.0;
+    size_t n = 0;
+    for (int y = y0; y < y1; y += 2) {
+        const f32* a = &g.data[(size_t)(y - 1) * g.w];
+        const f32* b = &g.data[(size_t)y * g.w];
+        const f32* c = &g.data[(size_t)(y + 1) * g.w];
+        for (int x = x0; x < x1; x += 2) {
+            const double gx = ((double)a[x + 1] + 2.0 * b[x + 1] + c[x + 1]) - ((double)a[x - 1] + 2.0 * b[x - 1] + c[x - 1]);
+            const double gy = ((double)c[x - 1] + 2.0 * c[x] + c[x + 1]) - ((double)a[x - 1] + 2.0 * a[x] + a[x + 1]);
+            s += gx * gx + gy * gy;
+            m += b[x];
+            ++n;
+        }
+    }
+    if (n == 0) return 0.0;
+    m /= (double)n;
+    return m > 0.0 ? (s / (double)n) / (m * m) : 0.0;
+}
+
 static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader,
                                  const Config& cfg, const std::string& dng_path,
                                  const ProgressFn& progress, int maxPreviewDim) {
@@ -1397,6 +1423,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     std::vector<std::unique_ptr<MergeFrame>> frames;
     Image keep_sum;                                       // save-mask export: sum of the dilated masks
     bool have_keep = false;
+    // GCam SABRE frame dropping (Config::sabre_frame_drop): sharpness-driven, relative to the base frame; night
+    // mode (low burst SNR) keeps every frame.
+    const bool drop_on = work.sabre_frame_drop && cov_t.snr > work.sabre_frame_drop_night_snr;
+    const double base_sharp = drop_on ? sabre_frame_sharpness(ref_grey) : 0.0;
+    int dropped = 0;
+    bool wr_merge = work.sabre_wronski_kernels;   // Wronski kernels + merge (cleared if a kernel field fails)
     int pos = 0;
     for (int k = 0; k < frame_count; ++k) {
         if (k == ref_index) continue;
@@ -1408,6 +1440,21 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         // ---- alignment (ours, unchanged) ----
         const double t_al = prof_now_ms();
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        if (drop_on && base_sharp > 0.0) {
+            const double tw = 1.0 - (double)std::abs(k - ref_index) / 150.0;
+            const double score = sabre_frame_sharpness(comp_grey) * tw;
+            // SNR-budget release: never go below min_frames merged frames (base included).
+            const int left_if_dropped = 1 + (int)frames.size() + (frame_count - 1 - pos);
+            if (score <= (double)work.sabre_frame_drop_ratio * base_sharp &&
+                left_if_dropped >= work.sabre_frame_drop_min_frames) {
+                ++dropped;
+                char msg[160];
+                std::snprintf(msg, sizeof(msg), "SABRE: frame %d dropped (sharpness %.3f of the base)", k,
+                              score / base_sharp);
+                report(msg, 0.06f + 0.40f * (float)pos / std::max(1, frame_count - 1));
+                continue;
+            }
+        }
         PrealignTransform init;
         if (k < (int)prealign.from_reference.size()) init = prealign.from_reference[(size_t)k];
         const f32 gsx = (f32)ref_grey.w / (f32)Wr, gsy = (f32)ref_grey.h / (f32)Hr;
@@ -1432,6 +1479,10 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
             const bool last = (lvl == halftile_levels - 1);
             halftile_subdivide_refine(flow, ref_grey, cg, work, level_ts, comp.h, comp.w, !(last && merge_ts <= 4));
         }
+        // GCam 6.1 half-overlap flow: every merge-grid vector re-measured on a 2x-cell window (sub-pixel LK).
+        if (work.sabre_overlap_lk)
+            overlap_lk_refine(flow, ref_grey, cg, merge_ts, comp.h, comp.w, work.sabre_overlap_lk_iters,
+                              work.num_threads);
         if (work.dense_flow_enabled) {
             const int Dd = std::max(1, work.dense_flow_downsample);
             if (Dd > 1) dense_lk_refine(flow, downsample_box_grey(ref_grey, Dd), downsample_box_grey(cg, Dd),
@@ -1475,8 +1526,35 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
             resid_shift_apply(rs, itg, mf->keep, work.num_threads);
             mf->cov = std::move(g.cov);
         }
+        if (wr_merge) {   // Config::sabre_wronski_kernels: inputs of the Wronski merge for this frame
+            Config kc = work;
+            kc.gcam_sabre_kernel = false;
+            mf->wcov = estimate_kernels(comp, kc);
+            if (mf->wcov.h != Hg || mf->wcov.w != Wg) wr_merge = false;
+            mf->wflow.ny = mf->flow.ny; mf->wflow.nx = mf->flow.nx;
+            mf->wflow.flow.assign((size_t)mf->flow.ny * mf->flow.nx * 2, 0.f);
+            for (size_t t = 0; t < (size_t)mf->flow.ny * mf->flow.nx; ++t) {
+                mf->wflow.flow[t * 2 + 0] = mf->flow.data[t * 4 + 0] * (float)Wr;
+                mf->wflow.flow[t * 2 + 1] = mf->flow.data[t * 4 + 1] * (float)Hr;
+            }
+            // keep mask (Wm x Hm, LINEAR in GCam's merge) -> guide resolution, bilinear at the guide pixel centre
+            mf->wrob = Image(Hg, Wg, 1);
+            parallel_rows(Hg, work.num_threads, [&](int gy) {
+                const float my = std::min((float)(Hm - 1), std::max(0.f, (gy + 0.5f) * 0.5f - 0.5f));
+                const int y0i = (int)my, y1i = std::min(Hm - 1, y0i + 1);
+                const float fy = my - (float)y0i;
+                for (int gx = 0; gx < Wg; ++gx) {
+                    const float mx = std::min((float)(Wm - 1), std::max(0.f, (gx + 0.5f) * 0.5f - 0.5f));
+                    const int x0i = (int)mx, x1i = std::min(Wm - 1, x0i + 1);
+                    const float fx = mx - (float)x0i;
+                    const float a = mf->keep[(size_t)y0i * Wm + x0i] * (1.f - fx) + mf->keep[(size_t)y0i * Wm + x1i] * fx;
+                    const float b = mf->keep[(size_t)y1i * Wm + x0i] * (1.f - fx) + mf->keep[(size_t)y1i * Wm + x1i] * fx;
+                    mf->wrob.data[(size_t)gy * Wg + gx] = (a * (1.f - fy) + b * fy) * (1.f / 255.f);
+                }
+            });
+        }
         prof_add_cpu("sabre:frame", prof_now_ms() - t_s);
-        if (work.robustness_save_mask || work.sabre_save_accumulated_mask) {
+        if (work.robustness_save_mask || work.sabre_save_accumulated_mask || work.sabre_base_kernel_blur) {
             if (!have_keep) { keep_sum = Image(Hm, Wm, 1); have_keep = true; }
             for (size_t i = 0; i < mf->keep.size() && i < keep_sum.data.size(); ++i)
                 keep_sum.data[i] += mf->keep[i] * (1.f / 255.f);
@@ -1501,12 +1579,26 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     ref_pyr = Pyramid();
     ref_grey = Image();
     clear_align_ref_ica_cache();
+    if (dropped > 0)
+        report("SABRE: dropped " + std::to_string(dropped) + " of " + std::to_string(frame_count - 1) +
+               " comparison frames as soft", 0.46f);
     if (frames.empty()) report("SABRE: no comparison frame aligned - reference only", 0.46f);
 
     MergeFrame base;
     base.raw = &ref;
     base.cov = std::move(base_guide.cov);
     extract_eps(work, work.cfa, 1.f, base.eps);
+    if (work.sabre_base_kernel_blur && have_keep && !frames.empty()) {
+        // 6.1 BASE_FRAME kernel blurring: base.keep = accumulated comparison keep (frames) / nalts, as u8.
+        const float nalts = (float)frames.size();
+        base.keep.resize((size_t)Wm * Hm);
+        for (size_t i = 0; i < base.keep.size() && i < keep_sum.data.size(); ++i)
+            base.keep[i] = (uint8_t)std::lround(std::min(1.f, std::max(0.f, keep_sum.data[i] / nalts)) * 255.f);
+        base.blur_base = 1;
+        base.blur_thr = work.sabre_base_blur_thr;
+        base.blur_mult = work.sabre_base_blur_mult;
+        base.blur_acc_scale = nalts;   // s82_linear_u8 already returns code / 255
+    }
     base.flow = zero_flow_tex(frames.empty() ? std::max(1, Wr / merge_ts) : frames[0]->flow.nx,
                               frames.empty() ? std::max(1, Hr / merge_ts) : frames[0]->flow.ny, merge_ts, Wr, Hr);
     base_guide = Guide();
@@ -1538,10 +1630,40 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     const int band = std::max(16, std::min(Ho, (int)((48ull << 20) / ((size_t)Wo * 3 * 4 * 2))));
     std::vector<float> rgb, ones;
     std::vector<uint16_t> row16;
+    // Config::sabre_wronski_kernels: the Wronski merge (CPU) with the Wronski kernels, GCam's keep masks.
+    CovField ref_wcov;
+    Config mcfg = work;
+    if (wr_merge) {
+        Config kc = work;
+        kc.gcam_sabre_kernel = false;
+        ref_wcov = estimate_kernels(ref, kc);
+        if (ref_wcov.h != Hg || ref_wcov.w != Wg) wr_merge = false;
+        mcfg.gcam_sabre_kernel = false;           // Wronski kernel weights (inverted covariance, round anchor)
+        mcfg.merge_robustness_bilinear = true;    // the keep mask read bilinearly, as GCam's merge reads it
+        mcfg.gcam_sabre_merge_res = false;
+        mcfg.gcam_sabre_flow_bilinear = false;    // one vector per tile, as the rejection graded it
+        mcfg.affine_flow_enabled = false;
+        mcfg.dense_flow_enabled = false;
+    }
+    if (work.sabre_wronski_kernels)
+        report(wr_merge ? "SABRE: Wronski kernels + merge (CPU)" : "SABRE: Wronski kernels unavailable - GCam merge", 0.47f);
+    auto wronski_band = [&](int y0, int y1, std::vector<float>& out) {
+        const int bh = y1 - y0;
+        Image num(bh, Wo, 3), den(bh, Wo, 3);
+        for (const MergeFrame* f : merge_frames) {
+            if (f == &base) continue;
+            merge_comp_band_cpu(*f->raw, f->wflow, f->wcov, f->wrob, merge_ts, num, den, y0, mcfg);
+        }
+        merge_ref_band_cpu(ref, ref_wcov, num, den, y0, mcfg);
+        out.resize((size_t)bh * Wo * 3);
+        for (size_t i = 0; i < out.size(); ++i) out[i] = den.data[i] > 0.f ? num.data[i] / den.data[i] : 0.f;
+        return true;
+    };
     const double t_m = prof_now_ms();
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
-        if (!merge_band(merge_frames, ctx, y0, y1, gpu || mali, rgb) || rgb.size() < (size_t)bh * Wo * 3) {
+        const bool merged = wr_merge ? wronski_band(y0, y1, rgb) : merge_band(merge_frames, ctx, y0, y1, gpu || mali, rgb);
+        if (!merged || rgb.size() < (size_t)bh * Wo * 3) {
             report("Error: SABRE merge failed", 1.f);
             writer.close();
             return Image();

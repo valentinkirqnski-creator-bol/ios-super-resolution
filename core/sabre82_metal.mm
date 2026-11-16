@@ -310,7 +310,7 @@ bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandCo
             id<MTLBuffer> raw = buf(d, f.raw->data.data() + (size_t)r0 * ctx.Wr, (size_t)(r1 - r0) * ctx.Wr * 4);
             id<MTLBuffer> cov = buf(d, nullptr, (size_t)(g1 - g0) * ctx.Wg * 3 * 4);
             id<MTLBuffer> fl = buf(d, f.flow.data.data(), f.flow.data.size() * 4);
-            id<MTLBuffer> mk = is_base ? buf(d, nullptr, 16) : buf(d, f.keep.data(), f.keep.size());
+            id<MTLBuffer> mk = (is_base && f.keep.empty()) ? buf(d, nullptr, 16) : buf(d, f.keep.data(), f.keep.size());
             if (!raw || !cov || !fl || !mk) { [e endEncoding]; return false; }
             float* cp = (float*)cov.contents;
             const uint16_t* src = f.cov.data() + (size_t)g0 * ctx.Wg * 3;

@@ -1924,6 +1924,81 @@ void dense_lk_refine(FlowField& flow, const Image& ref_grey,
 //     the refinement is skipped (seeding + carry still apply).
 // Downstream, robustness and the merge index the result at half the tile size
 // -- the consumption shape the overlapping-tiles experiment already proved.
+void overlap_lk_refine(FlowField& flow, const Image& ref_grey, const Image& comp_grey, int raw_tile_size,
+                       int raw_h, int raw_w, int iters, int threads) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || raw_tile_size < 2 || raw_w <= 0 || raw_h <= 0) return;
+    const int H = ref_grey.h, W = ref_grey.w;
+    if (H < 4 || W < 4 || comp_grey.h != H || comp_grey.w != W ||
+        ref_grey.data.size() < (size_t)H * W || comp_grey.data.size() < (size_t)H * W) return;
+    const f32 s = (f32)W / (f32)raw_w;                       // grey px per raw px
+    const int win = std::max(4, (int)std::lround(2.f * (f32)raw_tile_size * s));   // 2 cells, grey px
+    const f32* R = ref_grey.data.data();
+    const f32* C = comp_grey.data.data();
+    auto at = [&](const f32* p, int y, int x) { return p[(size_t)y * W + x]; };
+    auto bil = [&](f32 y, f32 x, f32& v) -> bool {
+        if (!(x >= 0.f && y >= 0.f && x <= (f32)(W - 1) && y <= (f32)(H - 1))) return false;
+        const int x0 = std::min(W - 2, (int)x), y0 = std::min(H - 2, (int)y);
+        const f32 fx = x - (f32)x0, fy = y - (f32)y0;
+        v = (at(C, y0, x0) * (1.f - fx) + at(C, y0, x0 + 1) * fx) * (1.f - fy) +
+            (at(C, y0 + 1, x0) * (1.f - fx) + at(C, y0 + 1, x0 + 1) * fx) * fy;
+        return true;
+    };
+    FlowField out = flow;
+    parallel_rows(flow.ny, threads, [&](int ty) {
+        std::vector<f32> T, GX, GY;
+        std::vector<int> PY, PX;
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            // cell centre (raw, pixel-span coordinates) -> grey; window of `win` grey px centred on it
+            const f32 cy = ((f32)ty + 0.5f) * (f32)raw_tile_size * s, cx = ((f32)tx + 0.5f) * (f32)raw_tile_size * s;
+            int y0 = (int)std::lround(cy - 0.5f * (f32)win), x0 = (int)std::lround(cx - 0.5f * (f32)win);
+            y0 = std::max(1, std::min(H - 1 - win, y0));
+            x0 = std::max(1, std::min(W - 1 - win, x0));
+            if (y0 < 1 || x0 < 1) continue;
+            T.clear(); GX.clear(); GY.clear(); PY.clear(); PX.clear();
+            f32 h11 = 0.f, h12 = 0.f, h22 = 0.f;
+            for (int y = y0; y < y0 + win; ++y)
+                for (int x = x0; x < x0 + win; ++x) {
+                    const f32 gx = 0.5f * (at(R, y, x + 1) - at(R, y, x - 1));
+                    const f32 gy = 0.5f * (at(R, y + 1, x) - at(R, y - 1, x));
+                    T.push_back(at(R, y, x)); GX.push_back(gx); GY.push_back(gy); PY.push_back(y); PX.push_back(x);
+                    h11 += gx * gx; h12 += gx * gy; h22 += gy * gy;
+                }
+            const f32 det = h11 * h22 - h12 * h12, tr = h11 + h22;
+            if (!(det > 1e-4f * tr * tr) || !(tr > 0.f)) continue;   // flat or 1-D window: keep the seed
+            const f32 seed_x = flow.dx(ty, tx) * s, seed_y = flow.dy(ty, tx) * s;
+            auto ssd = [&](f32 px, f32 py, f32* bx, f32* by) -> f32 {
+                f32 e2 = 0.f, b1 = 0.f, b2 = 0.f; int n = 0;
+                for (size_t i = 0; i < T.size(); ++i) {
+                    f32 v;
+                    if (!bil((f32)PY[i] + py, (f32)PX[i] + px, v)) continue;
+                    const f32 e = v - T[i];
+                    e2 += e * e; b1 += GX[i] * e; b2 += GY[i] * e; ++n;
+                }
+                if (bx) *bx = b1;
+                if (by) *by = b2;
+                return n * 10 >= (int)T.size() * 9 ? e2 / (f32)n : 1e30f;   // >= 90% of the window in frame
+            };
+            f32 px = seed_x, py = seed_y;
+            const f32 e_seed = ssd(px, py, nullptr, nullptr);
+            for (int it = 0; it < iters; ++it) {
+                f32 b1, b2;
+                if (ssd(px, py, &b1, &b2) >= 1e29f) break;
+                // inverse compositional translation: dp = H^-1 sum(gradT * e); p <- p - dp
+                const f32 dx = (h22 * b1 - h12 * b2) / det, dy = (h11 * b2 - h12 * b1) / det;
+                px -= dx; py -= dy;
+                if (std::fabs(px - seed_x) > 0.5f * (f32)win || std::fabs(py - seed_y) > 0.5f * (f32)win) break;
+                if (dx * dx + dy * dy < 1e-4f) break;
+            }
+            const f32 e_new = ssd(px, py, nullptr, nullptr);
+            if (std::isfinite(px) && std::isfinite(py) && e_new < e_seed) {
+                out.dx(ty, tx) = px / s;
+                out.dy(ty, tx) = py / s;
+            }
+        }
+    });
+    flow.flow = std::move(out.flow);
+}
+
 void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
                                const Image& comp_grey, const Config& cfg,
                                int raw_tile_size, int raw_h, int raw_w,

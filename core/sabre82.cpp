@@ -588,6 +588,8 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
     P.fbp[0] = kMergeBorderGuidePx / ctx.Wg; P.fbp[1] = kMergeBorderGuidePx / ctx.Hg;
     P.fbp[2] = 1.f - kMergeBorderGuidePx / ctx.Wg; P.fbp[3] = 1.f - kMergeBorderGuidePx / ctx.Hg;
     P.cfa = ctx.cfa;
+    P.blur_base = (is_base && f.blur_base && !f.keep.empty()) ? 1 : 0;
+    P.blur_thr = f.blur_thr; P.blur_mult = f.blur_mult; P.blur_acc_scale = f.blur_acc_scale;
     return P;
 }
 
@@ -605,7 +607,7 @@ static bool merge_band_cpu(const std::vector<const MergeFrame*>& frames, const B
         for (size_t i = 0; i < cov.size(); ++i) cov[i] = (float)src[i] * (1.0f / 1023.0f);
         const S82MergeParams P = merge_params(f, ctx, is_base, 0, ctx.Hr, g0, g1, y0);   // full raw plane on CPU
         const float* rp = f.raw->data.data();
-        const uint8_t* mk = is_base ? nullptr : f.keep.data();
+        const uint8_t* mk = (is_base && f.keep.empty()) ? nullptr : f.keep.data();   // base: 6.1 blur coverage
         parallel_rows(bh, ctx.threads, [&](int ly) {
             for (int ox = 0; ox < Wo; ++ox) {
                 float c3[3], w3[3];

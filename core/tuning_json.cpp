@@ -288,6 +288,16 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("sabre_save_accumulated_mask")) cfg.sabre_save_accumulated_mask = bv("sabre_save_accumulated_mask");
     if (has("sabre_resid_shift_enabled"))  cfg.sabre_resid_shift_enabled = bv("sabre_resid_shift_enabled");
     if (has("sabre_rejection_only_1x"))    cfg.sabre_rejection_only_1x = bv("sabre_rejection_only_1x");
+    if (has("sabre_frame_drop"))           cfg.sabre_frame_drop = bv("sabre_frame_drop");
+    if (has("sabre_wronski_kernels"))      cfg.sabre_wronski_kernels = bv("sabre_wronski_kernels");
+    if (has("sabre_overlap_lk"))           cfg.sabre_overlap_lk = bv("sabre_overlap_lk");
+    if (has("sabre_overlap_lk_iters"))     cfg.sabre_overlap_lk_iters = iv("sabre_overlap_lk_iters");
+    if (has("sabre_base_kernel_blur"))     cfg.sabre_base_kernel_blur = bv("sabre_base_kernel_blur");
+    if (has("sabre_base_blur_thr"))        cfg.sabre_base_blur_thr = fv("sabre_base_blur_thr");
+    if (has("sabre_base_blur_mult"))       cfg.sabre_base_blur_mult = fv("sabre_base_blur_mult");
+    if (has("sabre_frame_drop_ratio"))     cfg.sabre_frame_drop_ratio = fv("sabre_frame_drop_ratio");
+    if (has("sabre_frame_drop_min_frames")) cfg.sabre_frame_drop_min_frames = iv("sabre_frame_drop_min_frames");
+    if (has("sabre_frame_drop_night_snr")) cfg.sabre_frame_drop_night_snr = fv("sabre_frame_drop_night_snr");
     if (has("sabre_resid_shift_tol_px"))   cfg.sabre_resid_shift_tol_px = fv("sabre_resid_shift_tol_px");
     if (has("sabre_resid_shift_width_px")) cfg.sabre_resid_shift_width_px = fv("sabre_resid_shift_width_px");
     if (has("sabre_resid_shift_edge_pct")) cfg.sabre_resid_shift_edge_pct = fv("sabre_resid_shift_edge_pct");
