@@ -54,6 +54,7 @@ targets:
           - "fb_confidence.cpp"
           - "burst_consensus.cpp"
           - "sabre82.cpp"
+          - "hsr_align.cpp"
           - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"

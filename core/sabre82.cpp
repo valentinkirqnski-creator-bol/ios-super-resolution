@@ -384,6 +384,7 @@ S82RejParams rej_params(int Wg, int Hg, const FlowTex& flow, float noise_scale, 
     P.ub_thr = kMotionThrGuidePx / (float)Wg;
     P.noise_scale = noise_scale;
     P.rejection_only = rejection_only;
+    P.flow_bilinear = flow.bilinear;
     return P;
 }
 
@@ -406,7 +407,7 @@ static void finish_flow_tex(FlowTex& t) {
     for (size_t i = 0; i < z.size(); ++i) t.data[i * 4 + 2] = s82_q16(z[i]);
 }
 
-FlowTex make_flow_tex(const FlowField& flow, int ts, int Wr, int Hr, const Config& cfg) {
+FlowTex make_flow_tex(const FlowField& flow, int ts, int Wr, int Hr, const Config& cfg, bool median3) {
     FlowTex t;
     t.nx = flow.nx; t.ny = flow.ny;
     t.fso[0] = (float)Wr / (float)(t.nx * ts);
@@ -441,8 +442,13 @@ FlowTex make_flow_tex(const FlowField& flow, int ts, int Wr, int Hr, const Confi
                     vy[k] = py[(size_t)qy * t.nx + qx];
                     ++k;
                 }
-            std::nth_element(vx, vx + 4, vx + 9);
-            std::nth_element(vy, vy + 4, vy + 9);
+            if (median3) {
+                std::nth_element(vx, vx + 4, vx + 9);
+                std::nth_element(vy, vy + 4, vy + 9);
+            } else {
+                vx[4] = px[(size_t)ty * t.nx + tx];
+                vy[4] = py[(size_t)ty * t.nx + tx];
+            }
             mn = std::min(mn, vy[4]); mx = std::max(mx, vy[4]);
             float* f = &t.data[((size_t)ty * t.nx + tx) * 4];
             f[0] = s82_q16(vx[4] / (float)Wr);
@@ -588,6 +594,7 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
     P.fbp[0] = kMergeBorderGuidePx / ctx.Wg; P.fbp[1] = kMergeBorderGuidePx / ctx.Hg;
     P.fbp[2] = 1.f - kMergeBorderGuidePx / ctx.Wg; P.fbp[3] = 1.f - kMergeBorderGuidePx / ctx.Hg;
     P.cfa = ctx.cfa;
+    P.flow_bilinear = f.flow.bilinear;
     P.blur_base = (is_base && f.blur_base && !f.keep.empty()) ? 1 : 0;
     P.blur_thr = f.blur_thr; P.blur_mult = f.blur_mult; P.blur_acc_scale = f.blur_acc_scale;
     return P;

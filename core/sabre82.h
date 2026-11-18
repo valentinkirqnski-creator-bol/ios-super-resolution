@@ -76,8 +76,10 @@ struct FlowTex {
     float fso[4] = {1.f, 1.f, 0.f, 0.f};
     std::vector<float> data;          // ny*nx*4
     float min_dy_px = 0.f, max_dy_px = 0.f;
+    int bilinear = 0;                 // Config::sabre_flow_bilinear: displacement read LINEAR (rejection + merge)
 };
-FlowTex make_flow_tex(const FlowField& flow, int tile_size, int Wr, int Hr, const Config& cfg);
+// median3 = false when the flow is already 3x3-median filtered (the hsr_align output).
+FlowTex make_flow_tex(const FlowField& flow, int tile_size, int Wr, int Hr, const Config& cfg, bool median3 = true);
 FlowTex zero_flow_tex(int nx, int ny, int tile_size, int Wr, int Hr);
 
 // Unblocker (unblocker.cc -> UnblockerRaw16Halide): one R8 texel per 16x16 Bayer tile (= 8x8 guide pixels),

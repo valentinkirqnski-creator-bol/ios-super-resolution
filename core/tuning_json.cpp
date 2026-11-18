@@ -291,6 +291,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("sabre_frame_drop"))           cfg.sabre_frame_drop = bv("sabre_frame_drop");
     if (has("sabre_wronski_kernels"))      cfg.sabre_wronski_kernels = bv("sabre_wronski_kernels");
     if (has("sabre_overlap_lk"))           cfg.sabre_overlap_lk = bv("sabre_overlap_lk");
+    if (has("sabre_flow_bilinear"))        cfg.sabre_flow_bilinear = bv("sabre_flow_bilinear");
     if (has("sabre_overlap_lk_iters"))     cfg.sabre_overlap_lk_iters = iv("sabre_overlap_lk_iters");
     if (has("sabre_base_kernel_blur"))     cfg.sabre_base_kernel_blur = bv("sabre_base_kernel_blur");
     if (has("sabre_base_blur_thr"))        cfg.sabre_base_blur_thr = fv("sabre_base_blur_thr");

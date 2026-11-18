@@ -154,6 +154,7 @@ struct S82RejParams {
     float noise_scale;        // 1 = the LUT as filled (exposed as a tuning knob)
     int unx, uny;             // unblocker texture (R8, one texel per 8x8 guide pixels)
     float uscale[2];          // unblocker_scale
+    int flow_bilinear;        // Config::sabre_flow_bilinear: flow .xy read LINEAR between tile centres
     int rejection_only;       // REJECTION_ONLY shader variant (GCam at true 1x): the current frame sampled
                               // SampleBiquadraticAbsolute, kFilterVarianceScale 0.25 / 0.0976597
 };
@@ -179,6 +180,7 @@ struct S82MergeParams {
     // covariance (precision) is multiplied by blur_mult.
     int blur_base;
     float blur_thr, blur_mult, blur_acc_scale;
+    int flow_bilinear;        // Config::sabre_flow_bilinear
 };
 
 // ------------------------------------------------------------------------------------------------ samplers
@@ -234,6 +236,21 @@ S82_INLINE S82F4 s82_flow_nearest(const S82_DEVICE float* flow, int nx, int ny, 
     const int y = s82_clampi((int)s82_floor(v * (float)ny), 0, ny - 1);
     const S82_DEVICE float* f = flow + ((long)y * nx + x) * 4;
     return s82_f4(f[0], f[1], f[2], f[3]);
+}
+// Config::sabre_flow_bilinear: the displacement (.xy) LINEAR between flow-texel centres, .zw NEAREST.
+S82_INLINE S82F4 s82_flow_linear_xy(const S82_DEVICE float* flow, int nx, int ny, float u, float v) {
+    S82F4 r = s82_flow_nearest(flow, nx, ny, u, v);
+    const float x = u * (float)nx - 0.5f, y = v * (float)ny - 0.5f;
+    const float fx = s82_floor(x), fy = s82_floor(y);
+    const float ax = s82_clampf(x - fx, 0.0f, 1.0f), ay = s82_clampf(y - fy, 0.0f, 1.0f);
+    const int x0 = s82_clampi((int)fx, 0, nx - 1), x1 = s82_clampi((int)fx + 1, 0, nx - 1);
+    const int y0 = s82_clampi((int)fy, 0, ny - 1), y1 = s82_clampi((int)fy + 1, 0, ny - 1);
+    for (int c = 0; c < 2; ++c) {
+        const float a = flow[((long)y0 * nx + x0) * 4 + c] * (1.0f - ax) + flow[((long)y0 * nx + x1) * 4 + c] * ax;
+        const float b = flow[((long)y1 * nx + x0) * 4 + c] * (1.0f - ax) + flow[((long)y1 * nx + x1) * 4 + c] * ax;
+        if (c == 0) r.x = a * (1.0f - ay) + b * ay; else r.y = a * (1.0f - ay) + b * ay;
+    }
+    return r;
 }
 // kFunctionSampleBicubic: ComputeBicubicParameters + SampleBicubicAbsolute (abs after each LINEAR tap).
 S82_INLINE S82F4 s82_sample_bicubic_abs(const S82_DEVICE float* tex, int W, int H, float u, float v) {
@@ -457,7 +474,9 @@ S82_INLINE float s82_rejection_pixel(const S82_DEVICE float* base_ref, const S82
                                      const S82_DEVICE uint8_t* unb, S82RejParams P, int gx, int gy,
                                      S82_THREAD float* it_out) {
     const float tcx = ((float)gx + 0.5f) / (float)P.Wg, tcy = ((float)gy + 0.5f) / (float)P.Hg;
-    const S82F4 fl = s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
+    const S82F4 fl = P.flow_bilinear
+        ? s82_flow_linear_xy(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3])
+        : s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
     float wuv[2];
     wuv[0] = tcx + fl.x; wuv[1] = tcy + fl.y;
     s82_mirror(wuv, P.fbp);
@@ -793,7 +812,13 @@ S82_INLINE float s82m_rejection_pixel(const S82_DEVICE float* base_ref, const S8
     float tcx, tcy;
     s82m_tex_coord(P.Wg, P.Hg, gx, gy, &tcx, &tcy);
     const float fu = tcx * P.fso[0] + P.fso[2], fv = tcy * P.fso[1] + P.fso[3];
-    const S82_DEVICE float* fl = flow + ((S82M_I64)s82m_nearest(fv, P.fny) * P.fnx + s82m_nearest(fu, P.fnx)) * 4;
+    const S82_DEVICE float* flp = flow + ((S82M_I64)s82m_nearest(fv, P.fny) * P.fnx + s82m_nearest(fu, P.fnx)) * 4;
+    float fl[4];
+    fl[0] = flp[0]; fl[1] = flp[1]; fl[2] = flp[2]; fl[3] = flp[3];
+    if (P.flow_bilinear) {   // Config::sabre_flow_bilinear (not GCam): displacement LINEAR between tile centres
+        const S82F4 b = s82_flow_linear_xy(flow, P.fnx, P.fny, fu, fv);
+        fl[0] = b.x; fl[1] = b.y;
+    }
     float wuv[2];
     wuv[0] = tcx + fl[0];
     wuv[1] = tcy + fl[1];
@@ -1013,7 +1038,9 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
     // The dilated mask is sampled LINEAR (burst9_GT2 teacher-forced merge: 99.7% of the >2% errors under NEAREST
     // sat on mask-transition texels).
     if (P.use_mask) frame_weight = s82_linear_u8(mask, P.Wm, P.Hm, tcx, tcy);
-    const S82F4 fl = s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
+    const S82F4 fl = P.flow_bilinear
+        ? s82_flow_linear_xy(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3])
+        : s82_flow_nearest(flow, P.fnx, P.fny, tcx * P.fso[0] + P.fso[2], tcy * P.fso[1] + P.fso[3]);
     float s[2];
     s[0] = tcx + fl.x; s[1] = tcy + fl.y;
     s82_mirror(s, P.fbp);

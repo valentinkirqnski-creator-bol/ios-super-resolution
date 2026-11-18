@@ -1784,12 +1784,19 @@ struct Config {
     // k_shrink / k_stretch / k_denoise / D_th / D_tr, SNR auto-tune as usual), each comparison frame weighted by its
     // SABRE keep mask (bilinear) and warped by the same tile vectors the rejection graded. Off.
     bool  sabre_wronski_kernels = false;
+    // NO EFFECT since the SABRE path aligns with hsr_align (its own 16/8 overlapping grid); kept for old settings.
     // GCam 6.1 flow layout (libgcam_jni FUN_008a45d4: tile = merge_tile, stride = tile/2): every flow vector of the
     // SABRE grid (one per merge tile) is RE-MEASURED with sub-pixel Lucas-Kanade (translation, inverse
     // compositional, up to sabre_overlap_lk_iters steps) on a window TWICE the cell (16 grey px for an 8-px cell),
     // centred on the cell -- the half-tile overlap GCam estimates on -- seeded by our flow. A cell keeps the result
     // only when its window SSD beats the seed's. Same grid, NEAREST, 3x3 median downstream. Off by default.
     bool  sabre_overlap_lk = false;
+    // SABRE path: read the flow texture's displacement BILINEARLY between tile centres (rejection AND merge, so the
+    // masks grade exactly what is merged) instead of GCam's NEAREST. Our per-tile flow follows real local motion
+    // (burst12: 0.17 px median at tile level vs GCam's 0.44), so NEAREST turns its tile-to-tile changes into seams
+    // at every tile boundary; bilinear makes the motion continuous at ~the same accuracy (0.18 px). The motion
+    // extent (.z, motion boost / unblocker gate) stays NEAREST. Off = GCam (NEAREST).
+    bool  sabre_flow_bilinear = false;
     int   sabre_overlap_lk_iters = 6;
     // GCam 6.1 merge BASE_FRAME: `if (weight_so_far < kernel_blurring_params.x) covariance *= kernel_blurring_params.y`
     // with weight_so_far = accumulated comparison-frame keep weight at the pixel (sum of keep masks, in frames). The

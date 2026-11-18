@@ -22,6 +22,7 @@
 #include "burst_consensus.h"
 #include "cref.h"
 #include "sabre82.h"
+#include "hsr_align.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1267,9 +1268,10 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 //               base frame additionally its BaseFrameRefColor; comparison frames: rejection against it
 //               (noise-subtracted variance distance) and the dilate to the half-guide grid
 //   per band  : merge of every comparison frame, the base last with frame weight 1, then SabreDehomogenize
-// Alignment is ours, unchanged (pre-align plan, global warp, block match / LK, half-tile / dense /
-// feature-metric refinements); its result is handed to SABRE as GCam's flow texture (one vector per
-// tile after the 3x3 median, NEAREST). None of the hhsr robustness / kernel / merge / mask stages run.
+// Alignment is hsr_align (core/hsr_align.h: the Handheld-Multi-Frame-Super-Resolution alignment module, reference =
+// frame 0, no pre-alignment or refinements); its 16/8 grid (already 3x3-median filtered) is handed to SABRE as
+// GCam's flow texture (one vector per 16 raw px, NEAREST). None of the hhsr robustness / kernel / merge / mask
+// stages run.
 // 8.2's post-merge spatial-merge / RAISR resolve chain is not part of the reference; the dehomogenized
 // merge is the output. Per-pixel math: core/sabre82_shared.h. Reference:
 // Documents/super/SABRE_8.2_COMPLETE_REFERENCE.md.
@@ -1312,7 +1314,9 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     report("SABRE: loading reference", 0.02f);
     Image first_ref = loader(0, work, true, 0, 0);
     if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
-    PrealignPlan prealign = build_prealign_plan_from_first(frame_count, loader, work, first_ref, progress);
+    // Alignment = hsr_align (the Handheld-Multi-Frame-Super-Resolution alignment module): no pre-alignment pass, and
+    // the reference is frame 0, as in the package.
+    PrealignPlan prealign;
     const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
     Image ref;
     if (ref_index == 0) ref = std::move(first_ref);
@@ -1325,26 +1329,22 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         report("Error: SABRE needs a Bayer frame with sides divisible by 4", 1.f);
         return Image();
     }
-    clear_align_ref_ica_cache();
     f32 ref_brightness = 0.f;
-    tune_config_snr(ref, work, &ref_brightness);   // alignment tile size + the rest of the aligner's tuning
-#if defined(__APPLE__)
-    metal_set_grey_force_host(true);               // our aligner runs on host greys here (no frame residency)
-#endif
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
-    const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
-    int halftile_levels = 0;
-    if (work.halftile_refine_enabled) {
-        const int target = work.halftile_refine_target_ts;
-        if (target <= 0) halftile_levels = 1;
-        else {
-            int t = tile_size;
-            while (t > target && halftile_levels < 4) { t >>= 1; ++halftile_levels; }
-            if (halftile_levels < 1) halftile_levels = 1;
-        }
+    tune_config_snr(ref, work, &ref_brightness);   // reference brightness (kernel covariance SNR below)
+    // ---- alignment: hsr_align, reference pyramid (package grey, SNR-selected level settings) ----
+    const double t_ra = prof_now_ms();
+    const hsra::Options al_opt = hsra::options_for_snr(hsra::estimate_image_snr_db(ref, work));
+    hsra::Pyramid al_ref = hsra::build_pyramid(hsra::grey_from_bayer(ref, work, work.num_threads), al_opt,
+                                               true, work.num_threads);
+    prof_add_cpu("sabre:align-ref", prof_now_ms() - t_ra);
+    {
+        char ab[192];
+        std::snprintf(ab, sizeof(ab), "Alignment: Handheld-SR aligner (grey decimated, SNR %.1f dB, tiles %d/%d/%d/%d/%d, "
+                      "radii 1/3/3/3/3, ICA %d, 16/8 grid + 3x3 median)", al_opt.snr_db, al_opt.tiles[0], al_opt.tiles[1],
+                      al_opt.tiles[2], al_opt.tiles[3], al_opt.tiles[4], al_opt.ica_iterations);
+        report(ab, 0.04f);
     }
-    const int merge_ts = std::max(1, tile_size >> halftile_levels);
-    Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, work.grey_tile_size(tile_size)), work.bm_factors);
+    const int merge_ts = 16;                       // the package's final grid: 16 raw px per cell (16/8 grey tiles)
 
     const int Wr = ref.w, Hr = ref.h, Wg = Wr / 2, Hg = Hr / 2, Wm = Wg / 2, Hm = Hg / 2;
     const int Wo = (int)std::lround(work.scale * Wr), Ho = (int)std::lround(work.scale * Hr);
@@ -1426,7 +1426,8 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     // GCam SABRE frame dropping (Config::sabre_frame_drop): sharpness-driven, relative to the base frame; night
     // mode (low burst SNR) keeps every frame.
     const bool drop_on = work.sabre_frame_drop && cov_t.snr > work.sabre_frame_drop_night_snr;
-    const double base_sharp = drop_on ? sabre_frame_sharpness(ref_grey) : 0.0;
+    auto plane_image = [](const hsra::Plane& p) { Image im(p.h, p.w, 1); im.data = p.d; return im; };
+    const double base_sharp = drop_on ? sabre_frame_sharpness(plane_image(al_ref.levels[0].img)) : 0.0;
     int dropped = 0;
     bool wr_merge = work.sabre_wronski_kernels;   // Wronski kernels + merge (cleared if a kernel field fails)
     int pos = 0;
@@ -1437,12 +1438,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         ++pos;
         Image comp = loader(k, work, false, ref.h, ref.w);
         if (comp.h != ref.h || comp.w != ref.w || comp.data.size() < (size_t)comp.h * comp.w) continue;
-        // ---- alignment (ours, unchanged) ----
+        // ---- alignment: hsr_align ----
         const double t_al = prof_now_ms();
-        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        hsra::Plane comp_grey = hsra::grey_from_bayer(comp, work, work.num_threads);
         if (drop_on && base_sharp > 0.0) {
             const double tw = 1.0 - (double)std::abs(k - ref_index) / 150.0;
-            const double score = sabre_frame_sharpness(comp_grey) * tw;
+            const double score = sabre_frame_sharpness(plane_image(comp_grey)) * tw;
             // SNR-budget release: never go below min_frames merged frames (base included).
             const int left_if_dropped = 1 + (int)frames.size() + (frame_count - 1 - pos);
             if (score <= (double)work.sabre_frame_drop_ratio * base_sharp &&
@@ -1455,55 +1456,18 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
                 continue;
             }
         }
-        PrealignTransform init;
-        if (k < (int)prealign.from_reference.size()) init = prealign.from_reference[(size_t)k];
-        const f32 gsx = (f32)ref_grey.w / (f32)Wr, gsy = (f32)ref_grey.h / (f32)Hr;
-        GlobalWarp gw = estimate_global_warp(ref_grey, comp_grey, comp.h, comp.w, k, work);
-        const Image* align_comp = gw.warped ? &gw.warped_grey : &comp_grey;
-#if defined(__APPLE__)
-        metal_invalidate_sticky_grey();
-#endif
-        FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
-                               gw.warped ? 0.f : init.dx * gsx, gw.warped ? 0.f : init.dy * gsy,
-                               gw.warped ? 0.f : init.angle);
-        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile_size,
-                                     work.r_Mt, work.num_threads, work.grey_tile_size(tile_size));
-        if (gw.warped) {
-            for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i];
-            flow.has_global_h = true;
-        }
-        if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
-        const Image& cg = gw.warped ? gw.warped_grey : comp_grey;
-        for (int lvl = 0; lvl < halftile_levels; ++lvl) {
-            const int level_ts = std::max(2, tile_size >> lvl);
-            const bool last = (lvl == halftile_levels - 1);
-            halftile_subdivide_refine(flow, ref_grey, cg, work, level_ts, comp.h, comp.w, !(last && merge_ts <= 4));
-        }
-        // GCam 6.1 half-overlap flow: every merge-grid vector re-measured on a 2x-cell window (sub-pixel LK).
-        if (work.sabre_overlap_lk)
-            overlap_lk_refine(flow, ref_grey, cg, merge_ts, comp.h, comp.w, work.sabre_overlap_lk_iters,
-                              work.num_threads);
-        if (work.dense_flow_enabled) {
-            const int Dd = std::max(1, work.dense_flow_downsample);
-            if (Dd > 1) dense_lk_refine(flow, downsample_box_grey(ref_grey, Dd), downsample_box_grey(cg, Dd),
-                                        work, merge_ts, comp.h, comp.w);
-            else dense_lk_refine(flow, ref_grey, cg, work, merge_ts, comp.h, comp.w);
-        }
-        if (work.feat_metric_refine_enabled) {
-            const int Dd = std::max(1, work.feat_metric_downsample);
-            if (Dd > 1) feat_metric_refine(flow, downsample_box_grey(ref_grey, Dd), downsample_box_grey(cg, Dd),
-                                           work, merge_ts, comp.h, comp.w);
-            else feat_metric_refine(flow, ref_grey, cg, work, merge_ts, comp.h, comp.w);
-        }
-        comp_grey = Image();
-        gw = GlobalWarp();
+        FlowField flow = hsra::to_raw_flow_field(
+            hsra::align(al_ref, hsra::build_pyramid(comp_grey, al_opt, false, work.num_threads), work.num_threads),
+            comp.w, comp.h);
+        comp_grey = hsra::Plane();
         prof_add_cpu("sabre:align", prof_now_ms() - t_al);
         if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) continue;
 
         // ---- SABRE per-frame stages ----
         const double t_s = prof_now_ms();
         auto mf = std::make_unique<MergeFrame>();
-        mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work);
+        mf->flow = make_flow_tex(flow, merge_ts, Wr, Hr, work, /*median3=*/false);   // hsr_align already medians
+        mf->flow.bilinear = work.sabre_flow_bilinear ? 1 : 0;
         const float Kf = applied_gain(comp);
         GuideTuning ft = guide_tuning(cov_t, green_clip_point(Kf, work.white_level));
         ft.rejection_only = ro1x ? 1 : 0;
@@ -1576,9 +1540,7 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         mf->raw = comp_raws.back().get();
         frames.push_back(std::move(mf));
     }
-    ref_pyr = Pyramid();
-    ref_grey = Image();
-    clear_align_ref_ica_cache();
+    al_ref = hsra::Pyramid();   // the reference pyramid is done with once every frame is aligned
     if (dropped > 0)
         report("SABRE: dropped " + std::to_string(dropped) + " of " + std::to_string(frame_count - 1) +
                " comparison frames as soft", 0.46f);

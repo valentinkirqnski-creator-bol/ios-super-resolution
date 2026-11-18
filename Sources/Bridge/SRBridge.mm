@@ -704,6 +704,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"sabre_frame_drop"]) cfg.sabre_frame_drop = tuning[@"sabre_frame_drop"].boolValue;
     if (tuning[@"sabre_wronski_kernels"]) cfg.sabre_wronski_kernels = tuning[@"sabre_wronski_kernels"].boolValue;
     if (tuning[@"sabre_overlap_lk"]) cfg.sabre_overlap_lk = tuning[@"sabre_overlap_lk"].boolValue;
+    if (tuning[@"sabre_flow_bilinear"]) cfg.sabre_flow_bilinear = tuning[@"sabre_flow_bilinear"].boolValue;
     if (tuning[@"sabre_base_kernel_blur"]) cfg.sabre_base_kernel_blur = tuning[@"sabre_base_kernel_blur"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
