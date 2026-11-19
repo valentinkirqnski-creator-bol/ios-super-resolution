@@ -1759,6 +1759,9 @@ struct Config {
     // comparison frames (255 = every frame kept fully). The same quantity as GCam's AccumulateMergeMask
     // (which stores sum / 15). Independent of robustness_save_mask (which also writes every per-frame mask).
     bool  sabre_save_accumulated_mask = false;
+    // SABRE path: also write <stem>_reference.dng -- the reference frame ALONE through the same merge (same kernels,
+    // same output size, same DNG encoding), i.e. what the merge makes of one frame. Saved to Photos with the output.
+    bool  sabre_save_reference = false;
     // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
     // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
     // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on

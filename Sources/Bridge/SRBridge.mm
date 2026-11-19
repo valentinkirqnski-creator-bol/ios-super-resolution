@@ -699,6 +699,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"sabre_mali_gpu"])           cfg.sabre_mali_gpu = tuning[@"sabre_mali_gpu"].boolValue;
     if (tuning[@"sabre_mali_noise_model"])   cfg.sabre_mali_noise_model = tuning[@"sabre_mali_noise_model"].boolValue;
     if (tuning[@"sabre_save_accumulated_mask"]) cfg.sabre_save_accumulated_mask = tuning[@"sabre_save_accumulated_mask"].boolValue;
+    if (tuning[@"sabre_save_reference"]) cfg.sabre_save_reference = tuning[@"sabre_save_reference"].boolValue;
     if (tuning[@"sabre_resid_shift_enabled"]) cfg.sabre_resid_shift_enabled = tuning[@"sabre_resid_shift_enabled"].boolValue;
     if (tuning[@"sabre_rejection_only_1x"]) cfg.sabre_rejection_only_1x = tuning[@"sabre_rejection_only_1x"].boolValue;
     if (tuning[@"sabre_frame_drop"]) cfg.sabre_frame_drop = tuning[@"sabre_frame_drop"].boolValue;

@@ -1586,6 +1586,23 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     const float pscale = std::min(1.f, (float)maxPreviewDim / (float)std::max(Ho, Wo));
     const int ph = std::max(1, (int)(Ho * pscale)), pw = std::max(1, (int)(Wo * pscale));
     Image preview(ph, pw, 3);
+    // Config::sabre_save_reference: <stem>_reference.dng = the base frame alone through the same merge, written band
+    // by band next to the output (same size, kernels and DNG encoding).
+    DngStreamWriter ref_writer;
+    std::string ref_dng_path = dng_path;
+    if (ref_dng_path.size() >= 4 && ref_dng_path.compare(ref_dng_path.size() - 4, 4, ".dng") == 0)
+        ref_dng_path.resize(ref_dng_path.size() - 4);
+    ref_dng_path += "_reference.dng";
+    bool ref_out = work.sabre_save_reference &&
+                   ref_writer.open(ref_dng_path, Wo, Ho, model, work.orientation,
+                                   work.has_color_matrix ? work.color_matrix : nullptr, work.white_balance,
+                                   work.bake_srgb, make, work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
+                                   work.raw_prewhitened && !dng_unwhiten_active(work, nch),
+                                   work.dng_codec, &dng_exif, work.num_threads);
+    if (work.sabre_save_reference && !ref_out) report("SABRE: cannot open the reference DNG - not saved", 0.47f);
+    Image ref_preview(ph, pw, 3);
+    std::vector<float> rgb_ref;
+    std::vector<uint16_t> row16_ref;
     BandContext ctx;
     ctx.Wo = Wo; ctx.Ho = Ho; ctx.Wr = Wr; ctx.Hr = Hr; ctx.Wg = Wg; ctx.Hg = Hg; ctx.Wm = Wm; ctx.Hm = Hm;
     ctx.cfa = cfa; ctx.threads = work.num_threads;
@@ -1621,6 +1638,15 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         for (size_t i = 0; i < out.size(); ++i) out[i] = den.data[i] > 0.f ? num.data[i] / den.data[i] : 0.f;
         return true;
     };
+    auto wronski_ref_band = [&](int y0, int y1, std::vector<float>& out) {   // the reference alone
+        const int bh = y1 - y0;
+        Image num(bh, Wo, 3), den(bh, Wo, 3);
+        merge_ref_band_cpu(ref, ref_wcov, num, den, y0, mcfg);
+        out.resize((size_t)bh * Wo * 3);
+        for (size_t i = 0; i < out.size(); ++i) out[i] = den.data[i] > 0.f ? num.data[i] / den.data[i] : 0.f;
+        return true;
+    };
+    const std::vector<const MergeFrame*> base_only{&base};
     const double t_m = prof_now_ms();
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
@@ -1633,10 +1659,25 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         if (ones.size() < rgb.size()) ones.assign(rgb.size(), 1.f);
         encode_band_rows_ptr(rgb.data(), ones.data(), y0, bh, work, nch, preview, pscale, ph, pw, Wo, row16);
         writer.write_rows(row16.data(), bh);
+        if (ref_out) {
+            const bool ok = wr_merge ? wronski_ref_band(y0, y1, rgb_ref)
+                                     : merge_band(base_only, ctx, y0, y1, gpu || mali, rgb_ref);
+            if (ok && rgb_ref.size() >= (size_t)bh * Wo * 3) {
+                encode_band_rows_ptr(rgb_ref.data(), ones.data(), y0, bh, work, nch, ref_preview, pscale, ph, pw, Wo,
+                                     row16_ref);
+                ref_writer.write_rows(row16_ref.data(), bh);
+            } else {
+                ref_writer.close();
+                std::remove(ref_dng_path.c_str());
+                ref_out = false;
+                report("SABRE: reference merge failed - reference DNG not saved", 0.48f + 0.50f * (float)y1 / Ho);
+            }
+        }
         report("SABRE: merging", 0.48f + 0.50f * (float)y1 / Ho);
     }
     prof_add_cpu("sabre:merge", prof_now_ms() - t_m);
     writer.close();
+    if (ref_out) ref_writer.close();
     if (work.robustness_save_mask && have_keep)
         write_robustness_mask_pgm(keep_sum, (int)frames.size(), dng_path, "", Hr, Wr);
     // The accumulated mask at its native (GCam MASKOP) resolution: <stem>_robustness_accumulated.pgm
@@ -1654,10 +1695,33 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     return preview;
 }
 
+// Per-frame side files of an earlier run with the same output name (<stem>_keep_fNN.pgm, <stem>_structure_fNN*.ppm)
+// would otherwise be picked up with this run's: the app collects them by listing the folder for the stem prefix, and
+// a run with fewer frames, a dropped frame or a different reference leaves some of the old indices unwritten.
+static void remove_stale_frame_outputs(const std::string& dng_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path out(dng_path);
+    const fs::path dir = out.has_parent_path() ? out.parent_path() : fs::path(".");
+    const std::string stem = out.stem().string();
+    if (stem.empty()) return;
+    const std::string keep = stem + "_keep_f", structure = stem + "_structure_f", reference = stem + "_reference.dng";
+    std::vector<fs::path> stale;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        const std::string ext = it->path().extension().string();
+        if ((name.compare(0, keep.size(), keep) == 0 && ext == ".pgm") ||
+            (name.compare(0, structure.size(), structure) == 0 && ext == ".ppm") || name == reference)
+            stale.push_back(it->path());
+    }
+    for (const fs::path& p : stale) fs::remove(p, ec);
+}
+
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
                                   const Config& cfg, const std::string& dng_path,
                                   const ProgressFn& progress, int maxPreviewDim) {
     if (frame_count < 2 || !loader_in) return Image();
+    if (!dng_path.empty()) remove_stale_frame_outputs(dng_path);
     // Every frame of the burst comes through this loader (reference, prealign thumbnails, analysis and merge
     // passes), so brightness matching here covers the DNG and ZSL paths alike. The gain is the ratio of the
     // frames' own exposure metadata (shutter x ISO), one gain for all channels; nothing happens when either

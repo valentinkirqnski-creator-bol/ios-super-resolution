@@ -375,6 +375,7 @@ struct TuningParams: Equatable, Codable {
     var sabre_mali_gpu: Bool = true
     var sabre_mali_noise_model: Bool = false
     var sabre_save_accumulated_mask: Bool = false
+    var sabre_save_reference: Bool = false
     var sabre_resid_shift_enabled: Bool = false
     var sabre_rejection_only_1x: Bool = true
     var sabre_frame_drop: Bool = false
@@ -638,7 +639,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_resid_shift_enabled, sabre_rejection_only_1x, sabre_frame_drop, sabre_wronski_kernels, sabre_overlap_lk, sabre_flow_bilinear, sabre_base_kernel_blur,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_save_reference, sabre_resid_shift_enabled, sabre_rejection_only_1x, sabre_frame_drop, sabre_wronski_kernels, sabre_overlap_lk, sabre_flow_bilinear, sabre_base_kernel_blur,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -828,6 +829,7 @@ struct TuningParams: Equatable, Codable {
         sabre_mali_gpu = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_gpu) ?? sabre_mali_gpu
         sabre_mali_noise_model = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_noise_model) ?? sabre_mali_noise_model
         sabre_save_accumulated_mask = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_accumulated_mask) ?? sabre_save_accumulated_mask
+        sabre_save_reference = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_reference) ?? sabre_save_reference
         sabre_resid_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .sabre_resid_shift_enabled) ?? sabre_resid_shift_enabled
         sabre_rejection_only_1x = try c.decodeIfPresent(Bool.self, forKey: .sabre_rejection_only_1x) ?? sabre_rejection_only_1x
         sabre_frame_drop = try c.decodeIfPresent(Bool.self, forKey: .sabre_frame_drop) ?? sabre_frame_drop
@@ -2568,6 +2570,17 @@ final class CameraModel: NSObject, ObservableObject {
             usingDocDNGs = true
         }
 
+        // Every run writes its DNG and side files (per-frame masks, structure maps) into a folder of its own, deleted
+        // after saving. Imports have no capture folder, and used to write into the shared temporary directory under a
+        // fixed name, where the per-frame masks of earlier runs stayed behind and were saved again with the next
+        // import's masks (the mask list is a directory listing by name prefix).
+        if self.burstDir == nil {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("import_\(UUID().uuidString)", isDirectory: true)
+            if (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil {
+                self.burstDir = dir
+            }
+        }
         let burstDir = self.burstDir
         guard rawFrames.count >= 2 || paths.count >= 2 else {
             removeBurstDir(burstDir)
@@ -2727,6 +2740,7 @@ final class CameraModel: NSObject, ObservableObject {
             "sabre_mali_gpu": NSNumber(value: tuningParams.sabre_mali_gpu),
             "sabre_mali_noise_model": NSNumber(value: tuningParams.sabre_mali_noise_model),
             "sabre_save_accumulated_mask": NSNumber(value: tuningParams.sabre_save_accumulated_mask),
+            "sabre_save_reference": NSNumber(value: tuningParams.sabre_save_reference),
             "sabre_resid_shift_enabled": NSNumber(value: tuningParams.sabre_resid_shift_enabled),
             "sabre_rejection_only_1x": NSNumber(value: tuningParams.sabre_rejection_only_1x),
             "sabre_frame_drop": NSNumber(value: tuningParams.sabre_frame_drop),
@@ -2883,7 +2897,14 @@ final class CameraModel: NSObject, ObservableObject {
                     .sorted()
                     .map { dir.appendingPathComponent($0) }
             }
-            saveToPhotos(url: outURL, robustnessMasks: robURLs, preview: preview, burstDir: burstDir)
+            // SABRE: the reference frame alone through the same merge (<stem>_reference.dng), its own Photos asset.
+            var extraDNGs: [URL] = []
+            if tuningParams.sabre_save_reference && tuningParams.robustness_gcam_enabled {
+                let refURL = URL(fileURLWithPath: base + "_reference.dng")
+                if FileManager.default.fileExists(atPath: refURL.path) { extraDNGs.append(refURL) }
+            }
+            saveToPhotos(url: outURL, robustnessMasks: robURLs, extraDNGs: extraDNGs, preview: preview,
+                         burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)
             self.burstDir = nil
@@ -2977,7 +2998,8 @@ final class CameraModel: NSObject, ObservableObject {
         return UIImage(cgImage: cg)
     }
 
-    private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
+    private func saveToPhotos(url: URL, robustnessMasks: [URL], extraDNGs: [URL] = [], preview: UIImage?,
+                              burstDir: URL?) {
         let format = exportFormat
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
@@ -3037,6 +3059,17 @@ final class CameraModel: NSObject, ObservableObject {
                 maskJPEGs.append(tmp)
             }
             let savedMask = !maskJPEGs.isEmpty
+            // Extra DNGs (the reference through the merge) get the output's own export: an embedded preview so
+            // Photos can show the DNG, or the same JPEG render when exporting JPG.
+            var extraFiles: [(url: URL, isDNG: Bool)] = []
+            for dng in extraDNGs where FileManager.default.fileExists(atPath: dng.path) {
+                if format == .dng {
+                    _ = SRBridge.embedJPEGPreview(inDNG: dng.path, maxSide: 4096)
+                    extraFiles.append((dng, true))
+                } else if let jpg = Self.renderExportJPEG(fromDNG: dng) {
+                    extraFiles.append((jpg, false))
+                }
+            }
             let label = format == .jpg ? "JPG" : "DNG"
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
@@ -3066,8 +3099,17 @@ final class CameraModel: NSObject, ObservableObject {
                     let mreq = PHAssetCreationRequest.forAsset()
                     mreq.addResource(with: .photo, fileURL: maskJPEG, options: mopts)
                 }
+                for extra in extraFiles {
+                    // Its own asset and options, as for the masks; a DNG keeps the RAW type identifier.
+                    let eopts = PHAssetResourceCreationOptions()
+                    eopts.shouldMoveFile = true
+                    if extra.isDNG { eopts.uniformTypeIdentifier = "com.adobe.raw-image" }
+                    let ereq = PHAssetCreationRequest.forAsset()
+                    ereq.addResource(with: .photo, fileURL: extra.url, options: eopts)
+                }
             }, completionHandler: { success, _ in
                 for maskJPEG in maskJPEGs { try? FileManager.default.removeItem(at: maskJPEG) }
+                for extra in extraFiles where !extra.isDNG { try? FileManager.default.removeItem(at: extra.url) }
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = ispThumb
