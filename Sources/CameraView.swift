@@ -202,19 +202,19 @@ struct CameraView: View {
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
 
-            // GCam capture progress: the viewfinder dims to ~38% and a 70 pt ring at its
+            // GCam capture progress: the viewfinder dims to ~38% and a 79 pt ring at its
             // centre fills clockwise from 12 o'clock as the frames arrive (faint track
             // underneath), then the ring and the dimming fade out together.
             ZStack {
                 Color.black.opacity(0.62)
                 Circle()
-                    .stroke(Color.white.opacity(0.25), lineWidth: 2.5)
-                    .frame(width: 70, height: 70)
+                    .stroke(Color.white.opacity(0.25), lineWidth: 2.3)
+                    .frame(width: 79, height: 79)
                 Circle()
                     .trim(from: 0, to: CGFloat(min(1, max(0, cam.captureFraction))))
-                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .butt))
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2.3, lineCap: .butt))
                     .rotationEffect(.degrees(-90))
-                    .frame(width: 70, height: 70)
+                    .frame(width: 79, height: 79)
                     .animation(.linear(duration: 0.12), value: cam.captureFraction)
             }
             .frame(width: width, height: height)
@@ -275,7 +275,7 @@ struct CameraView: View {
                         .transition(.opacity)
                 } else {
                     resolutionToggle
-                        .padding(.bottom, 18)
+                        .padding(.bottom, 11)
                         .transition(.opacity)
                 }
             }
@@ -448,7 +448,7 @@ struct CameraView: View {
         HStack(spacing: 0) {
             Button(action: { withAnimation(.easeOut(duration: 0.2)) { showQuickPanel.toggle() } }) {
                 Text("\(cam.frameCount)")
-                    .font(.system(size: 24, weight: .bold))
+                    .font(.system(size: 22, weight: .bold))
                     .foregroundColor(GC.textGrey)
                     .frame(minWidth: 44, minHeight: 44)
             }
@@ -460,26 +460,26 @@ struct CameraView: View {
             HStack(spacing: 20) {
                 Button(action: { showSettings = true }) {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 21, weight: .regular))
+                        .font(.system(size: 19, weight: .regular))
                         .foregroundColor(GC.iconGrey)
                 }
                 .accessibilityLabel("Settings")
                 Button(action: { withAnimation(.easeOut(duration: 0.2)) { showQuickPanel.toggle() } }) {
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 15, weight: .bold))
+                        .font(.system(size: 14, weight: .bold))
                         .foregroundColor(GC.iconGrey)
                         .rotationEffect(.degrees(showQuickPanel ? 180 : 0))
                 }
                 .accessibilityLabel("Quick settings")
             }
-            .padding(.horizontal, 15)
-            .frame(height: 43)
+            .padding(.horizontal, 14)
+            .frame(height: 39)
             .background(Capsule().fill(GC.pill))
 
             Spacer(minLength: 10)
 
             Image(systemName: "thermometer")
-                .font(.system(size: 19, weight: .regular))
+                .font(.system(size: 17, weight: .regular))
                 .foregroundColor(thermalColor)
                 .accessibilityLabel("Device temperature")
 
@@ -491,9 +491,9 @@ struct CameraView: View {
             }) {
                 ZStack {
                     Image(systemName: "seal")
-                        .font(.system(size: 24, weight: .regular))
+                        .font(.system(size: 22, weight: .regular))
                     Text(cam.exportFormat == .dng ? "D" : "J")
-                        .font(.system(size: 11, weight: .heavy))
+                        .font(.system(size: 10, weight: .heavy))
                 }
                 .foregroundColor(GC.badge)
             }
@@ -505,7 +505,7 @@ struct CameraView: View {
 
             Button(action: { withAnimation(.easeOut(duration: 0.2)) { showPro.toggle() } }) {
                 Text("PRO")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: 12, weight: .bold))
                     .foregroundColor(showPro ? GC.badge : GC.textGrey)
             }
             .padding(.trailing, 16)
@@ -550,14 +550,14 @@ struct CameraView: View {
 
     /// Bottom-centre pill: 1x (12 MP) or 2x (48 MP super-resolution).
     private var resolutionToggle: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 14) {
             ForEach(OutputResolutionMode.allCases) { mode in
                 let selected = cam.outputResolutionMode == mode
                 Button(action: { if !cam.isBusy { cam.outputResolutionMode = mode } }) {
                     Text(mode == .native12mp ? "1x" : "2x")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundColor(selected ? Color(white: 0.2) : GC.toggleText)
-                        .frame(width: 38, height: 38)
+                        .frame(width: 30, height: 30)
                         .background(Circle().fill(selected ? GC.toggleSelected : Color.clear))
                 }
                 .disabled(cam.isBusy)
@@ -788,9 +788,9 @@ struct CameraView: View {
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundColor(selected ? Color(white: 0.15) : .white)
-                .frame(width: 42, height: 42)
+                .frame(width: 38, height: 38)
                 .background(Circle().fill(selected ? GC.lensSelected : Color.clear))
         }
         .disabled(cam.isBusy)
@@ -804,20 +804,14 @@ struct CameraView: View {
             freeTierBanner
                 .padding(.top, 4)
             Spacer(minLength: 0)
-            HStack(alignment: .center) {
+            ZStack {
                 flipCameraButton
-                    .frame(width: 72)
-
-                Spacer()
-
+                    .offset(x: -126)
                 shutterButton
-
-                Spacer()
-
                 galleryButton
-                    .frame(width: 72)
+                    .offset(x: 126)
             }
-            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity)
             Spacer(minLength: 0)
         }
     }
@@ -827,10 +821,10 @@ struct CameraView: View {
         return Button(action: { cam.toggleFrontCamera() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(GC.flipRing.opacity(enabled ? 1 : 0.3), lineWidth: 2.5)
-                    .frame(width: 63, height: 63)
+                    .strokeBorder(GC.flipRing.opacity(enabled ? 1 : 0.3), lineWidth: 2.3)
+                    .frame(width: 59, height: 59)
                 Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 25, weight: .regular))
+                    .font(.system(size: 23, weight: .regular))
                     .foregroundColor(GC.flipRing.opacity(enabled ? 1 : 0.3))
             }
         }
@@ -912,7 +906,7 @@ struct CameraView: View {
     /// from behind the thumbnail carrying a chevron and a pink-violet disc. A new shot
     /// grows from 55% over the previous one with a faint ripple expanding behind.
     private var galleryButton: some View {
-        let d: CGFloat = 63
+        let d: CGFloat = 56.5
         let shown = displayedThumb ?? cam.lastThumbnail
         let mergeFrac = cam.isProcessing ? max(0.03, min(1, (Double(cam.progress) - 0.15) / 0.85)) : 1
         return Button(action: { if !cam.isBusy { showGallery = true } }) {
@@ -983,7 +977,7 @@ struct CameraView: View {
         }
         .frame(width: d, height: d)
         .clipShape(Circle())
-        .overlay(Circle().strokeBorder(GC.ring, lineWidth: 2))
+        .overlay(Circle().strokeBorder(GC.ring, lineWidth: 2.3))
     }
 
     /// New thumbnail: grows from 55% over the previous one, ripple expands and fades.
@@ -1265,26 +1259,6 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    Toggle("Coarsest Search Radius ±4", isOn: $cam.tuningParams.coarsest_search_radius_fixed4)
-                    Text("Fixes the block-match search window at the coarsest pyramid level to ±4 px (9×9 offsets; about ±128 raw px with the default FFT grey). The offset below is ignored while this is on. Off = 4 plus the offset.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Stepper(value: $cam.tuningParams.coarsest_search_radius_delta,
-                            in: -5...5,
-                            step: 1) {
-                        HStack {
-                            Text("Coarsest Search Radius")
-                            Spacer()
-                            // The radius actually used: 4 + offset, at least 1 (or 4 when fixed).
-                            Text(coarsestRadiusLabel)
-                        }
-                    }
-                    .disabled(cam.tuningParams.coarsest_search_radius_fixed4)
-                    Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default of ±4. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
                     HStack {
                         Text("Detail Sharpness (k_detail)")
                         Spacer()
@@ -1367,6 +1341,25 @@ struct CameraView: View {
                         Text("32").tag(32)
                         Text("64").tag(64)
                     }
+                    Toggle("Coarsest Search Radius ±4", isOn: $cam.tuningParams.coarsest_search_radius_fixed4)
+                    Text("Fixes the block-match search window at the coarsest pyramid level to ±4 px (9×9 offsets; about ±128 raw px with the default FFT grey). The offset below is ignored while this is on. Off = 4 plus the offset.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Stepper(value: $cam.tuningParams.coarsest_search_radius_delta,
+                            in: -5...5,
+                            step: 1) {
+                        HStack {
+                            Text("Coarsest Search Radius")
+                            Spacer()
+                            // The radius actually used: 4 + offset, at least 1 (or 4 when fixed).
+                            Text(coarsestRadiusLabel)
+                        }
+                    }
+                    .disabled(cam.tuningParams.coarsest_search_radius_fixed4)
+                    Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default of ±4. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Toggle("Structure Map", isOn: $cam.tuningParams.structure_map_save)
                     Text("Saves a structure-tensor map of every frame, reference included, to Photos: hue = edge orientation, saturation = how edge-like (vs corner/texture), brightness = structure strength (same scale for all frames). Black = flat.")
@@ -1899,7 +1892,7 @@ fileprivate enum GC {
         startPoint: .topTrailing, endPoint: .bottomLeading)
 }
 
-/// The GCam shutter: 91 pt outer ring (3.6 pt), black gap, 68 pt disc. The disc
+/// The GCam shutter: 83 pt outer ring (3 pt), black gap, 61.5 pt disc. The disc
 /// switches colour with no transition while pressed (or during the post-tap flash).
 fileprivate struct GCamShutterStyle: ButtonStyle {
     var flash: Bool
@@ -1913,12 +1906,12 @@ fileprivate struct GCamShutterStyle: ButtonStyle {
             : (capturing ? GC.capturingGrey : (pressed ? GC.shutterPressed : GC.shutterDisc))
         return ZStack {
             Circle()
-                .strokeBorder(capturing ? GC.capturingGrey : GC.ring.opacity(locked ? 0.35 : 1), lineWidth: 3.6)
-                .frame(width: 91, height: 91)
+                .strokeBorder(capturing ? GC.capturingGrey : GC.ring.opacity(locked ? 0.35 : 1), lineWidth: 3)
+                .frame(width: 83, height: 83)
                 .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
             Circle()
                 .fill(disc)
-                .frame(width: 68, height: 68)
+                .frame(width: 61.5, height: 61.5)
                 .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
                 .animation(nil, value: pressed)
             if locked {

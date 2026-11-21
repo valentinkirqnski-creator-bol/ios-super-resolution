@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <thread>
 #ifdef __APPLE__
 #include "metal_gpu.h"
 #endif
@@ -601,14 +602,76 @@ static inline size_t noise_curve_index(f32 brightness, size_t n) {
     return (size_t)std::min<long>(id, (long)n - 1);
 }
 
+// One entry of the linear noise curve, computed directly. SNR tuning and the status
+// line read exactly one bin, but used to build the whole 1001-bin curve first (~80
+// Monte-Carlo bins, ~1 s on device, under the curve lock the status line then waited
+// on). Bit-identical to std_curve[i] of the full build: the same spec decides whether
+// bin i is Monte-Carlo (i < imin, i > imax, or full_mc) or interpolated (imin..imax,
+// from the Monte-Carlo values at imin and imax with interp_MC_range's arithmetic),
+// and each Monte-Carlo bin is seeded from its own index, so it does not depend on
+// which other bins are built. Uses the full curve when it is already cached.
+static f32 noise_std_single(f32 alpha, f32 beta, f32 brightness) {
+    const size_t n = (size_t)k_n_brightness + 1;
+    const size_t idx = noise_curve_index(brightness, n);
+    {
+        std::lock_guard<std::mutex> lk(g_curve_mu);
+        if (const NoiseCurves* hit = curve_lookup_locked(alpha, beta, /*sqrt_domain=*/false))
+            if (hit->std_curve.size() == n) return hit->std_curve[idx];
+    }
+    struct Memo { f32 a, b; size_t i; f32 v; };
+    static std::mutex memo_mu;
+    static std::vector<Memo> memo;
+    {
+        std::lock_guard<std::mutex> lk(memo_mu);
+        for (const Memo& m : memo)
+            if (m.a == alpha && m.b == beta && m.i == idx) return m.v;
+    }
+    NoiseCurves tmp;
+    CurveBuildSpec spec;
+    spec.out = &tmp;
+    spec.alpha = alpha;
+    spec.beta = beta;
+    spec.sqrt_domain = false;
+    prepare_noise_curve_spec(spec);
+    f32 v;
+    const int i = (int)idx;
+    if (!spec.needs_mc) {
+        v = tmp.std_curve[idx];                      // zeros, or a Python dump
+    } else if (spec.full_mc || i < spec.imin || i > spec.imax) {
+        f32 d, s;
+        unitary_MC(alpha, beta, i / (f32)k_n_brightness, d, s, false);
+        v = s;
+    } else {
+        f32 d_lo, s_lo, d_hi, s_hi;
+        const int imin = spec.imin, imax = spec.imax;
+        std::thread th([&]() { unitary_MC(alpha, beta, imax / (f32)k_n_brightness, d_hi, s_hi, false); });
+        unitary_MC(alpha, beta, imin / (f32)k_n_brightness, d_lo, s_lo, false);
+        th.join();
+        // interp_MC_range, std half, for bin i.
+        const f32 b0 = (imin - 1) / (f32)k_n_brightness;
+        const f32 b1 = (imax + 1) / (f32)k_n_brightness;
+        const f32 denom = b1 - b0;
+        const f32 s2_min = s_lo * s_lo;
+        const f32 s2_max = s_hi * s_hi;
+        const f32 b = i / (f32)k_n_brightness;
+        const f32 norm_b = (b - b0) / denom;
+        const f32 s2 = norm_b * (s2_max - s2_min) + s2_min;
+        v = std::sqrt(std::max(0.f, s2));
+    }
+    {
+        std::lock_guard<std::mutex> lk(memo_mu);
+        memo.push_back(Memo{alpha, beta, idx, v});
+        if (memo.size() > 64) memo.erase(memo.begin());
+    }
+    return v;
+}
+
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
-    const NoiseCurves& nc = make_noise_curves(alpha, beta);
-    return nc.std_curve[noise_curve_index(brightness, nc.std_curve.size())];
+    return noise_std_single(alpha, beta, brightness);
 }
 
 f32 noise_std_at_brightness(f32 brightness, const Config& cfg) {
-    const NoiseCurves& nc = make_noise_curves(cfg);
-    return nc.std_curve[noise_curve_index(brightness, nc.std_curve.size())];
+    return noise_std_single(cfg.noise_alpha(), cfg.noise_beta(), brightness);
 }
 
 void fetch_noise_curves(f32 alpha, f32 beta,
@@ -665,13 +728,8 @@ void prewarm_noise_curves(const Config& cfg) {
     // noise_std_at_brightness, and so does tune_config_snr when SNR auto-tuning
     // is on -- and it must not end up waiting behind the three mask curves it
     // does not need. One batch under one lock would have done exactly that.
-    {
-        const f32 a0 = cfg.noise_alpha();
-        const f32 b0 = cfg.noise_beta();
-        const bool sq0 = false;
-        std::lock_guard<std::mutex> lk(g_curve_mu);
-        curve_build_missing_locked(&a0, &b0, &sq0, 1);
-    }
+    // (The linear curve is no longer built here: noise_std_at_brightness computes the
+    // one value it needs directly, see noise_std_single.)
 
     // GCam robustness replaces the mask that reads these curves (it has its own
     // Monte-Carlo LUT, build_gcam_noise_lut), so skip ~1 s of background Monte Carlo that
@@ -2512,8 +2570,9 @@ static void gcam_structure_match_apply(Image* R, Mask8* m8, const Image& comp_ra
 static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const FlowField& flow,
                                  int tile_size, const Config& cfg) {
     const Image& L = rs.hf_loss;
-    // The SABRE Unblocker replaces this rule on the GCam path (exclusive toggles).
-    if (cfg.gcam_unblocker_enabled) return;
+    // Settings makes the HF rule and the SABRE Unblocker exclusive, but a preset saved
+    // by an older build can carry both: then both apply rather than the HF rule being
+    // silently dropped.
     if (!cfg.hf_artifact_removal_enabled || L.h <= 0 || L.w <= 0 ||
         L.data.size() != (size_t)L.h * L.w || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0)
         return;
@@ -2562,24 +2621,31 @@ static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const 
             }
         });
     }
-    auto rej_at = [&](int Y, int X, int H, int W) {
-        const int hy = std::min(gh - 1, (int)(((int64_t)Y * gh) / H));
-        const int hx = std::min(gw - 1, (int)(((int64_t)X * gw) / W));
-        return rej[(size_t)hy * gw + hx] != 0;
+    // Nearest guide pixel of each mask row / column, computed once (the same integer
+    // expressions the per-pixel lookup used).
+    auto map_axis = [](int n_out, int n_in) {
+        std::vector<int> m((size_t)std::max(0, n_out));
+        for (int k = 0; k < n_out; ++k)
+            m[(size_t)k] = std::min(n_in - 1, (int)(((int64_t)k * n_in) / n_out));
+        return m;
     };
     if (R && R->h > 0 && R->w > 0 && R->data.size() == (size_t)R->h * R->w * R->c) {
         Image& M = *R;
+        const std::vector<int> my = map_axis(M.h, gh), mx = map_axis(M.w, gw);
         parallel_rows(M.h, nt, [&](int Y) {
+            const uint8_t* rrow = &rej[(size_t)my[(size_t)Y] * gw];
             for (int X = 0; X < M.w; ++X)
-                if (rej_at(Y, X, M.h, M.w))
+                if (rrow[mx[(size_t)X]])
                     for (int ch = 0; ch < M.c; ++ch) M.at(Y, X, ch) = 0.f;
         });
     }
     if (m8 && !m8->empty()) {
         Mask8& M = *m8;
+        const std::vector<int> my = map_axis(M.h, gh), mx = map_axis(M.w, gw);
         parallel_rows(M.h, nt, [&](int Y) {
+            const uint8_t* rrow = &rej[(size_t)my[(size_t)Y] * gw];
             for (int X = 0; X < M.w; ++X)
-                if (rej_at(Y, X, M.h, M.w)) M.data[(size_t)Y * M.w + X] = 0;
+                if (rrow[mx[(size_t)X]]) M.data[(size_t)Y * M.w + X] = 0;
         });
     }
 }

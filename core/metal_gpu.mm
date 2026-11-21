@@ -2178,6 +2178,10 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
 
 // Sticky ref means/vars for compute_robustness_metal (avoid re-upload + free host).
 static id<MTLBuffer> g_rob_ref_hf = nil;
+// The command buffer that produced the pinned reference statistics / HF-loss map. It is
+// committed without a wait; host readers (metal_fetch_ref_hf_loss, the GCam path's HF
+// rule) must wait for it -- metal_merge_wait_inflight only covers merge work.
+static id<MTLCommandBuffer> g_rob_ref_cmd = nil;
 static size_t g_rob_ref_hf_bytes = 0;
 static id<MTLBuffer> g_rob_ref_m = nil;
 static id<MTLBuffer> g_rob_ref_v = nil;
@@ -2241,6 +2245,7 @@ static void rob_build_vst_curve(f32 a, f32 b, size_t n, std::vector<f32>& out) {
 }
 
 static void clear_rob_ref_gpu() {
+    g_rob_ref_cmd = nil;
     g_rob_ref_hf = nil;
     g_rob_ref_hf_bytes = 0;
     g_rob_ref_m = nil;
@@ -2630,6 +2635,7 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // No CPU readback follows. Commit without waiting; subsequent work on the
     // same queue observes these pinned buffers after this command completes.
     [cmd commit];
+    g_rob_ref_cmd = cmd;
 
     g_rob_ref_hf = b_ref_hf_loss;
     g_rob_ref_hf_bytes = b_ref_hf_loss
@@ -2694,6 +2700,10 @@ bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
     // The stats are produced by a command buffer that was committed without a
     // wait, so make sure it has landed before reading the contents.
     if (!metal_merge_wait_inflight()) return false;
+    if (g_rob_ref_cmd) {
+        [g_rob_ref_cmd waitUntilCompleted];
+        if (g_rob_ref_cmd.status != MTLCommandBufferStatusCompleted) return false;
+    }
     Image m(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
     Image v(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
     memcpy(m.data.data(), [g_rob_ref_m contents], bytes);
@@ -2726,6 +2736,11 @@ bool metal_fetch_ref_hf_loss(Image& out) {
     const size_t bytes = (size_t)g_rob_ref_h * (size_t)g_rob_ref_w * sizeof(float);
     if (g_rob_ref_hf_bytes != bytes || [g_rob_ref_hf length] < bytes) return false;
     if (!metal_merge_wait_inflight()) return false;
+    // The map is written by the reference-statistics command, committed without a wait.
+    if (g_rob_ref_cmd) {
+        [g_rob_ref_cmd waitUntilCompleted];
+        if (g_rob_ref_cmd.status != MTLCommandBufferStatusCompleted) return false;
+    }
     Image m(g_rob_ref_h, g_rob_ref_w, 1);
     memcpy(m.data.data(), [g_rob_ref_hf contents], bytes);
     out = std::move(m);
