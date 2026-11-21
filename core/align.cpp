@@ -1122,6 +1122,17 @@ struct RefIcaBurstCache {
 };
 static RefIcaBurstCache g_ref_ica_cache;
 
+FlowField block_match_coarse(const Image& ref, const Image& moving, int tile_size,
+                             int search_radius, const Config& cfg) {
+    FlowField flow;
+    if (tile_size <= 0 || ref.h < tile_size || ref.w < tile_size ||
+        moving.h != ref.h || moving.w != ref.w)
+        return flow;
+    flow = FlowField(ref.h / tile_size, ref.w / tile_size);   // zero initial flow
+    block_match_level_L2(ref, moving, tile_size, search_radius, flow, cfg, cfg.num_threads);
+    return flow;
+}
+
 void clear_align_ref_ica_cache() {
     g_ref_ica_cache = {};
 #ifdef __APPLE__

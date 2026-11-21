@@ -1350,6 +1350,24 @@ struct CameraView: View {
                     Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default of ±4. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
+
+                    Toggle("Drop Rotated / Parallax Frames", isOn: $cam.tuningParams.frame_drop_enabled)
+                    Text("Before each comparison frame is aligned, its gradient image is aligned to the reference's with the coarsest-level block matching only (search radius below) and laid over it. If every edge then sits in place, the frame is merged. If edges still do not line up -- the camera rotated or the scene shows parallax -- the frame is dropped from the merge. Off by default.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    if cam.tuningParams.frame_drop_enabled {
+                        Stepper(value: $cam.tuningParams.frame_drop_radius, in: 1...16, step: 1) {
+                            HStack { Text("Gate Search Radius"); Spacer(); Text("±\(cam.tuningParams.frame_drop_radius)") }
+                        }
+                        ispRow("Edge Match Threshold", $cam.tuningParams.frame_drop_tile_score, 0.3...0.95, "%.2f")
+                        ispRow("Allowed Misaligned Tiles (%)", $cam.tuningParams.frame_drop_max_bad_pct, 0.0...25.0, "%.0f")
+                        Stepper(value: $cam.tuningParams.frame_drop_min_frames, in: 2...8, step: 1) {
+                            HStack { Text("Min Frames Merged"); Spacer(); Text("\(cam.tuningParams.frame_drop_min_frames)") }
+                        }
+                        Text("A tile counts as misaligned when its edges correlate below the threshold after the coarse alignment (1 = identical). 0% = any misaligned tile drops the frame. Measured on test images: pure camera shifts up to ~290 px pass; rotation of about 2 degrees or more and parallax of about 40-60 px or more are dropped. The reference is never dropped and at least Min Frames are merged.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Toggle("Structure Map", isOn: $cam.tuningParams.structure_map_save)
                     Text("Saves a structure-tensor map of every frame, reference included, to Photos: hue = edge orientation, saturation = how edge-like (vs corner/texture), brightness = structure strength (same scale for all frames). Black = flat.")
@@ -1565,6 +1583,9 @@ struct CameraView: View {
                         Text("""
                              Gives every one of the ~48 MP output pixels its own rejection weight, but memory-safely: R and the N×N minimum are computed at the INPUT-FRAME resolution (~12 MP, the same ~49 MB/frame as "Mask at Input-Frame Resolution"), then the merge BILINEARLY upsamples that mask to each output pixel at fetch time. There is never a full 48 MP mask in memory (an earlier version materialised one ~195 MB mask per frame and crashed the app with out-of-memory). Because the statistics are guide-resolution either way, this interpolated per-output weight is numerically almost identical to literally computing R at 48 MP, without the RAM. MUTUALLY EXCLUSIVE with "Mask at Input-Frame Resolution" (turning either on turns the other off); the difference is this one adds the smooth per-output-pixel bilinear upsample. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
                              """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Drop Rotated / Parallax Frames", isOn: $cam.tuningParams.frame_drop_enabled)
+                        Text("Aligns each comparison frame's gradient image to the reference's with the coarsest-level block matching only (±9) and lays them over each other; if any edge is still out of place (rotation or parallax) the frame is not merged. Same setting as Settings > Advanced, where its threshold and limits are.")
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("OIS During Burst", isOn: $cam.tuningParams.gcam_burst_ois)
                         Text("Keeps optical image stabilization working while the burst is taken. iOS only lets an app turn OIS on explicitly for bracketed captures, so the burst is taken as RAW brackets (as many frames per bracket as the camera allows) at exactly the locked exposure and ISO. After the burst the status line shows how many frames the camera reported OIS active for. Cameras without OIS bracket support capture as before. Off by default.")

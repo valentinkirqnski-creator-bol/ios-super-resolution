@@ -100,6 +100,12 @@ struct TuningParams: Equatable, Codable {
     var k_shrink: Float = 1.0
     /// Merge-kernel structure tensor from 16 Bayer-green gradients (GCam's tensor) instead of 4.
     var kernel_tensor16: Bool = true
+    /// Coarse gradient-overlay frame gate (drop rotated / parallax frames).
+    var frame_drop_enabled: Bool = false
+    var frame_drop_radius: Int = 9
+    var frame_drop_tile_score: Float = 0.7
+    var frame_drop_max_bad_pct: Float = 0
+    var frame_drop_min_frames: Int = 2
     var snr_auto_tune: Bool = false
     var alignment_tile_size: Int = 16
     /// Offset (-5...+5) applied to the coarsest pyramid level's block-match search radius.
@@ -605,6 +611,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16
+        case frame_drop_enabled, frame_drop_radius, frame_drop_tile_score, frame_drop_max_bad_pct, frame_drop_min_frames
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -692,6 +699,11 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_tensor16 = try c.decodeIfPresent(Bool.self, forKey: .kernel_tensor16) ?? kernel_tensor16
+        frame_drop_enabled = try c.decodeIfPresent(Bool.self, forKey: .frame_drop_enabled) ?? frame_drop_enabled
+        frame_drop_radius = try c.decodeIfPresent(Int.self, forKey: .frame_drop_radius) ?? frame_drop_radius
+        frame_drop_tile_score = try c.decodeIfPresent(Float.self, forKey: .frame_drop_tile_score) ?? frame_drop_tile_score
+        frame_drop_max_bad_pct = try c.decodeIfPresent(Float.self, forKey: .frame_drop_max_bad_pct) ?? frame_drop_max_bad_pct
+        frame_drop_min_frames = try c.decodeIfPresent(Int.self, forKey: .frame_drop_min_frames) ?? frame_drop_min_frames
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         coarsest_search_radius_delta = try c.decodeIfPresent(Int.self, forKey: .coarsest_search_radius_delta) ?? coarsest_search_radius_delta
@@ -2647,6 +2659,11 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "kernel_tensor16": NSNumber(value: tuningParams.kernel_tensor16),
+            "frame_drop_enabled": NSNumber(value: tuningParams.frame_drop_enabled),
+            "frame_drop_radius": NSNumber(value: tuningParams.frame_drop_radius),
+            "frame_drop_tile_score": NSNumber(value: tuningParams.frame_drop_tile_score),
+            "frame_drop_max_bad_pct": NSNumber(value: tuningParams.frame_drop_max_bad_pct),
+            "frame_drop_min_frames": NSNumber(value: tuningParams.frame_drop_min_frames),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "coarsest_search_radius_delta": NSNumber(value: tuningParams.coarsest_search_radius_delta),

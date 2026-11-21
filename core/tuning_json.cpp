@@ -133,6 +133,11 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("k_stretch")) cfg.k_stretch = fv("k_stretch");
     if (has("k_shrink"))  cfg.k_shrink  = fv("k_shrink");
     if (has("kernel_tensor16")) cfg.kernel_tensor16 = bv("kernel_tensor16");
+    if (has("frame_drop_enabled")) cfg.frame_drop_enabled = bv("frame_drop_enabled");
+    if (has("frame_drop_radius")) cfg.frame_drop_radius = std::max(1, std::min(16, iv("frame_drop_radius")));
+    if (has("frame_drop_tile_score")) cfg.frame_drop_tile_score = fv("frame_drop_tile_score");
+    if (has("frame_drop_max_bad_pct")) cfg.frame_drop_max_bad_pct = fv("frame_drop_max_bad_pct");
+    if (has("frame_drop_min_frames")) cfg.frame_drop_min_frames = std::max(2, iv("frame_drop_min_frames"));
     if (has("snr_auto_tune")) cfg.snr_auto_tune = bv("snr_auto_tune");
 
     // --- alignment ---

@@ -15,6 +15,7 @@
 #include "flow_consensus.h"
 #include "isa_prealign.h"
 #include "structure_map.h"
+#include "frame_gate.h"
 #include "ref_demosaic.h"
 #include "hfnn.h"
 #include "mann.h"
@@ -1501,7 +1502,7 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
                               work.feat_metric_refine_enabled ||
                               work.rob_mask_nn_enabled || work.cref_enabled ||
                               work.hfnn_enabled || work.mann_enabled ||
-                              work.fb_conf_enabled);
+                              work.fb_conf_enabled || work.frame_drop_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1922,6 +1923,13 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
+    // Coarse gradient-overlay frame gate (Config::frame_drop_enabled): the reference's
+    // coarsest pyramid level, the tile size block matching uses there, and the counters.
+    const bool gate_on = work.frame_drop_enabled && !ref_pyr.levels.empty();
+    const Image* gate_ref_coarse = gate_on ? &ref_pyr.levels.back() : nullptr;
+    const int gate_ts = gate_on ? std::max(1, work.grey_tile_size(work.bm_tile_sizes.empty()
+                                     ? tile_size : work.bm_tile_sizes.back())) : 1;
+    int gate_kept = 0, gate_dropped = 0;
 #if defined(__APPLE__)
     // Opened here, not at merge time, so each comparison frame can be uploaded
     // as soon as it is analyzed. set_single_acc_slot must precede begin_burst,
@@ -2064,6 +2072,39 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
         prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);
         debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());
+        // Coarse gradient-overlay gate: coarsest-level block matching only (radius
+        // frame_drop_radius) on the two gradient images, then the overlay. Edges that still do
+        // not coincide = rotation or parallax -> this frame is not merged. The pyramid is built
+        // exactly as align() builds it, so the coarse level is the alignment's own.
+        if (gate_on && comp_grey.data.size() >= (size_t)comp_grey.h * comp_grey.w &&
+            comp_grey.h > 0 && comp_grey.w > 0) {
+            const double t_gate = prof_now_ms();
+            const Pyramid comp_pyr = build_pyramid(
+                pad_image_circular(comp_grey, work.grey_tile_size(tile_size)), work.bm_factors);
+            FrameGateResult gr;
+            if (!comp_pyr.levels.empty() && comp_pyr.levels.back().h == gate_ref_coarse->h &&
+                comp_pyr.levels.back().w == gate_ref_coarse->w)
+                gr = frame_gate_coarse(*gate_ref_coarse, comp_pyr.levels.back(), gate_ts,
+                                       work.frame_drop_radius, work.frame_drop_tile_score, work);
+            prof_add_cpu("gate:coarse-overlay", prof_now_ms() - t_gate);
+            prof_add_cpu("gate#bad-tiles", (double)gr.bad_tiles);
+            const bool misaligned = gr.judged_tiles > 0 &&
+                100.f * gr.bad_fraction > std::max(0.f, work.frame_drop_max_bad_pct);
+            // Never below frame_drop_min_frames merged frames (reference included).
+            const int remaining = (int)comp_indices.size() - pos - 1;
+            const bool may_drop = gate_kept + remaining >= std::max(1, work.frame_drop_min_frames - 1);
+            if (misaligned && may_drop) {
+                ++gate_dropped;
+                prof_add_cpu("gate#dropped", 1.0);
+                char why[200];
+                std::snprintf(why, sizeof(why),
+                              "Frame %d dropped: %d of %d edge tiles not aligned after coarse matching "
+                              "(rotation / parallax)", k + 1, gr.bad_tiles, gr.judged_tiles);
+                report(why, 0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
+                continue;
+            }
+            ++gate_kept;
+        }
         PrealignTransform init;
         if (prealign_inline && prealign_ref_thumb.w > 0 && comp.h > 0 && comp.w > 0) {
             // comp is already decoded and still resident -- this is the whole

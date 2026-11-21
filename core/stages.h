@@ -146,6 +146,11 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
                                    int finest_h, int finest_w,
                                    f32 initial_dx, f32 initial_dy,
                                    f32 initial_rotation_rad);
+// One level of the pipeline's L2 block matching (block_match_level_L2: Metal on Apple, the
+// same direct search on the CPU otherwise) from a zero initial flow: ny = h / ts, nx = w / ts
+// tiles, integer offsets within +-search_radius. Used by the coarse frame gate.
+FlowField block_match_coarse(const Image& ref, const Image& moving, int tile_size,
+                             int search_radius, const Config& cfg);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size,

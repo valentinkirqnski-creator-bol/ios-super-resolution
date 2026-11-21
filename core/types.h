@@ -2180,6 +2180,18 @@ struct Config {
     // usual compute_k / covariance. Not GCam's covariance or merge kernel (gcam_sabre_kernel).
     // Bayer only; off = the 2x2-cell gradients of the quad-averaged grey (4 gradients).
     bool  kernel_tensor16 = true;
+    // Coarse gradient-overlay frame gate (core/frame_gate.h). At the coarsest pyramid level
+    // only, each comparison frame's gradient image is aligned to the reference's with the
+    // pipeline's own block matching (radius frame_drop_radius) and laid over it tile by tile.
+    // A structured tile whose edges still do not coincide (normalized gradient correlation
+    // below frame_drop_tile_score) means rotation or parallax; the frame is dropped from the
+    // merge when more than frame_drop_max_bad_pct % of the structured tiles are like that
+    // (0 = any one). At least frame_drop_min_frames frames (reference included) are merged.
+    bool  frame_drop_enabled = false;
+    int   frame_drop_radius = 9;
+    float frame_drop_tile_score = 0.7f;
+    float frame_drop_max_bad_pct = 0.f;
+    int   frame_drop_min_frames = 2;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune

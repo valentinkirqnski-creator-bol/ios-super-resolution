@@ -481,6 +481,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"kernel_tensor16"]) cfg.kernel_tensor16 = tuning[@"kernel_tensor16"].boolValue;
+    if (tuning[@"frame_drop_enabled"]) cfg.frame_drop_enabled = tuning[@"frame_drop_enabled"].boolValue;
+    if (tuning[@"frame_drop_radius"])
+        cfg.frame_drop_radius = std::max(1, std::min(16, tuning[@"frame_drop_radius"].intValue));
+    if (tuning[@"frame_drop_tile_score"]) cfg.frame_drop_tile_score = tuning[@"frame_drop_tile_score"].floatValue;
+    if (tuning[@"frame_drop_max_bad_pct"]) cfg.frame_drop_max_bad_pct = tuning[@"frame_drop_max_bad_pct"].floatValue;
+    if (tuning[@"frame_drop_min_frames"])
+        cfg.frame_drop_min_frames = std::max(2, tuning[@"frame_drop_min_frames"].intValue);
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;
