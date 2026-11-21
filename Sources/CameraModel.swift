@@ -6,6 +6,7 @@ import Combine
 import ImageIO
 import AudioToolbox
 import CoreMotion
+import CoreImage
 
 /// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
 enum ExportFormat: String, CaseIterable, Identifiable, Codable {
@@ -101,6 +102,8 @@ struct TuningParams: Equatable, Codable {
     var alignment_tile_size: Int = 16
     /// Offset (-5...+5) applied to the coarsest pyramid level's block-match search radius.
     var coarsest_search_radius_delta: Int = 0
+    /// Coarsest search radius fixed at +-4 (the offset above is ignored while on).
+    var coarsest_search_radius_fixed4: Bool = false
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -323,10 +326,13 @@ struct TuningParams: Equatable, Codable {
     /// CPU reference. Guides are still built on the host and §7 dilation runs on the
     /// CPU; only the per-pixel loop moves to the GPU. Falls back to CPU if the kernel
     /// is unavailable. Off by default — the kernel is unverified until a device build.
-    var gcam_sabre_gpu: Bool = false
+    var gcam_sabre_gpu: Bool = true
     var gcam_sabre_gpu_guide: Bool = true
     // DEFAULT ON: gcam stats are upsampled+warped to input-frame res; R + §7 run there.
     var gcam_sabre_raw_res: Bool = true
+    var gcam_save_reference: Bool = false
+    /// GCam mode: request optical image stabilization (OIS) for every burst frame.
+    var gcam_burst_ois: Bool = false
     var gcam_sabre_bilinear_upscale: Bool = false
     var gcam_sabre_min5x5: Bool = false
     /// Size n of the gcam hard ComputeLocalMin window (n x n). 5 = paper's 5x5.
@@ -597,7 +603,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
+        case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -623,8 +629,8 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
+        case gcam_sabre_gpu_guide = "gcam_sabre_gpu_guide_v2"
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu = "gcam_sabre_gpu_v2", gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_save_reference, gcam_burst_ois, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -686,6 +692,7 @@ struct TuningParams: Equatable, Codable {
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         coarsest_search_radius_delta = try c.decodeIfPresent(Int.self, forKey: .coarsest_search_radius_delta) ?? coarsest_search_radius_delta
+        coarsest_search_radius_fixed4 = try c.decodeIfPresent(Bool.self, forKey: .coarsest_search_radius_fixed4) ?? coarsest_search_radius_fixed4
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
@@ -789,6 +796,8 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
         gcam_sabre_gpu_guide = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu_guide) ?? gcam_sabre_gpu_guide
         gcam_sabre_raw_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_raw_res) ?? gcam_sabre_raw_res
+        gcam_save_reference = try c.decodeIfPresent(Bool.self, forKey: .gcam_save_reference) ?? gcam_save_reference
+        gcam_burst_ois = try c.decodeIfPresent(Bool.self, forKey: .gcam_burst_ois) ?? gcam_burst_ois
         gcam_sabre_bilinear_upscale = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_bilinear_upscale) ?? gcam_sabre_bilinear_upscale
         gcam_sabre_min5x5 = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_min5x5) ?? gcam_sabre_min5x5
         gcam_sabre_merge_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_merge_res) ?? gcam_sabre_merge_res
@@ -865,6 +874,12 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var noiseDiagText = ""
     @Published var progress: Float = 0
     @Published var lastThumbnail: UIImage?
+    /// Frames captured so far / burst length (0...1), for the viewfinder capture ring.
+    @Published var captureFraction: Double = 0
+    /// Small preview of this burst's first frame (from the RAW capture's embedded
+    /// preview), published when capture ends so the thumbnail can show the new shot
+    /// while the merge runs. nil for ZSL bursts and imports.
+    @Published var burstPreviewThumb: UIImage?
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var lensZoomMode: LensZoomMode = .wide1x
@@ -896,7 +911,7 @@ final class CameraModel: NSObject, ObservableObject {
     /// Play a short click when the shutter fires. Defaults on; the key is
     /// stored inverted so an untouched install gets sound without needing a
     /// migration (UserDefaults.bool returns false for a missing key).
-    @Published var shutterSoundEnabled: Bool = UserDefaults.standard.bool(forKey: "ShutterSoundOn") {
+    @Published var shutterSoundEnabled: Bool = (UserDefaults.standard.object(forKey: "ShutterSoundOn") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(shutterSoundEnabled, forKey: "ShutterSoundOn") }
     }
 
@@ -1186,6 +1201,13 @@ final class CameraModel: NSObject, ObservableObject {
     private var currentBurstTotal = CameraModel.persistedFrameCount()
     private var capturesRequested = 0
     private var capturesProcessed = 0
+    /// OIS During Burst: frames of this burst whose photo reported lens stabilization
+    /// active, and the summary shown with the result ("OIS active on n/N frames").
+    private var oisActiveFrames = 0
+    /// First frame's embedded preview, held until the last frame arrives.
+    private var pendingBurstPreview: UIImage?
+    private static let thumbCIContext = CIContext()
+    private var oisSummary = ""
     private var capturedRawFrames: [[String: Any]] = []
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
@@ -2146,6 +2168,8 @@ final class CameraModel: NSObject, ObservableObject {
         isCapturing = true
         isProcessing = false
         progress = 0
+        captureFraction = 0
+        burstPreviewThumb = nil
 
         sessionQueue.async(qos: .userInteractive) {
             self.pipelineBusy = true
@@ -2235,6 +2259,8 @@ final class CameraModel: NSObject, ObservableObject {
             self.currentBurstTotal = self.activeFrameCount
             self.capturesRequested = 0
             self.capturesProcessed = 0
+            self.oisActiveFrames = 0
+            self.pendingBurstPreview = nil
             self.captureKind = .burst
             self.zslCapturing = false
 
@@ -2399,12 +2425,48 @@ final class CameraModel: NSObject, ObservableObject {
             return false
         }
         cachedRawPixelFormat = rawFormat
+        // OIS During Burst (GCam mode). iOS only lets an app turn lens stabilization
+        // on explicitly for a BRACKETED capture, so the frames are taken as RAW brackets
+        // of up to maxBracketedCapturePhotoCount, each element at exactly the current
+        // exposure and ISO (the burst's locked values), with isLensStabilizationEnabled.
+        // Every photo still arrives through didFinishProcessingPhoto and the next
+        // bracket starts from didFinishCaptureFor, as for single frames.
+        if tuningParams.gcam_burst_ois && tuningParams.robustness_gcam_enabled &&
+            photoOutput.isLensStabilizationDuringBracketedCaptureSupported {
+            let maxN = max(1, photoOutput.maxBracketedCapturePhotoCount)
+            let n = isZSL ? 1 : max(1, min(maxN, currentBurstTotal - capturesRequested))
+            let items: [AVCaptureBracketedStillImageSettings] = (0..<n).map { _ in
+                AVCaptureManualExposureBracketedStillImageSettings.manualExposureSettings(
+                    exposureDuration: AVCaptureDevice.currentExposureDuration,
+                    iso: AVCaptureDevice.currentISO)
+            }
+            let bracket = AVCapturePhotoBracketSettings(rawPixelFormatType: rawFormat,
+                                                        processedFormat: nil,
+                                                        bracketedSettings: items)
+            bracket.isLensStabilizationEnabled = true
+            bracket.flashMode = .off
+            bracket.photoQualityPrioritization = .speed
+            bracket.isAutoStillImageStabilizationEnabled = false
+            applyRawCaptureLimits(to: bracket)
+            applyShutterSoundSuppression(to: bracket)
+            if !isZSL { capturesRequested += n }
+            photoOutput.capturePhoto(with: bracket, delegate: self)
+            return true
+        }
+        let firstOfBurst = !isZSL && capturesRequested == 0
         if !isZSL { capturesRequested += 1 }
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
         settings.photoQualityPrioritization = .speed
         // RAW must stay unprocessed — forcing SIS on Bayer RAW aborts capturePhoto.
         settings.isAutoStillImageStabilizationEnabled = false
+        // A small processed preview alongside the first RAW frame, for the thumbnail
+        // shown while the merge runs (the RAW itself is untouched).
+        if firstOfBurst, let fmt = settings.availablePreviewPhotoPixelFormatTypes.first {
+            settings.previewPhotoFormat = [kCVPixelBufferPixelFormatTypeKey as String: fmt,
+                                           kCVPixelBufferWidthKey as String: 320,
+                                           kCVPixelBufferHeightKey as String: 320]
+        }
         applyRawCaptureLimits(to: settings)
         applyShutterSoundSuppression(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
@@ -2584,6 +2646,7 @@ final class CameraModel: NSObject, ObservableObject {
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "coarsest_search_radius_delta": NSNumber(value: tuningParams.coarsest_search_radius_delta),
+            "coarsest_search_radius_fixed4": NSNumber(value: tuningParams.coarsest_search_radius_fixed4),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
@@ -2672,6 +2735,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
             "gcam_sabre_gpu_guide": NSNumber(value: tuningParams.gcam_sabre_gpu_guide),
             "gcam_sabre_raw_res": NSNumber(value: tuningParams.gcam_sabre_raw_res),
+            "gcam_save_reference": NSNumber(value: tuningParams.gcam_save_reference),
             "gcam_sabre_bilinear_upscale": NSNumber(value: tuningParams.gcam_sabre_bilinear_upscale),
             "gcam_sabre_min5x5": NSNumber(value: tuningParams.gcam_sabre_min5x5),
             "gcam_sabre_merge_res": NSNumber(value: tuningParams.gcam_sabre_merge_res),
@@ -2825,7 +2889,14 @@ final class CameraModel: NSObject, ObservableObject {
                     .sorted()
                     .map { dir.appendingPathComponent($0) }
             }
-            saveToPhotos(url: outURL, robustnessMasks: robURLs, preview: preview, burstDir: burstDir)
+            // GCam: the reference frame alone through the same merge (<stem>_reference.dng), its own Photos asset.
+            var extraDNGs: [URL] = []
+            if tuningParams.gcam_save_reference && tuningParams.robustness_gcam_enabled {
+                let refURL = URL(fileURLWithPath: base + "_reference.dng")
+                if FileManager.default.fileExists(atPath: refURL.path) { extraDNGs.append(refURL) }
+            }
+            saveToPhotos(url: outURL, robustnessMasks: robURLs, extraDNGs: extraDNGs, preview: preview,
+                         burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)
             self.burstDir = nil
@@ -2919,7 +2990,8 @@ final class CameraModel: NSObject, ObservableObject {
         return UIImage(cgImage: cg)
     }
 
-    private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
+    private func saveToPhotos(url: URL, robustnessMasks: [URL], extraDNGs: [URL] = [], preview: UIImage?,
+                              burstDir: URL?) {
         let format = exportFormat
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
@@ -2979,6 +3051,17 @@ final class CameraModel: NSObject, ObservableObject {
                 maskJPEGs.append(tmp)
             }
             let savedMask = !maskJPEGs.isEmpty
+            // Extra DNGs (the reference through the merge) get the output's own export: an embedded preview so
+            // Photos can show the DNG, or the same JPEG render when exporting JPG.
+            var extraFiles: [(url: URL, isDNG: Bool)] = []
+            for dng in extraDNGs where FileManager.default.fileExists(atPath: dng.path) {
+                if format == .dng {
+                    _ = SRBridge.embedJPEGPreview(inDNG: dng.path, maxSide: 4096)
+                    extraFiles.append((dng, true))
+                } else if let jpg = Self.renderExportJPEG(fromDNG: dng) {
+                    extraFiles.append((jpg, false))
+                }
+            }
             let label = format == .jpg ? "JPG" : "DNG"
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
@@ -3008,8 +3091,17 @@ final class CameraModel: NSObject, ObservableObject {
                     let mreq = PHAssetCreationRequest.forAsset()
                     mreq.addResource(with: .photo, fileURL: maskJPEG, options: mopts)
                 }
+                for extra in extraFiles {
+                    // Its own asset and options, as for the masks; a DNG keeps the RAW type identifier.
+                    let eopts = PHAssetResourceCreationOptions()
+                    eopts.shouldMoveFile = true
+                    if extra.isDNG { eopts.uniformTypeIdentifier = "com.adobe.raw-image" }
+                    let ereq = PHAssetCreationRequest.forAsset()
+                    ereq.addResource(with: .photo, fileURL: extra.url, options: eopts)
+                }
             }, completionHandler: { success, _ in
                 for maskJPEG in maskJPEGs { try? FileManager.default.removeItem(at: maskJPEG) }
+                for extra in extraFiles where !extra.isDNG { try? FileManager.default.removeItem(at: extra.url) }
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = ispThumb
@@ -3026,12 +3118,19 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// 1108 is the system camera-shutter sound. Using it rather than a bundled
-    /// asset keeps the app consistent with the platform and respects the
-    /// device's own shutter policy in regions that mandate it.
+    /// The GCam shutter sound (Resources/gcam_shutter.wav, 0.14 s), registered once as
+    /// a system sound so it starts with no player latency. Like every system sound it
+    /// follows the ringer volume and the silent switch. Falls back to the system
+    /// shutter (1108) if the file is missing.
+    private static let gcamShutterSoundID: SystemSoundID? = {
+        guard let url = Bundle.main.url(forResource: "gcam_shutter", withExtension: "wav") else { return nil }
+        var sid: SystemSoundID = 0
+        return AudioServicesCreateSystemSoundID(url as CFURL, &sid) == kAudioServicesNoError ? sid : nil
+    }()
+
     private func playShutterSound() {
         guard shutterSoundEnabled else { return }
-        AudioServicesPlaySystemSound(1108)
+        AudioServicesPlaySystemSound(Self.gcamShutterSoundID ?? 1108)
     }
 
     /// Last "Error…" line the C++ pipeline reported, kept because finish()
@@ -3050,8 +3149,10 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = success ? 1 : 0
             // On failure show the detailed pipeline error in the status line
             // (the separate noise/diagnostic line was removed from the UI).
-            self.statusText = (!success && !self.lastPipelineError.isEmpty)
+            let base = (!success && !self.lastPipelineError.isEmpty)
                 ? self.lastPipelineError : message
+            self.statusText = self.oisSummary.isEmpty ? base : base + " · " + self.oisSummary
+            self.oisSummary = ""
         }
         sessionQueue.async {
             self.resumeZSLAfterProcessing()
@@ -3131,12 +3232,30 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             frameCaptureTimes.append(CMTimeGetSeconds(photo.timestamp))
         }
 
+        if pendingBurstPreview == nil, let pb = photo.previewPixelBuffer {
+            let ci = CIImage(cvPixelBuffer: pb)
+            if let cg = Self.thumbCIContext.createCGImage(ci, from: ci.extent) {
+                pendingBurstPreview = UIImage(cgImage: cg, scale: 1,
+                                              orientation: cameraSelection == .front ? .leftMirrored : .right)
+            }
+        }
         capturesProcessed += 1
+        if photo.lensStabilizationStatus == .active { oisActiveFrames += 1 }
+        let frac = Double(capturesProcessed) / Double(max(1, currentBurstTotal))
+        let previewNow = capturesProcessed == currentBurstTotal ? pendingBurstPreview : nil
         DispatchQueue.main.async {
             self.progress = Float(self.capturesProcessed) / Float(self.currentBurstTotal) * 0.15
+            self.captureFraction = frac
+            if let p = previewNow { self.burstPreviewThumb = p }
         }
 
         if capturesProcessed == currentBurstTotal {
+            if tuningParams.gcam_burst_ois && tuningParams.robustness_gcam_enabled {
+                let summary = photoOutput.isLensStabilizationDuringBracketedCaptureSupported
+                    ? "OIS active on \(oisActiveFrames)/\(currentBurstTotal) frames"
+                    : "OIS during burst not supported on this camera"
+                DispatchQueue.main.async { self.oisSummary = summary }
+            }
             unlockAfterBurst()
             captureKind = .none
             processingQueue.async { self.processBurst() }

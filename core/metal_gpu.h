@@ -234,6 +234,10 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
 // (robustness_gcam_dilate) -- returning a guide-resolution host keep mask the
 // merge consumes exactly as the CPU operator's. Returns an empty Image if the
 // kernel/guide are unavailable so the caller can fall back to the CPU operator.
+// compute_gcam_guide(raw, cfg, /*prefilter_ref=*/true) on the GPU (the same kernels the
+// operator uses for the comparison guide), read back to the host. Empty on failure.
+Image compute_gcam_guide_metal(const Image& raw, const Config& cfg);
+
 Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats& ref_stats,
                                           const FlowField& flow, int tile_size,
                                           const Config& cfg, Image* s_select_out = nullptr);

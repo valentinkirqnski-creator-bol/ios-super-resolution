@@ -3044,6 +3044,80 @@ struct GcamGuideParamsCPU {
 };
 static_assert(sizeof(GcamGuideParamsCPU) == 64, "GcamGuideParamsCPU layout");
 
+// The 4-channel GCam guide of a Bayer raw, prefiltered (= compute_gcam_guide(raw, cfg,
+// true)), built on the GPU by rob_gcam_guide + rob_gcam_prefilter: line-for-line twins of
+// the host code, same order of operations and precise::sqrt (fast-math may differ in the
+// last bit). Returns the (raw.h/2) x (raw.w/2) x 4 float buffer, or nil (kernels absent,
+// not Bayer, no host pixels, GPU error) so the caller builds the guide on the host.
+static id<MTLBuffer> gcam_guide_build_gpu(const Image& raw, const Config& cfg, const char* tag) {
+    if (!cfg.bayer_mode || raw.h < 2 || raw.w < 2 ||
+        raw.data.size() < (size_t)raw.h * (size_t)raw.w)
+        return nil;
+    auto& c = ctx();
+    id<MTLComputePipelineState> gpipe = c.pipe("rob_gcam_guide");
+    id<MTLComputePipelineState> fpipe = c.pipe("rob_gcam_prefilter");
+    if (!gpipe || !fpipe) return nil;
+    const int gh = raw.h / 2, gw = raw.w / 2;
+    id<MTLBuffer> b_out = nil;
+    bool gok = false;
+    @autoreleasepool {
+        const size_t gbytes = (size_t)gh * (size_t)gw * 4u * sizeof(float);
+        id<MTLBuffer> b_raw = buf(raw.data.data(), (size_t)raw.h * (size_t)raw.w * sizeof(float));
+        id<MTLBuffer> b_g0 = buf(nullptr, gbytes);
+        b_out = buf(nullptr, gbytes);
+        const GcamNoiseLut glut = cfg.gcam_sabre_noise_model ? build_gcam_noise_lut(cfg)
+                                                             : GcamNoiseLut{};
+        id<MTLBuffer> b_glut = buf(glut.v, sizeof(glut.v));
+        GcamGuideParamsCPU gp{};
+        gp.gh = (uint32_t)gh; gp.gw = (uint32_t)gw;
+        gp.raw_w = (uint32_t)raw.w;
+        gp.use_mc = cfg.gcam_sabre_noise_model ? 1u : 0u;
+        gp.cfa00 = cfg.cfa.p[0][0]; gp.cfa01 = cfg.cfa.p[0][1];
+        gp.cfa10 = cfg.cfa.p[1][0]; gp.cfa11 = cfg.cfa.p[1][1];
+        gp.green_factor = cfg.gcam_sabre_green_factor;
+        gp.clip_point = cfg.gcam_sabre_clip_point;
+        gp.na = cfg.noise_alpha_robustness();
+        gp.nb = cfg.noise_beta_robustness();
+        const uint32_t dims[2] = {(uint32_t)gw, (uint32_t)gh};
+        id<MTLCommandBuffer> gcmd = (b_raw && b_g0 && b_out && b_glut) ? [c.queue commandBuffer] : nil;
+        if (gcmd) {
+            id<MTLComputeCommandEncoder> e1 = [gcmd computeCommandEncoder];
+            if (e1) {
+                [e1 setBuffer:b_g0 offset:0 atIndex:0];
+                [e1 setBuffer:b_raw offset:0 atIndex:1];
+                [e1 setBuffer:b_glut offset:0 atIndex:2];
+                [e1 setBytes:&gp length:sizeof(gp) atIndex:3];
+                dispatch2(e1, gpipe, (NSUInteger)gw, (NSUInteger)gh);
+                [e1 endEncoding];
+            }
+            id<MTLComputeCommandEncoder> e2 = e1 ? [gcmd computeCommandEncoder] : nil;
+            if (e2) {
+                [e2 setBuffer:b_out offset:0 atIndex:0];
+                [e2 setBuffer:b_g0 offset:0 atIndex:1];
+                [e2 setBytes:dims length:sizeof(dims) atIndex:2];
+                dispatch2(e2, fpipe, (NSUInteger)gw, (NSUInteger)gh);
+                [e2 endEncoding];
+                prof_tag_gpu(gcmd, tag);
+                [gcmd commit];
+                [gcmd waitUntilCompleted];
+                gok = gcmd.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+    }
+    return gok ? b_out : nil;
+}
+
+Image compute_gcam_guide_metal(const Image& raw, const Config& cfg) {
+  @autoreleasepool {
+    if (!metal_gpu_init()) return Image();
+    id<MTLBuffer> b = gcam_guide_build_gpu(raw, cfg, "robustness:gcam-guide(ref)");
+    if (!b) return Image();
+    Image g(raw.h / 2, raw.w / 2, 4);
+    memcpy(g.data.data(), [b contents], g.data.size() * sizeof(float));
+    return g;
+  }
+}
+
 Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats& ref_stats,
                                           const FlowField& flow, int tile_size,
                                           const Config& cfg, Image* s_select_out) {
@@ -3077,61 +3151,8 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     // and precise::sqrt; Metal fast-math may still differ from the CPU in the last bit
     // (~1e-7 relative). Falls back to the host guide below if a kernel is unavailable.
     if (cfg.gcam_sabre_gpu_guide && cfg.bayer_mode &&
-        comp_raw.h / 2 == refg.h && comp_raw.w / 2 == refg.w &&
-        comp_raw.data.size() >= (size_t)comp_raw.h * (size_t)comp_raw.w) {
-        id<MTLComputePipelineState> gpipe = c.pipe("rob_gcam_guide");
-        id<MTLComputePipelineState> fpipe = c.pipe("rob_gcam_prefilter");
-        if (gpipe && fpipe) {
-            id<MTLBuffer> b_out = nil;
-            bool gok = false;
-            @autoreleasepool {
-                const size_t gbytes = (size_t)refg.h * (size_t)refg.w * 4u * sizeof(float);
-                id<MTLBuffer> b_raw = buf(comp_raw.data.data(),
-                                          (size_t)comp_raw.h * (size_t)comp_raw.w * sizeof(float));
-                id<MTLBuffer> b_g0 = buf(nullptr, gbytes);
-                b_out = buf(nullptr, gbytes);
-                const GcamNoiseLut glut = cfg.gcam_sabre_noise_model ? build_gcam_noise_lut(cfg)
-                                                                     : GcamNoiseLut{};
-                id<MTLBuffer> b_glut = buf(glut.v, sizeof(glut.v));
-                GcamGuideParamsCPU gp{};
-                gp.gh = (uint32_t)refg.h; gp.gw = (uint32_t)refg.w;
-                gp.raw_w = (uint32_t)comp_raw.w;
-                gp.use_mc = cfg.gcam_sabre_noise_model ? 1u : 0u;
-                gp.cfa00 = cfg.cfa.p[0][0]; gp.cfa01 = cfg.cfa.p[0][1];
-                gp.cfa10 = cfg.cfa.p[1][0]; gp.cfa11 = cfg.cfa.p[1][1];
-                gp.green_factor = cfg.gcam_sabre_green_factor;
-                gp.clip_point = cfg.gcam_sabre_clip_point;
-                gp.na = cfg.noise_alpha_robustness();
-                gp.nb = cfg.noise_beta_robustness();
-                const uint32_t dims[2] = {(uint32_t)refg.w, (uint32_t)refg.h};
-                id<MTLCommandBuffer> gcmd = (b_raw && b_g0 && b_out && b_glut) ? [c.queue commandBuffer] : nil;
-                if (gcmd) {
-                    id<MTLComputeCommandEncoder> e1 = [gcmd computeCommandEncoder];
-                    if (e1) {
-                        [e1 setBuffer:b_g0 offset:0 atIndex:0];
-                        [e1 setBuffer:b_raw offset:0 atIndex:1];
-                        [e1 setBuffer:b_glut offset:0 atIndex:2];
-                        [e1 setBytes:&gp length:sizeof(gp) atIndex:3];
-                        dispatch2(e1, gpipe, (NSUInteger)refg.w, (NSUInteger)refg.h);
-                        [e1 endEncoding];
-                    }
-                    id<MTLComputeCommandEncoder> e2 = e1 ? [gcmd computeCommandEncoder] : nil;
-                    if (e2) {
-                        [e2 setBuffer:b_out offset:0 atIndex:0];
-                        [e2 setBuffer:b_g0 offset:0 atIndex:1];
-                        [e2 setBytes:dims length:sizeof(dims) atIndex:2];
-                        dispatch2(e2, fpipe, (NSUInteger)refg.w, (NSUInteger)refg.h);
-                        [e2 endEncoding];
-                        prof_tag_gpu(gcmd, "robustness:gcam-guide");
-                        [gcmd commit];
-                        [gcmd waitUntilCompleted];
-                        gok = gcmd.status == MTLCommandBufferStatusCompleted;
-                    }
-                }
-            }
-            if (gok) b_compg = b_out;
-        }
-    }
+        comp_raw.h / 2 == refg.h && comp_raw.w / 2 == refg.w)
+        b_compg = gcam_guide_build_gpu(comp_raw, cfg, "robustness:gcam-guide");
     if (!b_compg) {
         const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
         if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
@@ -3234,9 +3255,9 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     // Run the soft §7 dilate on the GPU for BOTH guide-res and raw/merge-res (resample):
     // rob_gcam_dilate operates on b_R at its own dims, so it works at raw res too. The 2x
     // guide->quarter downsample is forced OFF on the resample path (already finer than the
-    // guide), matching the host twin. Only the opt-in extra n x n min (gcam_sabre_min5x5)
-    // still forces the host §7 below.
-    if (!cfg.gcam_sabre_min5x5 && dpipe) {
+    // guide), matching the host twin. The opt-in extra n x n min (gcam_sabre_min5x5) runs on
+    // the host on the dilated readback, the same order as the host path.
+    if (dpipe) {
         id<MTLBuffer> b_dil = buf(nullptr, mask_b);
         if (b_dil) {
             struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
@@ -3264,6 +3285,8 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
                 b_R = nil;   // undilated mask no longer needed: free it before the readback
                 dil = Image(th, tw, 1);
                 memcpy(dil.data.data(), [b_dil contents], mask_b);
+                // Opt-in extra n x n min on top of the GPU dilate (same order as the host path).
+                if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
             }
         }
     }

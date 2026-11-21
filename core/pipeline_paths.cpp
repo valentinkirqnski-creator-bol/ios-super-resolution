@@ -1260,9 +1260,10 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 
 } // namespace
 
-Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
-                                  const Config& cfg, const std::string& dng_path,
-                                  const ProgressFn& progress, int maxPreviewDim) {
+static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoaderFn& loader_in,
+                                              const Config& cfg, const std::string& dng_path,
+                                              const ProgressFn& progress, int maxPreviewDim,
+                                              int* ref_index_out) {
     if (frame_count < 2 || !loader_in) return Image();
     // Every frame of the burst comes through this loader (reference, prealign thumbnails, analysis and merge
     // passes), so brightness matching here covers the DNG and ZSL paths alike. The gain is the ratio of the
@@ -1337,7 +1338,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         double t0;
         int n;
         ~ProfOnExit() {
-            if (*written || !prof_enabled()) return;
+            if (*written || !prof_enabled() || work->internal_reference_pass) return;
             char hdr[224];
             std::snprintf(hdr, sizeof(hdr),
                           "\nburst FAILED after %.1f ms over %d frames\n",
@@ -1367,6 +1368,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         frame_count, loader, work, first_ref, progress);
     prof_add_cpu("setup:prealign", prof_now_ms() - t_prealign);
     const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
+    if (ref_index_out) *ref_index_out = ref_index;
     Image ref;
     if (ref_index == 0) {
         ref = std::move(first_ref);
@@ -3277,7 +3279,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 
     prof_mark_memory("burst:end");
-    if (prof_enabled()) {
+    if (prof_enabled() && !work.internal_reference_pass) {
         // Wall time reported separately: the buckets above overlap (async
         // decode/encode threads) and must not be summed against it.
         const double wall = prof_now_ms() - t_burst;
@@ -3305,6 +3307,47 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     prof_written = true;
     report("Done", 1.f);
+    return preview;
+}
+
+Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
+                                  const Config& cfg, const std::string& dng_path,
+                                  const ProgressFn& progress, int maxPreviewDim) {
+    // <stem>_reference.dng beside the output: removed first so a file from an earlier run (imports reuse
+    // one output name) is never saved with this one.
+    const fs::path ref_dng = fs::path(dng_path).parent_path() /
+                             (fs::path(dng_path).stem().string() + "_reference.dng");
+    std::error_code ec;
+    fs::remove(ref_dng, ec);
+
+    Config main_cfg = cfg;
+    main_cfg.internal_reference_pass = false;
+    int ref_index = 0;
+    Image preview = process_burst_loader_to_dng_impl(frame_count, loader_in, main_cfg, dng_path, progress,
+                                                     maxPreviewDim, &ref_index);
+    if (preview.h <= 0 || !cfg.robustness_gcam_enabled || !cfg.gcam_save_reference) return preview;
+
+    // Save Reference Frame: the reference alone through the same merge. The merge needs a comparison frame,
+    // so the reference is loaded as both: the copy aligns at zero motion and adds exactly the reference's own
+    // samples, so each output pixel is the reference's value at any weight the copy gets. Same Config, so the
+    // kernels, output size and DNG encoding are the output's; no side files, no profile report.
+    Config rc = main_cfg;
+    rc.internal_reference_pass = true;
+    rc.robustness_save_mask = false;
+    rc.structure_map_save = false;
+    rc.global_prealignment_choose_reference = false;
+    const int ri = ref_index;
+    const RawFrameLoaderFn ref_loader = [&loader_in, ri](int, Config& c, bool is_reference, int crop_h, int crop_w) {
+        return loader_in(ri, c, is_reference, crop_h, crop_w);
+    };
+    // Statuses prefixed so the app shows them as a second step and never reads them as the output's error.
+    const ProgressFn ref_progress = [&progress](const std::string& s, float f) {
+        if (progress) progress("Reference frame: " + s, f);
+    };
+    const Image ref_preview = process_burst_loader_to_dng_impl(2, ref_loader, rc, ref_dng.string(), ref_progress,
+                                                               std::max(1, std::min(maxPreviewDim, 64)), nullptr);
+    if (ref_preview.h <= 0) fs::remove(ref_dng, ec);
+    if (progress) progress(ref_preview.h > 0 ? "Wrote reference frame DNG" : "Reference frame DNG failed", 1.f);
     return preview;
 }
 

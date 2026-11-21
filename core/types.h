@@ -685,6 +685,9 @@ struct Config {
     // matches on repeating structure). The effective radius is clamped to >= 1.
     // Applied in search_radius_for_level so the CPU and Metal paths stay identical.
     int coarsest_search_radius_delta = 0;
+    // Fix the coarsest level's search radius at exactly 4 (a +-4 px window, 9x9
+    // offsets), ignoring coarsest_search_radius_delta. Off = 4 + the offset.
+    bool coarsest_search_radius_fixed4 = false;
 
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
     // alignment through the bundled PWCNet Core ML model (neural_flow.h)
@@ -969,6 +972,7 @@ struct Config {
         // Coarsest level (largest index the radii vector addresses): apply the
         // user offset, clamped to [-5,+5], and keep the final radius >= 1.
         if (!bm_search_radii.empty() && lvl == (int)bm_search_radii.size() - 1) {
+            if (coarsest_search_radius_fixed4) return 4;
             int d = coarsest_search_radius_delta;
             if (d < -5) d = -5; else if (d > 5) d = 5;
             r += d;
@@ -1842,7 +1846,7 @@ struct Config {
     // up lazily, so if it is unavailable the path falls back to the CPU operator.
     // Off by default: the CPU operator is the verified reference and runs on device
     // as-is. The Metal kernel is unverified until a device/CI build compiles it.
-    bool  gcam_sabre_gpu             = false;
+    bool  gcam_sabre_gpu             = true;
     // With gcam_sabre_gpu: also build each COMPARISON guide on the GPU (rob_gcam_guide +
     // rob_gcam_prefilter, twins of compute_gcam_guide) instead of on the host -- removes
     // ~100+ ms of CPU work and the guide upload per frame. Same math in the same order;
@@ -1862,6 +1866,13 @@ struct Config {
     // bilinear-upsampled by the merge). NOTE: forces the non-resident merge on device
     // (metal_frames_begin refuses residency for raw-res). Requires robustness_gcam_enabled.
     bool  gcam_sabre_raw_res         = true;
+    // GCam path: also write <stem>_reference.dng, the reference frame alone through the same merge (same
+    // kernels, robustness settings, output size and DNG encoding). Done as a second pass after the output is
+    // written, with the reference fed in as both frames: the copy aligns at zero motion and lands on exactly
+    // the reference's own samples, so every output pixel is the reference's value. Requires robustness_gcam_enabled.
+    bool  gcam_save_reference        = false;
+    // Set only by the pipeline on that second pass (no profile report, no side files). Not a tuning knob.
+    bool  internal_reference_pass    = false;
     // Like gcam_sabre_raw_res, but the guide statistics are Dodgson x2 upscaled +
     // flow-warped all the way to the MERGE-OUTPUT grid (scale x the input frame, e.g.
     // ~48MP at scale 2) and R + the 5x5 ComputeLocalMin are computed per OUTPUT pixel

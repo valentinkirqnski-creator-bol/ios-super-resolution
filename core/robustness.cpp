@@ -673,6 +673,11 @@ void prewarm_noise_curves(const Config& cfg) {
         curve_build_missing_locked(&a0, &b0, &sq0, 1);
     }
 
+    // GCam robustness replaces the mask that reads these curves (it has its own
+    // Monte-Carlo LUT, build_gcam_noise_lut), so skip ~1 s of background Monte Carlo that
+    // competed with the reference stage for the CPU. A fallback to the standard mask
+    // (no GCam reference guide) still builds them lazily, with identical results.
+    if (cfg.robustness_gcam_enabled) return;
     // The mask's curves: mask_noise_curves_channel / mask_noise_curves. Not
     // needed until the first comparison frame is scored, which is several
     // hundred milliseconds of reference work away.
@@ -2025,6 +2030,75 @@ static f32 sample_bicubic_abs(const Image& g, f32 fy, f32 fx, int ch) {
     return (wacc != 0.f) ? buf / wacc : buf;
 }
 
+// The two samplers above for all four guide channels at once: the tap positions, the
+// weights and their sum are computed once instead of per channel, and the four channels
+// of a texel are adjacent in memory. Each channel still adds the same terms in the same
+// order (and wacc is the same for every channel), so every output is bit-identical to
+// four separate calls. Interior taps skip the edge clamp (same index either way).
+// Requires g.c == 4.
+static inline void sample_bicubic_abs4(const Image& g, f32 fy, f32 fx, f32 out[4]) {
+    const int iy = (int)std::floor(fy), ix = (int)std::floor(fx);
+    f32 wy[4], wx[4];
+    cubic_bspline_w(fy - (f32)iy, wy);
+    cubic_bspline_w(fx - (f32)ix, wx);
+    int ys[4], xs[4];
+    const bool in_y = iy - 1 >= 0 && iy + 2 <= g.h - 1;
+    const bool in_x = ix - 1 >= 0 && ix + 2 <= g.w - 1;
+    for (int m = 0; m < 4; ++m) {
+        ys[m] = in_y ? iy - 1 + m : (int)clampf((f32)(iy - 1 + m), 0.f, (f32)(g.h - 1));
+        xs[m] = in_x ? ix - 1 + m : (int)clampf((f32)(ix - 1 + m), 0.f, (f32)(g.w - 1));
+    }
+    f32 b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f, wacc = 0.f;
+    const f32* base = g.data.data();
+    for (int m = 0; m < 4; ++m) {
+        const f32* row = base + (size_t)ys[m] * (size_t)g.w * 4u;
+        for (int n = 0; n < 4; ++n) {
+            const f32* p = row + (size_t)xs[n] * 4u;
+            const f32 w = wy[m] * wx[n];
+            b0 += std::fabs(p[0]) * w;
+            b1 += std::fabs(p[1]) * w;
+            b2 += std::fabs(p[2]) * w;
+            b3 += std::fabs(p[3]) * w;
+            wacc += w;
+        }
+    }
+    if (wacc != 0.f) { out[0] = b0 / wacc; out[1] = b1 / wacc; out[2] = b2 / wacc; out[3] = b3 / wacc; }
+    else             { out[0] = b0; out[1] = b1; out[2] = b2; out[3] = b3; }
+}
+
+static inline void sample_biquad_abs4(const Image& g, f32 gy, f32 gx, f32 out[4]) {
+    if (!(gy >= 0.f && gy < (f32)g.h && gx >= 0.f && gx < (f32)g.w)) {
+        for (int c = 0; c < 4; ++c) out[c] = std::numeric_limits<f32>::infinity();
+        return;
+    }
+    // Same bilinear as sample_biquad_abs, all four channels per tap.
+    auto bilin4 = [&](f32 y, f32 x, f32 v[4]) {
+        y = clampf(y, 0.f, (f32)(g.h - 1)); x = clampf(x, 0.f, (f32)(g.w - 1));
+        const int y0 = (int)std::floor(y), x0 = (int)std::floor(x);
+        const int y1 = std::min(y0 + 1, g.h - 1), x1 = std::min(x0 + 1, g.w - 1);
+        const f32 fy = y - (f32)y0, fx = x - (f32)x0;
+        const f32* pa = &g.data[((size_t)y0 * g.w + x0) * 4u];
+        const f32* pb = &g.data[((size_t)y0 * g.w + x1) * 4u];
+        const f32* pc = &g.data[((size_t)y1 * g.w + x0) * 4u];
+        const f32* pd = &g.data[((size_t)y1 * g.w + x1) * 4u];
+        for (int c = 0; c < 4; ++c) {
+            const f32 a = pa[c], b = pb[c], cc = pc[c], d = pd[c];
+            const f32 top = a + (b - a) * fx, bot = cc + (d - cc) * fx;
+            v[c] = top + (bot - top) * fy;
+        }
+    };
+    const f32 Py = gy + 0.5f, Px = gx + 0.5f;
+    const f32 fy = Py - std::floor(Py), fx = Px - std::floor(Px);
+    const f32 cy = fy * fy - fy + 0.5f, cx = fx * fx - fx + 0.5f;
+    const f32 y0 = gy - cy, y1 = gy + cy, x0 = gx - cx, x1 = gx + cx;
+    f32 t00[4], t10[4], t11[4], t01[4];
+    bilin4(y0, x0, t00); bilin4(y1, x0, t10); bilin4(y1, x1, t11); bilin4(y0, x1, t01);
+    for (int c = 0; c < 4; ++c) {
+        const f32 s = std::fabs(t00[c]) + std::fabs(t10[c]) + std::fabs(t11[c]) + std::fabs(t01[c]);
+        out[c] = s * 0.25f;
+    }
+}
+
 // GCam Rejection samples alt_flow_texture with texture() = BILINEAR interpolation of the
 // per-tile flow (x,y) AND the packed min-max motion extent (z). Tile (i,j) represents the
 // raw tile CENTRE at (i+0.5)*tile_size, so a raw position maps to tile coordinate
@@ -2448,17 +2522,20 @@ static void gcam_hf_reject_apply(Image* R, Mask8* m8, const RefStats& rs, const 
     if (irr.size() != (size_t)flow.ny * flow.nx) return;
     const int gh = L.h, gw = L.w, nt = cfg.num_threads;
     std::vector<uint8_t> rej((size_t)gh * gw, 0);
-    bool any = false;
-    for (int y = 0; y < gh; ++y) {
+    // Rows are independent (each writes its own row and its own "any" flag).
+    std::vector<uint8_t> row_any((size_t)gh, 0);
+    parallel_rows(gh, nt, [&](int y) {
         const int ty = std::min(flow.ny - 1, std::max(0, (int)((2.f * y + 0.5f) / (f32)tile_size)));
         for (int x = 0; x < gw; ++x) {
             const int tx = std::min(flow.nx - 1, std::max(0, (int)((2.f * x + 0.5f) / (f32)tile_size)));
             if (irr[(size_t)ty * flow.nx + tx] != 0u && L.at(y, x) > cfg.hf_variance_loss_threshold) {
                 rej[(size_t)y * gw + x] = 1;
-                any = true;
+                row_any[(size_t)y] = 1;
             }
         }
-    }
+    });
+    bool any = false;
+    for (uint8_t v : row_any) if (v) { any = true; break; }
     if (!any) return;
     // Spread like the Wronski path does: there the HF zero is written BEFORE Eq. 9
     // (2x2 min-reduce to the guide lattice, then a 5x5 min), so every flagged guide
@@ -2519,14 +2596,22 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // If the reference raw is a header-only shell (decoded into the GPU slot),
         // pull it back from the resident buffer first (same as the comp path).
         if (cfg.robustness_gcam_enabled) {
+            // The reference guide on the GPU when the comparison guides are built there
+            // (same kernels, so reference and comparison guides come from the same code);
+            // the host build is the fallback.
+            const bool gpu_guide = cfg.gcam_sabre_gpu && cfg.gcam_sabre_gpu_guide;
+            auto ref_guide = [&](const Image& src) {
+                Image g = gpu_guide ? compute_gcam_guide_metal(src, cfg) : Image();
+                return (g.h > 0 && g.w > 0) ? g : compute_gcam_guide(src, cfg, /*prefilter_ref=*/true);
+            };
             if (ref_raw.data.size() >= (size_t)ref_raw.h * (size_t)ref_raw.w) {
-                gpu.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+                gpu.gcam_guide = ref_guide(ref_raw);
                 if (cfg.gcam_structure_match) gcam_structure_ref(gpu, ref_raw, cfg);
             } else {
                 Image ref_host;
                 if (metal_fetch_host_raw(ref_host) &&
                     ref_host.h == ref_raw.h && ref_host.w == ref_raw.w) {
-                    gpu.gcam_guide = compute_gcam_guide(ref_host, cfg, /*prefilter_ref=*/true);
+                    gpu.gcam_guide = ref_guide(ref_host);
                     if (cfg.gcam_structure_match) gcam_structure_ref(gpu, ref_host, cfg);
                 }
             }
@@ -2785,7 +2870,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // Was `resample`, which prefiltered the comp only on the raw/merge-res paths and left
     // guide-res asymmetric (identical frames mean 236/255, 41% rejected).
     const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
-    if (compg.h != refg.h || compg.w != refg.w) return Image();
+    if (compg.h != refg.h || compg.w != refg.w || compg.c != 4 || refg.c != 4) return Image();
     const int gh = refg.h, gw = refg.w;
     const int rh = comp_raw.h, rw = comp_raw.w;   // input-frame (raw) resolution
     // merge-output grid = scale x the input frame (what the merge accumulates onto).
@@ -2896,21 +2981,22 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             // (comp) coordinates differ between guide-res (integer) and raw/merge-res
             // (Dodgson-upsampled), computed above. Sampling both guides the same way and
             // prefiltering both keeps identical frames at d==0.
-            auto gsamp = [&](const Image& g, f32 yy, f32 xx, int ch) -> f32 {
-                return rej_only ? sample_biquad_abs(g, yy, xx, ch)
-                                : sample_bicubic_abs(g, yy, xx, ch);
-            };
+            // All four channels per guide in one fused call (bit-identical to sampling
+            // each channel separately; see sample_bicubic_abs4).
+            f32 rs4[4], cs4[4];
+            if (rej_only) { sample_biquad_abs4(refg, gy, gx, rs4); sample_biquad_abs4(compg, sy, sx, cs4); }
+            else          { sample_bicubic_abs4(refg, gy, gx, rs4); sample_bicubic_abs4(compg, sy, sx, cs4); }
             const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
             const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
             const bool green_pt = refg.at(iy, ix, 3) < 0.f;      // texture(guide, uv).w < 0
             f32 ref_var_signed, refc[3], curc[3], cur_a;
-            const f32 ref_mag = std::fabs(gsamp(refg, gy, gx, 3));
+            const f32 ref_mag = std::fabs(rs4[3]);
             ref_var_signed = green_pt ? -ref_mag : ref_mag;      // reference_values.w sign
             for (int c = 0; c < 3; ++c) {
-                refc[c] = gsamp(refg, gy, gx, c);
-                curc[c] = gsamp(compg, sy, sx, c);
+                refc[c] = rs4[c];
+                curc[c] = cs4[c];
             }
-            cur_a = gsamp(compg, sy, sx, 3);
+            cur_a = cs4[3];
             const bool green_only = ref_var_signed < 0.f;
             f32 ref_a = std::fabs(ref_var_signed);
             // §5.5 noise at the reference luma. MC model on: ref/cur from the LUT

@@ -17,23 +17,37 @@ struct CameraView: View {
     /// viewfinder. Collapsible so the preview can fill the screen.
     @State private var showImporter = false
     @State private var showGallery = false
+    /// GCam-style chrome: the chevron in the top pill opens the quick panel (frames,
+    /// import, format); PRO shows the ISO / shutter bar over the viewfinder.
+    @State private var showQuickPanel = false
+    @State private var showPro = false
+    /// Shutter press flash (inner disc lavender for ~100 ms, as in GCam).
+    @State private var shutterFlash = false
+    /// New-thumbnail animation: pop from half size, plus a fading ripple ring.
+    @State private var thumbPop = true
+    @State private var thumbRipple: CGFloat = 1
+    @State private var thermal = ProcessInfo.processInfo.thermalState
+    /// Capture ring: the viewfinder dims and shows the ring while frames are taken.
+    @State private var captureOverlay = false
+    /// Thumbnail shown in the library button: the burst's preview while it merges,
+    /// then the finished capture; `underThumb` is the previous one while the new pops in.
+    @State private var heldPreview: UIImage?
+    @State private var displayedThumb: UIImage?
+    @State private var underThumb: UIImage?
+    /// The grey capsule (chevron + gradient disc) behind the thumbnail while merging.
+    @State private var capsuleUp = false
 
     var body: some View {
         GeometryReader { geo in
-            let topBarH: CGFloat = 88
-            let exposureBarH: CGFloat = 58
-            let bottomH: CGFloat = 96
+            // GCam layout: a slim black top bar, the 4:3 viewfinder, and a black
+            // bottom bar holding flip / shutter / thumbnail.
+            let topBarH: CGFloat = 60
+            let bottomH: CGFloat = 112
             let vfWidth = geo.size.width
             // One value for the space below the controls, used both to reserve
-            // it and to apply it. They were computed separately before, and the
-            // panel ended up claiming the safe-area inset twice -- once in its
-            // frame and again as padding -- while the viewfinder only reserved
-            // it once, so the whole stack overflowed by an inset and the shutter
-            // ran under the home indicator. The extra 10 lifts it clear rather
-            // than merely flush.
-            let bottomInset = geo.safeAreaInsets.bottom + 10
-            let maxVFHeight = geo.size.height - topBarH - exposureBarH - bottomH - bottomInset
-            // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
+            // it and to apply it (see the history of the double-inset overflow).
+            let bottomInset = geo.safeAreaInsets.bottom + 6
+            let maxVFHeight = geo.size.height - topBarH - bottomH - bottomInset
             let vfHeight = min(maxVFHeight, vfWidth * 4 / 3)
 
             ZStack {
@@ -44,19 +58,67 @@ struct CameraView: View {
                 } else {
                     VStack(spacing: 0) {
                         topStrip
-                            .padding(.top, geo.safeAreaInsets.top + 4)
+                            .padding(.top, geo.safeAreaInsets.top)
                             .frame(height: topBarH + geo.safeAreaInsets.top)
-                            .background(Color.black)
-
-                        exposureBar
                             .background(Color.black)
 
                         viewfinder(width: vfWidth, height: vfHeight)
 
                         bottomPanel
-                            .frame(height: bottomH)
+                            .frame(minHeight: bottomH, maxHeight: .infinity)
                             .padding(.bottom, bottomInset)
                             .background(Color.black)
+                    }
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: ProcessInfo.thermalStateDidChangeNotification)) { _ in
+            thermal = ProcessInfo.processInfo.thermalState
+        }
+        .onChange(of: cam.isCapturing) { capturing in
+            if capturing {
+                withAnimation(.easeOut(duration: 0.18)) { captureOverlay = true }
+            } else {
+                // Let the completed ring show for a moment, then fade ring + dim together.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    withAnimation(.easeIn(duration: 0.2)) { captureOverlay = false }
+                }
+            }
+        }
+        .onChange(of: cam.isProcessing) { processing in
+            if processing {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    if cam.isProcessing { withAnimation(.easeOut(duration: 0.2)) { capsuleUp = true } }
+                }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    if !cam.isProcessing { withAnimation(.easeIn(duration: 0.2)) { capsuleUp = false } }
+                }
+            }
+        }
+        .onChange(of: cam.burstPreviewThumb) { p in
+            // The new shot pops into the library button as soon as capture ends.
+            guard let p = p else { return }
+            heldPreview = p
+            popThumbnail(to: p)
+        }
+        .onChange(of: cam.lastThumbnail) { t in
+            guard let t = t else { return }
+            if heldPreview != nil {
+                heldPreview = nil            // same shot, finished: swap without a second pop
+                displayedThumb = t
+            } else {
+                popThumbnail(to: t)          // ZSL / import: no early preview, pop now
+            }
+        }
+        .onChange(of: cam.isBusy) { busy in
+            // A failed burst never delivers a final thumbnail: go back to the last one.
+            if !busy {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    if !cam.isBusy && heldPreview != nil {
+                        heldPreview = nil
+                        displayedThumb = cam.lastThumbnail
                     }
                 }
             }
@@ -140,23 +202,81 @@ struct CameraView: View {
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
 
-            // ISO/shutter controls live in the exposure bar ABOVE the viewfinder
-            // (see `exposureBar`), so nothing covers the preview here.
+            // GCam capture progress: the viewfinder dims to ~38% and a 70 pt ring at its
+            // centre fills clockwise from 12 o'clock as the frames arrive (faint track
+            // underneath), then the ring and the dimming fade out together.
+            ZStack {
+                Color.black.opacity(0.62)
+                Circle()
+                    .stroke(Color.white.opacity(0.25), lineWidth: 2.5)
+                    .frame(width: 70, height: 70)
+                Circle()
+                    .trim(from: 0, to: CGFloat(min(1, max(0, cam.captureFraction))))
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 70, height: 70)
+                    .animation(.linear(duration: 0.12), value: cam.captureFraction)
+            }
+            .frame(width: width, height: height)
+            .opacity(captureOverlay ? 1 : 0)
+            .allowsHitTesting(false)
 
+            // Top of the viewfinder: the quick panel (chevron), the PRO exposure bar,
+            // and the pipeline status line.
+            VStack(spacing: 6) {
+                if showQuickPanel {
+                    quickPanel
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if showPro {
+                    exposureBar
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(Color.black.opacity(0.62)))
+                        .padding(.horizontal, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                if !cam.statusText.isEmpty && (cam.isProcessing || !cam.isBusy) {
+                    Text(cam.statusText)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.85))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.75)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Capsule().fill(Color.black.opacity(0.45)))
+                        .padding(.horizontal, 16)
+                        .allowsHitTesting(false)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 8)
+            .frame(width: width, height: height)
+
+            // Right edge: the vertical lens column (tele / 1x / ultra-wide).
+            if cam.cameraSelection != .front {
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    VStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        backLensPicker
+                        Spacer(minLength: 0).frame(height: height * 0.16)
+                    }
+                    .padding(.trailing, 8)
+                }
+                .frame(width: width, height: height)
+            }
+
+            // Bottom centre: the 1x | 2x output toggle; the zoom ruler while zooming.
             VStack {
                 Spacer()
-                if cam.cameraSelection != .front {
-                    // One or the other, never both: the slider is the zoomed-in
-                    // form of the same control, as on the reference UI.
-                    if cam.zoomUIVisible {
-                        zoomSlider(width: width)
-                            .padding(.bottom, 14)
-                            .transition(.opacity)
-                    } else {
-                        backLensPicker
-                            .padding(.bottom, 14)
-                            .transition(.opacity)
-                    }
+                if cam.cameraSelection != .front && cam.zoomUIVisible {
+                    zoomSlider(width: width)
+                        .padding(.bottom, 14)
+                        .transition(.opacity)
+                } else {
+                    resolutionToggle
+                        .padding(.bottom, 18)
+                        .transition(.opacity)
                 }
             }
             .frame(width: width, height: height)
@@ -192,7 +312,7 @@ struct CameraView: View {
                     p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: g.size.width, y: y))
                 }
             }
-            .stroke(Color.white.opacity(0.28), lineWidth: 0.5)
+            .stroke(Color.white.opacity(0.45), lineWidth: 0.6)
         }
     }
 
@@ -321,26 +441,131 @@ struct CameraView: View {
 
     // MARK: - Top strip
 
+    /// GCam top bar: a big grey number (here the burst frame count; tap for the quick
+    /// panel), the dark pill with settings + chevron, the thermometer (device thermal
+    /// state), the format badge (D = DNG, J = JPG; tap to switch) and PRO (ISO / shutter).
     private var topStrip: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 14) {
-                roundIconButton("gearshape.fill") { showSettings = true }
-                // A stack of frames collapsing into one output is the closest
-                // symbol to "merge several files into a larger image".
-                roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
-                Spacer()
+        HStack(spacing: 0) {
+            Button(action: { withAnimation(.easeOut(duration: 0.2)) { showQuickPanel.toggle() } }) {
+                Text("\(cam.frameCount)")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundColor(GC.textGrey)
+                    .frame(minWidth: 44, minHeight: 44)
             }
+            .accessibilityLabel("Burst frames")
+            .padding(.leading, 18)
 
-            HStack(spacing: 14) {
-                frameCountControl
-                resolutionControl
-                formatControl
-                Spacer()
-                // ISO/shutter now live in the exposure bar below the top strip,
-                // so they are not duplicated here.
+            Spacer(minLength: 8)
+
+            HStack(spacing: 20) {
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 21, weight: .regular))
+                        .foregroundColor(GC.iconGrey)
+                }
+                .accessibilityLabel("Settings")
+                Button(action: { withAnimation(.easeOut(duration: 0.2)) { showQuickPanel.toggle() } }) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(GC.iconGrey)
+                        .rotationEffect(.degrees(showQuickPanel ? 180 : 0))
+                }
+                .accessibilityLabel("Quick settings")
+            }
+            .padding(.horizontal, 15)
+            .frame(height: 43)
+            .background(Capsule().fill(GC.pill))
+
+            Spacer(minLength: 10)
+
+            Image(systemName: "thermometer")
+                .font(.system(size: 19, weight: .regular))
+                .foregroundColor(thermalColor)
+                .accessibilityLabel("Device temperature")
+
+            Spacer(minLength: 10)
+
+            Button(action: {
+                guard !cam.isBusy else { return }
+                cam.exportFormat = (cam.exportFormat == .dng) ? .jpg : .dng
+            }) {
+                ZStack {
+                    Image(systemName: "seal")
+                        .font(.system(size: 24, weight: .regular))
+                    Text(cam.exportFormat == .dng ? "D" : "J")
+                        .font(.system(size: 11, weight: .heavy))
+                }
+                .foregroundColor(GC.badge)
+            }
+            .disabled(cam.isBusy)
+            .accessibilityLabel("Save format")
+            .accessibilityValue(cam.exportFormat.label)
+
+            Spacer(minLength: 10)
+
+            Button(action: { withAnimation(.easeOut(duration: 0.2)) { showPro.toggle() } }) {
+                Text("PRO")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(showPro ? GC.badge : GC.textGrey)
+            }
+            .padding(.trailing, 16)
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    /// The coarsest-level search radius actually used: 4 + offset (at least 1), or 4 when fixed.
+    private var coarsestRadiusLabel: String {
+        if cam.tuningParams.coarsest_search_radius_fixed4 { return "±4" }
+        let d = cam.tuningParams.coarsest_search_radius_delta
+        let sign = d >= 0 ? "+" : ""
+        return "±\(max(1, 4 + d)) (\(sign)\(d))"
+    }
+
+    private var thermalColor: Color {
+        switch thermal {
+        case .serious: return .orange
+        case .critical: return .red
+        default: return GC.thermo
+        }
+    }
+
+    /// Chevron drop-down: burst length, import from Files, output size and format.
+    private var quickPanel: some View {
+        HStack(spacing: 14) {
+            frameCountControl
+            Button(action: { showImporter = true; showQuickPanel = false }) {
+                Image(systemName: "square.stack.3d.down.right.fill")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.white.opacity(0.12)))
+            }
+            .disabled(cam.isBusy)
+            .accessibilityLabel("Import burst")
+            formatControl
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(Capsule().fill(Color.black.opacity(0.62)))
+    }
+
+    /// Bottom-centre pill: 1x (12 MP) or 2x (48 MP super-resolution).
+    private var resolutionToggle: some View {
+        HStack(spacing: 6) {
+            ForEach(OutputResolutionMode.allCases) { mode in
+                let selected = cam.outputResolutionMode == mode
+                Button(action: { if !cam.isBusy { cam.outputResolutionMode = mode } }) {
+                    Text(mode == .native12mp ? "1x" : "2x")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(selected ? Color(white: 0.2) : GC.toggleText)
+                        .frame(width: 38, height: 38)
+                        .background(Circle().fill(selected ? GC.toggleSelected : Color.clear))
+                }
+                .disabled(cam.isBusy)
+                .accessibilityLabel(mode.label)
             }
         }
-        .padding(.horizontal, 20)
+        .padding(2)
+        .background(Capsule().fill(GC.toggleCapsule))
     }
 
     private var frameCountControl: some View {
@@ -533,79 +758,54 @@ struct CameraView: View {
 
     // MARK: - Lens picker (over viewfinder)
 
+    /// GCam's vertical lens column on the right edge: longest lens on top. Only the
+    /// physical lenses this device has (the 2x sensor crop stays on the zoom ruler).
     private var backLensPicker: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 6) {
-                if cam.availableCameras.contains(.ultraWide) {
-                    lensChip(title: "0.5×", selected: cam.isAtZoom(cam.ultraWideNativeZoom)) {
-                        cam.setLensZoom(.ultraWide)
-                    }
-                }
-                if cam.availableCameras.contains(.wide) {
-                    lensChip(title: "1×", selected: cam.isAtZoom(1)) {
-                        cam.setLensZoom(.wide1x)
-                    }
-                    // No hard-coded 2× chip: the lens buttons reflect only the
-                    // physical lenses this device actually has (ultra-wide 0.5×,
-                    // wide 1×, and the telephoto's native factor), so a base
-                    // iPhone shows 0.5/1 and a Pro shows 0.5/1/<tele>. The 2×
-                    // sensor-crop remains reachable via the zoom slider.
-                }
-                if cam.availableCameras.contains(.telephoto) {
-                    lensChip(title: cam.telephotoLensLabel,
-                             selected: cam.isAtZoom(cam.telephotoNativeZoom)) {
-                        cam.setLensZoom(.telephoto)
-                    }
+        VStack(spacing: 5) {
+            if cam.availableCameras.contains(.telephoto) {
+                lensChip(title: cam.telephotoLensLabel,
+                         selected: cam.isAtZoom(cam.telephotoNativeZoom)) {
+                    cam.setLensZoom(.telephoto)
                 }
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 5)
-            .background(Capsule().fill(Color.black.opacity(0.45)))
+            if cam.availableCameras.contains(.wide) {
+                lensChip(title: "1x", selected: cam.isAtZoom(1)) {
+                    cam.setLensZoom(.wide1x)
+                }
+            }
+            if cam.availableCameras.contains(.ultraWide) {
+                lensChip(title: String(format: "%.1fx", Double(cam.ultraWideNativeZoom)),
+                         selected: cam.isAtZoom(cam.ultraWideNativeZoom)) {
+                    cam.setLensZoom(.ultraWide)
+                }
+            }
         }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 2)
+        .background(Capsule().fill(GC.lensCapsule))
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 12, weight: selected ? .bold : .medium))
-                .foregroundColor(selected ? .black : .white.opacity(0.92))
-                .frame(width: 38, height: 38)
-                .background(
-                    Circle().fill(selected
-                                  ? Color(red: 0.86, green: 0.78, blue: 0.60)
-                                  : Color.white.opacity(0.14))
-                )
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(selected ? Color(white: 0.15) : .white)
+                .frame(width: 42, height: 42)
+                .background(Circle().fill(selected ? GC.lensSelected : Color.clear))
         }
         .disabled(cam.isBusy)
     }
 
     // MARK: - Bottom panel (Apple-style)
 
+    /// GCam bottom bar: flip (left), shutter (centre), last-capture thumbnail (right).
     private var bottomPanel: some View {
         VStack(spacing: 0) {
             freeTierBanner
-            if cam.isProcessing, !cam.statusText.isEmpty {
-                Text(cam.statusText)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.5))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.75)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 6)
-            } else if !cam.statusText.isEmpty, !cam.isBusy {
-                Text(cam.statusText)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.5))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.75)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 6)
-            }
-
+                .padding(.top, 4)
+            Spacer(minLength: 0)
             HStack(alignment: .center) {
-                galleryButton
+                flipCameraButton
                     .frame(width: 72)
 
                 Spacer()
@@ -614,13 +814,12 @@ struct CameraView: View {
 
                 Spacer()
 
-                flipCameraButton
+                galleryButton
                     .frame(width: 72)
             }
-            .padding(.horizontal, 28)
-
+            .padding(.horizontal, 4)
+            Spacer(minLength: 0)
         }
-        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var flipCameraButton: some View {
@@ -628,12 +827,11 @@ struct CameraView: View {
         return Button(action: { cam.toggleFrontCamera() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(enabled ? Color.white : Color.white.opacity(0.25),
-                                  lineWidth: 2)
-                    .frame(width: 48, height: 48)
+                    .strokeBorder(GC.flipRing.opacity(enabled ? 1 : 0.3), lineWidth: 2.5)
+                    .frame(width: 63, height: 63)
                 Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundColor(enabled ? .white : .white.opacity(0.25))
+                    .font(.system(size: 25, weight: .regular))
+                    .foregroundColor(GC.flipRing.opacity(enabled ? 1 : 0.3))
             }
         }
         .disabled(!enabled)
@@ -644,41 +842,23 @@ struct CameraView: View {
         !store.isUnlocked && store.photosRemaining == 0
     }
 
+    /// GCam shutter: thin white outer ring, black gap, light-grey disc. Pressing turns
+    /// the disc lavender instantly (no scale change) for as long as the finger is down,
+    /// and at least ~100 ms for a quick tap, matching the reference recording.
     private var shutterButton: some View {
         Button(action: {
             if cam.isBusy { return }
             // Out of free captures: don't shoot, offer the unlock instead.
             if outOfFreeCaptures { showPaywall = true; return }
+            shutterFlash = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { shutterFlash = false }
             cam.captureBurst()
             store.registerCapture()
         }) {
-            ZStack {
-                Circle()
-                    .strokeBorder(Color.white.opacity(cam.isBusy || outOfFreeCaptures ? 0.35 : 1), lineWidth: 5)
-                    .frame(width: 78, height: 78)
-                Circle()
-                    .fill(outOfFreeCaptures ? Color.white.opacity(0.25) : shutterFill)
-                    .frame(width: cam.isCapturing ? 50 : 58, height: cam.isCapturing ? 50 : 58)
-                    .animation(.spring(response: 0.22, dampingFraction: 0.6), value: cam.isCapturing)
-                if outOfFreeCaptures {
-                    // The shutter is "disabled" for capture — a lock marks that a
-                    // tap now opens the unlock sheet rather than shooting.
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.8))
-                }
-                if cam.isProcessing {
-                    // Progress reads on the control the user is waiting on,
-                    // rather than only in the status line above.
-                    Circle()
-                        .trim(from: 0, to: max(0.02, CGFloat(cam.progress)))
-                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                        .frame(width: 78, height: 78)
-                        .animation(.easeInOut(duration: 0.2), value: cam.progress)
-                }
-            }
+            EmptyView()
         }
+        .buttonStyle(GCamShutterStyle(flash: shutterFlash, locked: outOfFreeCaptures,
+                                      capturing: cam.isCapturing))
         // Kept tappable when out of free captures so the tap can open the paywall;
         // it will not start a capture in that state (handled in the action).
         .disabled(cam.isBusy)
@@ -726,45 +906,100 @@ struct CameraView: View {
         .disabled(cam.isBusy)
     }
 
-    private var shutterFill: Color {
-        if cam.isProcessing { return Color.white.opacity(0.25) }
-        if cam.isBusy { return Color.white.opacity(0.35) }
-        return .white
+    /// GCam library button. Thumbnail Ø63 with a 2 pt white ring. While the burst
+    /// merges, a steel-blue arc (outer Ø 1.19x, stroke 0.094x the thumbnail) sweeps
+    /// clockwise from 12 o'clock with the merge progress, and a grey capsule slides up
+    /// from behind the thumbnail carrying a chevron and a pink-violet disc. A new shot
+    /// grows from 55% over the previous one with a faint ripple expanding behind.
+    private var galleryButton: some View {
+        let d: CGFloat = 63
+        let shown = displayedThumb ?? cam.lastThumbnail
+        let mergeFrac = cam.isProcessing ? max(0.03, min(1, (Double(cam.progress) - 0.15) / 0.85)) : 1
+        return Button(action: { if !cam.isBusy { showGallery = true } }) {
+            ZStack {
+                // Merge progress arc (under the capsule and the thumbnail).
+                Circle()
+                    .trim(from: 0, to: CGFloat(mergeFrac))
+                    .stroke(GC.progress, style: StrokeStyle(lineWidth: d * 0.094, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: d * 1.19 - d * 0.094, height: d * 1.19 - d * 0.094)
+                    .opacity(cam.isProcessing ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25), value: mergeFrac)
+                    .animation(.easeOut(duration: 0.25), value: cam.isProcessing)
+
+                // Capsule: clipped to the area above the thumbnail centre, so it slides
+                // up out of the thumbnail rather than appearing below it.
+                ZStack(alignment: .top) {
+                    RoundedRectangle(cornerRadius: d / 2, style: .continuous)
+                        .fill(GC.capsule)
+                        .frame(width: d, height: d * 1.25 + d / 2)
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(GC.chevron)
+                        .padding(.top, d * 1.25 - d * 0.96 - 8)
+                    ZStack {
+                        Circle().fill(GC.discRim).frame(width: d * 0.63, height: d * 0.63)
+                        Circle().fill(GC.discGradient).frame(width: d * 0.5, height: d * 0.5)
+                    }
+                    .padding(.top, d * 1.25 - d * 0.52 - d * 0.315)
+                }
+                .frame(width: d, height: d * 1.25, alignment: .top)
+                .offset(y: capsuleUp ? 0 : d * 1.25)
+                .frame(width: d, height: d * 1.25, alignment: .top)
+                .clipped()
+                .offset(y: -d * 1.25 / 2)
+
+                // Ripple behind the new thumbnail.
+                Circle()
+                    .stroke(Color.white.opacity(0.22 * Double(1 - thumbRipple)), lineWidth: 4)
+                    .frame(width: d, height: d)
+                    .scaleEffect(1 + 0.55 * thumbRipple)
+
+                // Previous thumbnail stays underneath while the new one grows in.
+                if let u = underThumb {
+                    thumbCircle(u, d: d)
+                }
+                thumbCircle(shown, d: d)
+                    .scaleEffect(thumbPop ? 1 : 0.55)
+            }
+            .frame(width: d * 1.25, height: d * 1.25)
+        }
+        .disabled(cam.isBusy && shown == nil)
     }
 
-    private var galleryButton: some View {
-        Button(action: { if !cam.isBusy { showGallery = true } }) {
-            ZStack {
-                Group {
-                    if let thumb = cam.lastThumbnail {
-                        Image(uiImage: thumb).resizable().scaledToFill()
-                    } else {
-                        Circle()
-                            .fill(Color.white.opacity(0.1))
-                            .overlay(
-                                Image(systemName: "photo")
-                                    .font(.system(size: 18, weight: .light))
-                                    .foregroundColor(.white.opacity(0.5))
-                            )
-                    }
-                }
-                .frame(width: 46, height: 46)
-                .clipShape(Circle())
-                .overlay(Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: 1.5))
-
-                if cam.isBusy {
-                    Circle()
-                        .stroke(Color.white.opacity(0.25), lineWidth: 2)
-                        .frame(width: 54, height: 54)
-                    Circle()
-                        .trim(from: 0, to: CGFloat(max(0.02, Double(cam.progress))))
-                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: 54, height: 54)
-                        .rotationEffect(.degrees(-90))
-                }
+    private func thumbCircle(_ img: UIImage?, d: CGFloat) -> some View {
+        Group {
+            if let img = img {
+                Image(uiImage: img).resizable().scaledToFill()
+            } else {
+                Circle()
+                    .fill(Color.white.opacity(0.1))
+                    .overlay(
+                        Image(systemName: "photo")
+                            .font(.system(size: 18, weight: .light))
+                            .foregroundColor(.white.opacity(0.5))
+                    )
             }
         }
-        .disabled(cam.isBusy && cam.lastThumbnail == nil)
+        .frame(width: d, height: d)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(GC.ring, lineWidth: 2))
+    }
+
+    /// New thumbnail: grows from 55% over the previous one, ripple expands and fades.
+    private func popThumbnail(to img: UIImage) {
+        var t = Transaction(); t.disablesAnimations = true
+        withTransaction(t) {
+            underThumb = displayedThumb
+            displayedThumb = img
+            thumbPop = false
+            thumbRipple = 0
+        }
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) { thumbPop = true }
+            withAnimation(.easeOut(duration: 0.5)) { thumbRipple = 1 }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { underThumb = nil }
     }
 
     // MARK: - Sheets
@@ -1030,18 +1265,23 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
+                    Toggle("Coarsest Search Radius ±4", isOn: $cam.tuningParams.coarsest_search_radius_fixed4)
+                    Text("Fixes the block-match search window at the coarsest pyramid level to ±4 px (9×9 offsets; about ±128 raw px with the default FFT grey). The offset below is ignored while this is on. Off = 4 plus the offset.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Stepper(value: $cam.tuningParams.coarsest_search_radius_delta,
                             in: -5...5,
                             step: 1) {
                         HStack {
                             Text("Coarsest Search Radius")
                             Spacer()
-                            Text(cam.tuningParams.coarsest_search_radius_delta >= 0
-                                 ? "+\(cam.tuningParams.coarsest_search_radius_delta)"
-                                 : "\(cam.tuningParams.coarsest_search_radius_delta)")
+                            // The radius actually used: 4 + offset, at least 1 (or 4 when fixed).
+                            Text(coarsestRadiusLabel)
                         }
                     }
-                    Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
+                    .disabled(cam.tuningParams.coarsest_search_radius_fixed4)
+                    Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default of ±4. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
@@ -1081,6 +1321,9 @@ struct CameraView: View {
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
+                Section(header: Text("Camera")) {
+                    Toggle("Shutter Sound", isOn: $cam.shutterSoundEnabled)
+                }
                 Section(header: Text("Unlimited Shooting")) {
                     if store.isUnlocked {
                         HStack {
@@ -1333,6 +1576,12 @@ struct CameraView: View {
                         Text("""
                              Gives every one of the ~48 MP output pixels its own rejection weight, but memory-safely: R and the N×N minimum are computed at the INPUT-FRAME resolution (~12 MP, the same ~49 MB/frame as "Mask at Input-Frame Resolution"), then the merge BILINEARLY upsamples that mask to each output pixel at fetch time. There is never a full 48 MP mask in memory (an earlier version materialised one ~195 MB mask per frame and crashed the app with out-of-memory). Because the statistics are guide-resolution either way, this interpolated per-output weight is numerically almost identical to literally computing R at 48 MP, without the RAM. MUTUALLY EXCLUSIVE with "Mask at Input-Frame Resolution" (turning either on turns the other off); the difference is this one adds the smooth per-output-pixel bilinear upsample. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
                              """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("OIS During Burst", isOn: $cam.tuningParams.gcam_burst_ois)
+                        Text("Keeps optical image stabilization working while the burst is taken. iOS only lets an app turn OIS on explicitly for bracketed captures, so the burst is taken as RAW brackets (as many frames per bracket as the camera allows) at exactly the locked exposure and ISO. After the burst the status line shows how many frames the camera reported OIS active for. Cameras without OIS bracket support capture as before. Off by default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Save Reference Frame", isOn: $cam.tuningParams.gcam_save_reference)
+                        Text("Saves a second image to Photos with the output: the reference frame on its own, run through the same merge at the same output size (48 MP at 2x) and saved the same way (DNG or JPG). Comparing it with the output shows exactly what the other frames added. Runs as a second pass after the output is written, so the burst takes longer (roughly one extra frame plus a second merge). Off by default.")
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Run operator on GPU", isOn: $cam.tuningParams.gcam_sabre_gpu)
                         if cam.tuningParams.gcam_sabre_gpu {
@@ -1621,6 +1870,67 @@ struct CameraView: View {
 }
 
 // MARK: - Focus reticle
+
+/// Colours sampled from the reference GCam screen recording.
+fileprivate enum GC {
+    static let shutterDisc = Color(red: 233 / 255, green: 233 / 255, blue: 233 / 255)
+    static let shutterPressed = Color(red: 231 / 255, green: 190 / 255, blue: 226 / 255)
+    static let ring = Color(red: 249 / 255, green: 249 / 255, blue: 249 / 255)
+    static let flipRing = Color(white: 210 / 255)
+    static let pill = Color(red: 25 / 255, green: 24 / 255, blue: 26 / 255)
+    static let iconGrey = Color(white: 200 / 255)
+    static let textGrey = Color(white: 206 / 255)
+    static let thermo = Color(red: 150 / 255, green: 205 / 255, blue: 217 / 255)
+    static let badge = Color(red: 176 / 255, green: 212 / 255, blue: 220 / 255)
+    static let lensSelected = Color(red: 172 / 255, green: 185 / 255, blue: 243 / 255)
+    static let lensCapsule = Color.black.opacity(0.82)
+    static let toggleCapsule = Color(red: 38 / 255, green: 37 / 255, blue: 35 / 255).opacity(0.92)
+    static let toggleSelected = Color(red: 182 / 255, green: 186 / 255, blue: 206 / 255)
+    static let toggleText = Color(red: 211 / 255, green: 211 / 255, blue: 207 / 255)
+    static let progress = Color(red: 125 / 255, green: 162 / 255, blue: 178 / 255)   // merge arc
+    static let capturingGrey = Color(white: 142 / 255)
+    static let capsule = Color(red: 78 / 255, green: 81 / 255, blue: 87 / 255)
+    static let chevron = Color(red: 214 / 255, green: 217 / 255, blue: 221 / 255)
+    static let discRim = Color(red: 243 / 255, green: 246 / 255, blue: 250 / 255)
+    static let discGradient = LinearGradient(
+        colors: [Color(red: 236 / 255, green: 64 / 255, blue: 112 / 255),
+                 Color(red: 216 / 255, green: 63 / 255, blue: 139 / 255),
+                 Color(red: 150 / 255, green: 60 / 255, blue: 220 / 255)],
+        startPoint: .topTrailing, endPoint: .bottomLeading)
+}
+
+/// The GCam shutter: 91 pt outer ring (3.6 pt), black gap, 68 pt disc. The disc
+/// switches colour with no transition while pressed (or during the post-tap flash).
+fileprivate struct GCamShutterStyle: ButtonStyle {
+    var flash: Bool
+    var locked: Bool
+    /// While frames are being captured the ring and disc go grey (#8E8E8E), fading in
+    /// over ~0.1 s and snapping back to white when capture ends.
+    var capturing: Bool = false
+    func makeBody(configuration: Configuration) -> some View {
+        let pressed = configuration.isPressed || flash
+        let disc: Color = locked ? Color.white.opacity(0.25)
+            : (capturing ? GC.capturingGrey : (pressed ? GC.shutterPressed : GC.shutterDisc))
+        return ZStack {
+            Circle()
+                .strokeBorder(capturing ? GC.capturingGrey : GC.ring.opacity(locked ? 0.35 : 1), lineWidth: 3.6)
+                .frame(width: 91, height: 91)
+                .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
+            Circle()
+                .fill(disc)
+                .frame(width: 68, height: 68)
+                .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
+                .animation(nil, value: pressed)
+            if locked {
+                // A tap opens the unlock sheet rather than shooting.
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.8))
+            }
+        }
+        .contentShape(Circle())
+    }
+}
 
 private struct FocusIndicator: View {
     @State private var scale: CGFloat = 1.35

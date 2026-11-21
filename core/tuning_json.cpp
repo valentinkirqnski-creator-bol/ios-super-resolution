@@ -141,6 +141,8 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     }
     if (has("coarsest_search_radius_delta"))
         cfg.coarsest_search_radius_delta = std::max(-5, std::min(5, iv("coarsest_search_radius_delta")));
+    if (has("coarsest_search_radius_fixed4"))
+        cfg.coarsest_search_radius_fixed4 = bv("coarsest_search_radius_fixed4");
     if (has("global_prealignment_enabled")) cfg.global_prealignment_enabled = bv("global_prealignment_enabled");
     if (has("global_prealignment_choose_reference"))
         cfg.global_prealignment_choose_reference = bv("global_prealignment_choose_reference");
@@ -258,6 +260,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_gpu"))          cfg.gcam_sabre_gpu = bv("gcam_sabre_gpu");
     if (has("gcam_sabre_gpu_guide"))    cfg.gcam_sabre_gpu_guide = bv("gcam_sabre_gpu_guide");
     if (has("gcam_sabre_raw_res"))      cfg.gcam_sabre_raw_res = bv("gcam_sabre_raw_res");
+    if (has("gcam_save_reference"))     cfg.gcam_save_reference = bv("gcam_save_reference");
     if (has("gcam_sabre_bilinear_upscale")) cfg.gcam_sabre_bilinear_upscale = bv("gcam_sabre_bilinear_upscale");
     if (has("gcam_sabre_min5x5"))       cfg.gcam_sabre_min5x5 = bv("gcam_sabre_min5x5");
     if (has("gcam_sabre_merge_res"))    cfg.gcam_sabre_merge_res = bv("gcam_sabre_merge_res");
