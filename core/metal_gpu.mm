@@ -1608,6 +1608,24 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
+    // Config::kernel_tensor16: one pass straight from the raw (16-gradient Bayer tensor,
+    // core/tensor16_shared.h). Looked up lazily; absent -> the 4-gradient passes below.
+    id<MTLComputePipelineState> t16pipe =
+        (cfg.kernel_tensor16 && bayer) ? c.pipe("kernel_estimate_cov16") : nil;
+    if (t16pipe) {
+        int ry = 0, rx = 0, by = 0, bx = 0;
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                const uint8_t cc = cfg.cfa.p[i][j];
+                if (cc == 0) { ry = i; rx = j; } else if (cc == 2) { by = i; bx = j; }
+            }
+        const int t16[8] = {ry, rx, by, bx, by == 0 ? 1 : 0, cfg.cfa.p[0][0] == 1 ? 1 : 0, 0, 0};
+        [enc setBuffer:b_cov offset:cov_off_bytes atIndex:0];
+        [enc setBuffer:b_raw offset:raw_off_bytes atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        [enc setBytes:t16 length:sizeof(t16) atIndex:3];
+        dispatch2(enc, t16pipe, p.grey_w, p.grey_h);
+    } else {
     [enc setBuffer:b_grey offset:0 atIndex:0];
     [enc setBuffer:b_raw offset:raw_off_bytes atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
@@ -1627,6 +1645,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     [enc setBuffer:b_grad offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_estimate_cov"), p.grey_w, p.grey_h);
+    }
     [enc endEncoding];
 
     prof_tag_gpu(cmd, "kernels:estimate-cov");

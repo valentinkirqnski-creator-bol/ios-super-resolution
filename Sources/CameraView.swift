@@ -221,9 +221,10 @@ struct CameraView: View {
             .opacity(captureOverlay ? 1 : 0)
             .allowsHitTesting(false)
 
-            // Top of the viewfinder: the quick panel (chevron), the PRO exposure bar,
-            // and the pipeline status line.
+            // Top of the viewfinder: the 12MP | 48MP output pill, the quick panel (chevron),
+            // the PRO exposure bar, and the pipeline status line.
             VStack(spacing: 6) {
+                resolutionToggle
                 if showQuickPanel {
                     quickPanel
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -252,31 +253,20 @@ struct CameraView: View {
             .padding(.top, 8)
             .frame(width: width, height: height)
 
-            // Right edge: the vertical lens column (tele / 1x / ultra-wide).
-            if cam.cameraSelection != .front {
-                HStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    VStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        backLensPicker
-                        Spacer(minLength: 0).frame(height: height * 0.16)
-                    }
-                    .padding(.trailing, 8)
-                }
-                .frame(width: width, height: height)
-            }
-
-            // Bottom centre: the 1x | 2x output toggle; the zoom ruler while zooming.
+            // Bottom centre: the lens pill (0.5x | 1x | tele) switching the camera lens;
+            // the zoom ruler while zooming.
             VStack {
                 Spacer()
-                if cam.cameraSelection != .front && cam.zoomUIVisible {
-                    zoomSlider(width: width)
-                        .padding(.bottom, 14)
-                        .transition(.opacity)
-                } else {
-                    resolutionToggle
-                        .padding(.bottom, 11)
-                        .transition(.opacity)
+                if cam.cameraSelection != .front {
+                    if cam.zoomUIVisible {
+                        zoomSlider(width: width)
+                            .padding(.bottom, 14)
+                            .transition(.opacity)
+                    } else {
+                        backLensPicker
+                            .padding(.bottom, 11)
+                            .transition(.opacity)
+                    }
                 }
             }
             .frame(width: width, height: height)
@@ -548,17 +538,18 @@ struct CameraView: View {
         .background(Capsule().fill(Color.black.opacity(0.62)))
     }
 
-    /// Bottom-centre pill: 1x (12 MP) or 2x (48 MP super-resolution).
+    /// Top-of-viewfinder pill: the output size, i.e. the merge factor -- 12MP (1x) or
+    /// 48MP (2x super-resolution).
     private var resolutionToggle: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 4) {
             ForEach(OutputResolutionMode.allCases) { mode in
                 let selected = cam.outputResolutionMode == mode
                 Button(action: { if !cam.isBusy { cam.outputResolutionMode = mode } }) {
-                    Text(mode == .native12mp ? "1x" : "2x")
-                        .font(.system(size: 12, weight: .medium))
+                    Text(mode.label)   // "12MP" / "48MP"
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(selected ? Color(white: 0.2) : GC.toggleText)
-                        .frame(width: 30, height: 30)
-                        .background(Circle().fill(selected ? GC.toggleSelected : Color.clear))
+                        .frame(width: 44, height: 24)
+                        .background(Capsule().fill(selected ? GC.toggleSelected : Color.clear))
                 }
                 .disabled(cam.isBusy)
                 .accessibilityLabel(mode.label)
@@ -761,11 +752,11 @@ struct CameraView: View {
     /// GCam's vertical lens column on the right edge: longest lens on top. Only the
     /// physical lenses this device has (the 2x sensor crop stays on the zoom ruler).
     private var backLensPicker: some View {
-        VStack(spacing: 5) {
-            if cam.availableCameras.contains(.telephoto) {
-                lensChip(title: cam.telephotoLensLabel,
-                         selected: cam.isAtZoom(cam.telephotoNativeZoom)) {
-                    cam.setLensZoom(.telephoto)
+        HStack(spacing: 14) {
+            if cam.availableCameras.contains(.ultraWide) {
+                lensChip(title: String(format: "%.1fx", Double(cam.ultraWideNativeZoom)),
+                         selected: cam.isAtZoom(cam.ultraWideNativeZoom)) {
+                    cam.setLensZoom(.ultraWide)
                 }
             }
             if cam.availableCameras.contains(.wide) {
@@ -773,25 +764,24 @@ struct CameraView: View {
                     cam.setLensZoom(.wide1x)
                 }
             }
-            if cam.availableCameras.contains(.ultraWide) {
-                lensChip(title: String(format: "%.1fx", Double(cam.ultraWideNativeZoom)),
-                         selected: cam.isAtZoom(cam.ultraWideNativeZoom)) {
-                    cam.setLensZoom(.ultraWide)
+            if cam.availableCameras.contains(.telephoto) {
+                lensChip(title: cam.telephotoLensLabel,
+                         selected: cam.isAtZoom(cam.telephotoNativeZoom)) {
+                    cam.setLensZoom(.telephoto)
                 }
             }
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 2)
-        .background(Capsule().fill(GC.lensCapsule))
+        .padding(2)
+        .background(Capsule().fill(GC.toggleCapsule))
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(selected ? Color(white: 0.15) : .white)
-                .frame(width: 38, height: 38)
-                .background(Circle().fill(selected ? GC.lensSelected : Color.clear))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(selected ? Color(white: 0.2) : GC.toggleText)
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(selected ? GC.toggleSelected : Color.clear))
         }
         .disabled(cam.isBusy)
     }
@@ -806,10 +796,10 @@ struct CameraView: View {
             Spacer(minLength: 0)
             ZStack {
                 flipCameraButton
-                    .offset(x: -126)
+                    .offset(x: -120)
                 shutterButton
                 galleryButton
-                    .offset(x: 126)
+                    .offset(x: 120)
             }
             .frame(maxWidth: .infinity)
             Spacer(minLength: 0)
@@ -821,10 +811,10 @@ struct CameraView: View {
         return Button(action: { cam.toggleFrontCamera() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(GC.flipRing.opacity(enabled ? 1 : 0.3), lineWidth: 2.3)
-                    .frame(width: 59, height: 59)
+                    .strokeBorder(GC.flipRing.opacity(enabled ? 1 : 0.3), lineWidth: 2)
+                    .frame(width: 52, height: 52)
                 Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 23, weight: .regular))
+                    .font(.system(size: 20, weight: .regular))
                     .foregroundColor(GC.flipRing.opacity(enabled ? 1 : 0.3))
             }
         }
@@ -906,7 +896,7 @@ struct CameraView: View {
     /// from behind the thumbnail carrying a chevron and a pink-violet disc. A new shot
     /// grows from 55% over the previous one with a faint ripple expanding behind.
     private var galleryButton: some View {
-        let d: CGFloat = 56.5
+        let d: CGFloat = 50
         let shown = displayedThumb ?? cam.lastThumbnail
         let mergeFrac = cam.isProcessing ? max(0.03, min(1, (Double(cam.progress) - 0.15) / 0.85)) : 1
         return Button(action: { if !cam.isBusy { showGallery = true } }) {
@@ -977,7 +967,7 @@ struct CameraView: View {
         }
         .frame(width: d, height: d)
         .clipShape(Circle())
-        .overlay(Circle().strokeBorder(GC.ring, lineWidth: 2.3))
+        .overlay(Circle().strokeBorder(GC.ring, lineWidth: 2))
     }
 
     /// New thumbnail: grows from 55% over the previous one, ripple expands and fades.
@@ -1399,6 +1389,9 @@ struct CameraView: View {
                     ispRow("k_shrink", $cam.tuningParams.k_shrink, 0.25...4.0, "%.2f")
                     Text("Shape of the merge kernels along/across edges. 460-main: k_stretch 4, k_shrink 2. Higher stretch elongates kernels along edges; higher shrink narrows them across edges (sharper, noisier).")
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("16-Gradient Structure Tensor", isOn: $cam.tuningParams.kernel_tensor16)
+                    Text("Measures edge direction and strength for the merge kernels from 16 gradients per pixel instead of 4: GCam's structure tensor, which takes four gradients (at the blue site, at the red site and along both green diagonals) at each of 2x2 positions on the raw Bayer greens. The kernel shapes are then built exactly as before (k_detail, k_denoise, k_stretch, k_shrink); GCam's own merge kernel is not used. On by default; off = the original 4 gradients of the averaged grey.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Motion Model")) {
@@ -1515,6 +1508,9 @@ struct CameraView: View {
                         ispRow("Robustness Noise (0=device, 1=paper)", $cam.tuningParams.gcam_sabre_rob_noise, 0.0...1.0, "%.2f")
                         ispRow("Motion Boost (×)", $cam.tuningParams.gcam_sabre_boost, 1.0...16.0, "%.1f")
                         ispRow("Motion Boost Threshold (UV)", $cam.tuningParams.gcam_sabre_motion_thresh, 0.0...0.001, "%.5f")
+                        ispRow("Motion Boost Texture Gate (× noise)", $cam.tuningParams.gcam_sabre_boost_var_mult, 1.0...100.0, "%.0f")
+                        Text("The boost only arms where the reference is textured: its local variance must exceed this many times the noise (GCam = 25). Lower = the boost also arms on weaker texture (more rejection in low-contrast areas); higher = only strong texture.")
+                            .font(.footnote).foregroundColor(.secondary)
                         ispRow("Green-Only Trigger", $cam.tuningParams.gcam_sabre_green_factor, 0.0...8.0, "%.2f")
                         ispRow("Strictness RGB (mult)", $cam.tuningParams.gcam_sabre_mult_rgb, 0.0...0.5, "%.3f")
                         ispRow("Strictness Green (mult)", $cam.tuningParams.gcam_sabre_mult_green, 0.0...1.0, "%.3f")
@@ -1892,7 +1888,7 @@ fileprivate enum GC {
         startPoint: .topTrailing, endPoint: .bottomLeading)
 }
 
-/// The GCam shutter: 83 pt outer ring (3 pt), black gap, 61.5 pt disc. The disc
+/// The GCam shutter: 76 pt outer ring (2.8 pt), black gap, 56 pt disc. The disc
 /// switches colour with no transition while pressed (or during the post-tap flash).
 fileprivate struct GCamShutterStyle: ButtonStyle {
     var flash: Bool
@@ -1906,12 +1902,12 @@ fileprivate struct GCamShutterStyle: ButtonStyle {
             : (capturing ? GC.capturingGrey : (pressed ? GC.shutterPressed : GC.shutterDisc))
         return ZStack {
             Circle()
-                .strokeBorder(capturing ? GC.capturingGrey : GC.ring.opacity(locked ? 0.35 : 1), lineWidth: 3)
-                .frame(width: 83, height: 83)
+                .strokeBorder(capturing ? GC.capturingGrey : GC.ring.opacity(locked ? 0.35 : 1), lineWidth: 2.8)
+                .frame(width: 76, height: 76)
                 .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
             Circle()
                 .fill(disc)
-                .frame(width: 61.5, height: 61.5)
+                .frame(width: 56, height: 56)
                 .animation(capturing ? .easeIn(duration: 0.1) : nil, value: capturing)
                 .animation(nil, value: pressed)
             if locked {

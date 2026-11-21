@@ -98,6 +98,8 @@ struct TuningParams: Equatable, Codable {
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
+    /// Merge-kernel structure tensor from 16 Bayer-green gradients (GCam's tensor) instead of 4.
+    var kernel_tensor16: Bool = true
     var snr_auto_tune: Bool = false
     var alignment_tile_size: Int = 16
     /// Offset (-5...+5) applied to the coarsest pyramid level's block-match search radius.
@@ -602,7 +604,7 @@ struct TuningParams: Equatable, Codable {
         case hf_min_texture_snr
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
-        case k_detail, k_denoise, k_stretch, k_shrink
+        case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -689,6 +691,7 @@ struct TuningParams: Equatable, Codable {
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        kernel_tensor16 = try c.decodeIfPresent(Bool.self, forKey: .kernel_tensor16) ?? kernel_tensor16
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         coarsest_search_radius_delta = try c.decodeIfPresent(Int.self, forKey: .coarsest_search_radius_delta) ?? coarsest_search_radius_delta
@@ -2643,6 +2646,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
+            "kernel_tensor16": NSNumber(value: tuningParams.kernel_tensor16),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "coarsest_search_radius_delta": NSNumber(value: tuningParams.coarsest_search_radius_delta),

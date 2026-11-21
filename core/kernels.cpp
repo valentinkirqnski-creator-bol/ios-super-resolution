@@ -1,6 +1,7 @@
 #include "stages.h"
 #include "parallel.h"
 #include "linalg.h"
+#include "tensor16_shared.h"
 #ifdef __APPLE__
 #include "metal_gpu.h"
 #endif
@@ -58,17 +59,39 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };
 
-    Image grey = compute_grey_decimate(raw, cfg.bayer_mode);
-    Image vst = apply_gat(grey, cfg.noise_alpha(), cfg.noise_beta());
-    Image grad = compute_gradients(vst); // [gh-1, gw-1, 2]
+    // 16-gradient Bayer tensor (Config::kernel_tensor16): needs the raw quads, not the grey.
+    const bool t16 = cfg.kernel_tensor16 && cfg.bayer_mode &&
+                     raw.data.size() >= (size_t)raw.h * (size_t)raw.w && raw.h >= 2 && raw.w >= 2;
+    int t16_ry = 0, t16_rx = 0, t16_by = 0, t16_bx = 0;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            const uint8_t c = cfg.cfa.p[i][j];
+            if (c == 0) { t16_ry = i; t16_rx = j; } else if (c == 2) { t16_by = i; t16_bx = j; }
+        }
+    const int t16_blue_top = (t16_by == 0) ? 1 : 0;
+    const int t16_diag = (cfg.cfa.p[0][0] == 1) ? 1 : 0;
+    const f32 na = cfg.noise_alpha(), nb = cfg.noise_beta();
 
-    int H = vst.h, W = vst.w;
+    Image grey, vst, grad;
+    if (!t16) {
+        grey = compute_grey_decimate(raw, cfg.bayer_mode);
+        vst = apply_gat(grey, na, nb);
+        grad = compute_gradients(vst); // [gh-1, gw-1, 2]
+    }
+
+    int H = t16 ? raw.h / 2 : vst.h, W = t16 ? raw.w / 2 : vst.w;
     CovField covs(H, W);
 
     parallel_rows(H, cfg.num_threads, [&](int y) {
         for (int x = 0; x < W; ++x) {
-            // Structure tensor over 2x2 gradient neighborhood (cuda_estimate_kernel)
             f32 s00 = 0, s01 = 0, s11 = 0;
+            if (t16) {
+                f32 S[3];
+                t16_structure(raw.data.data(), raw.w, H, W, t16_ry, t16_rx, t16_by, t16_bx,
+                              t16_blue_top, t16_diag, na, nb, y, x, S);
+                s00 = S[0]; s01 = S[1]; s11 = S[2];
+            } else {
+            // Structure tensor over 2x2 gradient neighborhood (cuda_estimate_kernel)
             for (int i = 0; i < 2; ++i) {
                 for (int j = 0; j < 2; ++j) {
                     int gy = y - 1 + i, gx = x - 1 + j;
@@ -78,6 +101,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
                     s01 += gxv * gyv;
                     s11 += gyv * gyv;
                 }
+            }
             }
             f32 l[2], e1[2], e2[2];
             eigen_elmts_2x2(s00, s01, s01, s11, l, e1, e2);

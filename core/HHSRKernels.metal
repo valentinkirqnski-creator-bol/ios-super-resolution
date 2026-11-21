@@ -11,6 +11,8 @@ using namespace metal;
 #include "robustness_refine_shared.h"
 // tools/robust_nn: learned refinement of the robustness mask (rnn_refine_mask).
 #include "robust_nn_shared.h"
+// 16-gradient merge-kernel structure tensor (Config::kernel_tensor16), shared with kernels.cpp.
+#include "tensor16_shared.h"
 
 constant float PI = 3.14159265358979323846f;
 
@@ -1813,6 +1815,42 @@ kernel void kernel_estimate_cov(device float* covs [[buffer(0)]],
     covs[base + 1u] = xy;
     if (stride == 4u) {
         covs[base + 2u] = xy;   // yx, a duplicate of xy; never read
+        covs[base + 3u] = yy;
+    } else {
+        covs[base + 2u] = yy;
+    }
+}
+
+// kernel_estimate_cov with the 16-gradient Bayer structure tensor (t16_structure, the
+// same text kernels.cpp runs) in place of the 4 grey gradients; reads the raw directly.
+// t16 = (ry, rx, by, bx, blue_top, diag, 0, 0).
+kernel void kernel_estimate_cov16(device float* covs [[buffer(0)]],
+                                  device const float* raw [[buffer(1)]],
+                                  constant KernelEstParams& p [[buffer(2)]],
+                                  constant int* t16 [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
+    float S[3];
+    t16_structure(raw, int(p.raw_w), int(p.grey_h), int(p.grey_w),
+                  t16[0], t16[1], t16[2], t16[3], t16[4], t16[5],
+                  p.alpha, p.beta, int(gid.y), int(gid.x), S);
+
+    float l[2], e1[2], e2[2];
+    eigen_elmts_2x2(S[0], S[1], S[1], S[2], l, e1, e2);
+
+    float k1, k2;
+    compute_k_cpu(l[0], l[1], k1, k2, p);
+
+    float k1s = k1 * k1, k2s = k2 * k2;
+    const uint stride = (p.cov_stride == 3u) ? 3u : 4u;
+    uint base = (gid.y * p.grey_w + gid.x) * stride;
+    const float xx = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0];
+    const float xy = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1];
+    const float yy = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
+    covs[base + 0u] = xx;
+    covs[base + 1u] = xy;
+    if (stride == 4u) {
+        covs[base + 2u] = xy;
         covs[base + 3u] = yy;
     } else {
         covs[base + 2u] = yy;

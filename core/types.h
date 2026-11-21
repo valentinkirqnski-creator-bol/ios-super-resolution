@@ -2173,6 +2173,13 @@ struct Config {
     // anisotropy ramp); 460-main uses 'hard_threshold' (snap past A=1.95). They
     // coincide at A==1 and A==2 and differ only for moderately anisotropic tiles.
     SelectionLaw selection = SelectionLaw::Linear;
+    // Merge-kernel structure tensor from 16 gradients instead of 4 (core/tensor16_shared.h):
+    // GCam's ComputeStructureTensorFromGreen -- per Bayer quad, four green-derived gradients
+    // (blue site, red site, two green diagonals) at each of 2x2 positions, averaged and
+    // rotated 45 degrees -- on GAT-domain greens, in the standard estimator's units, then the
+    // usual compute_k / covariance. Not GCam's covariance or merge kernel (gcam_sabre_kernel).
+    // Bayer only; off = the 2x2-cell gradients of the quad-averaged grey (4 gradients).
+    bool  kernel_tensor16 = true;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune

@@ -132,6 +132,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("k_denoise")) cfg.k_denoise = fv("k_denoise");
     if (has("k_stretch")) cfg.k_stretch = fv("k_stretch");
     if (has("k_shrink"))  cfg.k_shrink  = fv("k_shrink");
+    if (has("kernel_tensor16")) cfg.kernel_tensor16 = bv("kernel_tensor16");
     if (has("snr_auto_tune")) cfg.snr_auto_tune = bv("snr_auto_tune");
 
     // --- alignment ---
