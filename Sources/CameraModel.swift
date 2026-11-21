@@ -376,6 +376,11 @@ struct TuningParams: Equatable, Codable {
     var sabre_mali_noise_model: Bool = false
     var sabre_save_accumulated_mask: Bool = false
     var sabre_save_reference: Bool = false
+    var sabre_kernel_override: Bool = false
+    var sabre_k_detail: Float = 0.29
+    var sabre_k_denoise: Float = 3.5
+    /// 0 = Auto (the aligner's SNR rule), else 16 / 32 / 64.
+    var sabre_align_tile: Int = 0
     var sabre_resid_shift_enabled: Bool = false
     var sabre_rejection_only_1x: Bool = true
     var sabre_frame_drop: Bool = false
@@ -639,7 +644,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_save_reference, sabre_resid_shift_enabled, sabre_rejection_only_1x, sabre_frame_drop, sabre_wronski_kernels, sabre_overlap_lk, sabre_flow_bilinear, sabre_base_kernel_blur,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale, sabre_noise_scale, sabre_noise_blind, sabre_mali_exact, sabre_mali_gpu, sabre_mali_noise_model, sabre_save_accumulated_mask, sabre_save_reference, sabre_kernel_override, sabre_k_detail, sabre_k_denoise, sabre_align_tile, sabre_resid_shift_enabled, sabre_rejection_only_1x, sabre_frame_drop, sabre_wronski_kernels, sabre_overlap_lk, sabre_flow_bilinear, sabre_base_kernel_blur,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -830,6 +835,10 @@ struct TuningParams: Equatable, Codable {
         sabre_mali_noise_model = try c.decodeIfPresent(Bool.self, forKey: .sabre_mali_noise_model) ?? sabre_mali_noise_model
         sabre_save_accumulated_mask = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_accumulated_mask) ?? sabre_save_accumulated_mask
         sabre_save_reference = try c.decodeIfPresent(Bool.self, forKey: .sabre_save_reference) ?? sabre_save_reference
+        sabre_kernel_override = try c.decodeIfPresent(Bool.self, forKey: .sabre_kernel_override) ?? sabre_kernel_override
+        sabre_k_detail = try c.decodeIfPresent(Float.self, forKey: .sabre_k_detail) ?? sabre_k_detail
+        sabre_k_denoise = try c.decodeIfPresent(Float.self, forKey: .sabre_k_denoise) ?? sabre_k_denoise
+        sabre_align_tile = try c.decodeIfPresent(Int.self, forKey: .sabre_align_tile) ?? sabre_align_tile
         sabre_resid_shift_enabled = try c.decodeIfPresent(Bool.self, forKey: .sabre_resid_shift_enabled) ?? sabre_resid_shift_enabled
         sabre_rejection_only_1x = try c.decodeIfPresent(Bool.self, forKey: .sabre_rejection_only_1x) ?? sabre_rejection_only_1x
         sabre_frame_drop = try c.decodeIfPresent(Bool.self, forKey: .sabre_frame_drop) ?? sabre_frame_drop
@@ -2741,6 +2750,10 @@ final class CameraModel: NSObject, ObservableObject {
             "sabre_mali_noise_model": NSNumber(value: tuningParams.sabre_mali_noise_model),
             "sabre_save_accumulated_mask": NSNumber(value: tuningParams.sabre_save_accumulated_mask),
             "sabre_save_reference": NSNumber(value: tuningParams.sabre_save_reference),
+            "sabre_kernel_override": NSNumber(value: tuningParams.sabre_kernel_override),
+            "sabre_k_detail": NSNumber(value: tuningParams.sabre_k_detail),
+            "sabre_k_denoise": NSNumber(value: tuningParams.sabre_k_denoise),
+            "sabre_align_tile": NSNumber(value: tuningParams.sabre_align_tile),
             "sabre_resid_shift_enabled": NSNumber(value: tuningParams.sabre_resid_shift_enabled),
             "sabre_rejection_only_1x": NSNumber(value: tuningParams.sabre_rejection_only_1x),
             "sabre_frame_drop": NSNumber(value: tuningParams.sabre_frame_drop),

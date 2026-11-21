@@ -1243,10 +1243,28 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("GCam SABRE 8.2 (full pipeline)", isOn: $cam.tuningParams.robustness_gcam_enabled)
                     Text("""
-                         Runs Google Camera 8.2's SABRE (Super Res Zoom) for everything after alignment, reimplemented from the recovered shaders and native code: square-root RGB guide with a signed local variance that switches fine detail to green-only rejection, green-channel structure tensor and anisotropic kernel per frame (kernel shape follows the burst's SNR and frame count through GCam's tuning curves), clipped-highlight rejection for brightened frames, the block-artifact Unblocker from the base frame, rejection against the filtered base frame (noise-subtracted colour difference in units of variance, x6 motion boost), 5x5 dilate, the anisotropic RBF merge and the separate dehomogenize. Alignment is the Handheld-SR package's aligner (Downloads/alignment, ported to C++): decimated grey, SNR-based tile sizes, block matching + ICA on a 5-level pyramid, 16x16 tiles at stride 8 and a 3x3 median, handed to SABRE as one flow vector per 16 px; none of the app's own alignment settings apply. Every other robustness, mask, kernel and merge setting is ignored while this is on. Not bit-exact everywhere: the noise table is computed from the DNG noise profile (GCam's own fill wasn't recovered and differs in the darkest tones). Runs on the GPU. Off by default.
+                         Runs Google Camera 8.2's SABRE (Super Res Zoom) for everything after alignment, reimplemented from the recovered shaders and native code: square-root RGB guide with a signed local variance that switches fine detail to green-only rejection, green-channel structure tensor and anisotropic kernel per frame (kernel shape follows the burst's SNR and frame count through GCam's tuning curves), clipped-highlight rejection for brightened frames, the block-artifact Unblocker from the base frame, rejection against the filtered base frame (noise-subtracted colour difference in units of variance, x6 motion boost), 5x5 dilate, the anisotropic RBF merge and the separate dehomogenize. Alignment is the Handheld-SR package's aligner (Downloads/alignment, ported to C++): decimated grey, SNR-based tile sizes, block matching + ICA on a 5-level pyramid, 16x16 tiles at stride 8 and a 3x3 median, handed to SABRE as one flow vector per 16 px; none of the app's own alignment settings apply. Every other robustness, mask, kernel and merge setting is ignored while this is on. Not bit-exact everywhere: the noise table is computed from the DNG noise profile (GCam's own fill wasn't recovered and differs in the darkest tones). Runs on the GPU, alignment included (the CPU takes over automatically if the GPU is unavailable). Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_gcam_enabled {
+                        Picker("SABRE Alignment Tile Size", selection: $cam.tuningParams.sabre_align_tile) {
+                            Text("Auto").tag(0)
+                            Text("16").tag(16)
+                            Text("32").tag(32)
+                            Text("64").tag(64)
+                        }
+                        .pickerStyle(.segmented)
+                        Text("The aligner's tile size (grey pixels, i.e. 2x in raw pixels) at full resolution, where block matching and the sub-pixel refinement run. Auto = the Handheld-SR package's rule from the reference frame's SNR: 64 at 14 dB or below, 32 up to 22 dB, 16 above. Smaller tiles follow motion that changes across the frame (parallax, rotation, foliage) but lock on less reliably in noise or flat areas; larger tiles are steadier but average motion over a bigger area. The final flow is always one vector per 16 raw px. Auto by default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SABRE Custom Kernel (k_detail / k_denoise)", isOn: $cam.tuningParams.sabre_kernel_override)
+                        Text("Replaces two of GCam's per-capture kernel curves with fixed values. k_detail is the base kernel size (raw pixels): GCam uses 0.33 in low light down to 0.25 in good light; larger = softer and fewer stair-step / diamond artifacts where only the reference frame is used, smaller = sharper. k_denoise is how much wider the kernel gets in flat areas (a multiple of k_detail): GCam uses 4.2 down to 3.0; larger = smoother flat areas. The edge shrink / stretch curves stay GCam's. GCam's 10-bit kernel storage limits the range: below about 0.30 k_detail no longer sharpens edges, and above about 1.65 for k_detail x k_denoise flat areas no longer get smoother. Off = GCam's curves.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        if cam.tuningParams.sabre_kernel_override {
+                            ispRow("k_detail", $cam.tuningParams.sabre_k_detail, 0.10...1.00, "%.2f")
+                                .padding(.leading, 16)
+                            ispRow("k_denoise", $cam.tuningParams.sabre_k_denoise, 1.0...8.0, "%.2f")
+                                .padding(.leading, 16)
+                        }
                         ispRow("SABRE Noise Scale", $cam.tuningParams.sabre_noise_scale, 0.0...8.0, "%.2f")
                         Text("Multiplies the simulated noise table the rejection subtracts and floors against. 1 = as estimated from the DNG noise profile; higher keeps more of each frame (brighter mask, more noise reduction), lower rejects more (0 = noise-blind).")
                             .font(.footnote).foregroundColor(.secondary)

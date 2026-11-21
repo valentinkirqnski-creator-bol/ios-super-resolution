@@ -95,9 +95,10 @@ kernel void s82_dilate_kernel(device const uint8_t* rej [[buffer(0)]],
     keep[oy * size.z + ox] = s82_to_u8(s82_dilate_pixel(rej, size.x, size.y, size.z, size.w, ox, oy));
 }
 
-// kMergeEntryPoint, one frame into the band accumulators (additive blend).
+// kMergeEntryPoint, one frame into the band accumulators (additive blend). cov = the RGB10_A2 codes (0..1023) of the
+// guide rows the band reads, sampled LINEAR exactly as the CPU samples them as floats.
 kernel void s82_merge_kernel(device const float* raw     [[buffer(0)]],
-                             device const float* cov     [[buffer(1)]],
+                             device const ushort* cov    [[buffer(1)]],
                              device const float* flow    [[buffer(2)]],
                              device const uint8_t* mask  [[buffer(3)]],
                              constant S82MergeParams& P  [[buffer(4)]],
@@ -110,7 +111,7 @@ kernel void s82_merge_kernel(device const float* raw     [[buffer(0)]],
     if (ox >= P.Wo || ly >= nrows) return;
     const S82MergeParams p = P;
     float c3[3], w3[3];
-    s82_merge_pixel(raw, cov, flow, mask, p, ox, p.out_row0 + ly, c3, w3);
+    s82_merge_pixel_u16(raw, cov, flow, mask, p, ox, p.out_row0 + ly, c3, w3);
     const int i = (ly * p.Wo + ox) * 3;
     for (int k = 0; k < 3; ++k) { accC[i + k] += c3[k]; accW[i + k] += w3[k]; }
 }

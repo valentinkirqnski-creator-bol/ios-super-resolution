@@ -213,6 +213,24 @@ S82_INLINE void s82_linear_plane(const S82_DEVICE float* p, int W, int H, int C,
         out[c] = a * (1.0f - ay) + b * ay;
     }
 }
+// The same LINEAR fetch from the RGB10_A2 codes themselves (code / 1023 at the texel, as the float plane holds them).
+S82_INLINE void s82_linear_plane_u16(const S82_DEVICE S82_U16* p, int W, int H, int C, int row0, int nrows,
+                                     float u, float v, S82_THREAD float* out) {
+    const float x = u * (float)W - 0.5f, y = v * (float)H - 0.5f;
+    const float fx = s82_floor(x), fy = s82_floor(y);
+    const float ax = x - fx, ay = y - fy;
+    const int x0 = s82_clampi((int)fx, 0, W - 1), x1 = s82_clampi((int)fx + 1, 0, W - 1);
+    const int y0 = s82_clampi(s82_clampi((int)fy, 0, H - 1) - row0, 0, nrows - 1);
+    const int y1 = s82_clampi(s82_clampi((int)fy + 1, 0, H - 1) - row0, 0, nrows - 1);
+    const float k = 1.0f / 1023.0f;
+    for (int c = 0; c < C; ++c) {
+        const float p00 = (float)p[((long)y0 * W + x0) * C + c] * k, p01 = (float)p[((long)y0 * W + x1) * C + c] * k;
+        const float p10 = (float)p[((long)y1 * W + x0) * C + c] * k, p11 = (float)p[((long)y1 * W + x1) * C + c] * k;
+        const float a = p00 * (1.0f - ax) + p01 * ax;
+        const float b = p10 * (1.0f - ax) + p11 * ax;
+        out[c] = a * (1.0f - ay) + b * ay;
+    }
+}
 S82_INLINE float s82_nearest_u8(const S82_DEVICE uint8_t* p, int W, int H, float u, float v) {
     const int x = s82_clampi((int)s82_floor(u * (float)W), 0, W - 1);
     const int y = s82_clampi((int)s82_floor(v * (float)H), 0, H - 1);
@@ -1029,10 +1047,10 @@ S82_INLINE float s82_resid_apply_pixel(const S82_DEVICE uint8_t* keep, const S82
 // ------------------------------------------------------------------------------------------------ merge
 // kMergeEntryPoint (ANDROID: zoomed_tc = tex_coord) for output pixel (ox, oy) of one frame. Returns the
 // frame's contribution (colour and weight per channel, already multiplied by frame_weight).
-S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE float* cov,
-                                const S82_DEVICE float* flow, const S82_DEVICE uint8_t* mask,
-                                S82MergeParams P, int ox, int oy,
-                                S82_THREAD float* color3, S82_THREAD float* weight3) {
+// Merge, split in two so the kernel covariance can be fetched from float texels (CPU) or the 10-bit codes (GPU):
+// st = (tcx, tcy, s.x, s.y, frame_weight) -- the output texel, the flow-displaced sample position, the mask weight.
+S82_INLINE void s82_merge_position(const S82_DEVICE float* flow, const S82_DEVICE uint8_t* mask, S82MergeParams P,
+                                   int ox, int oy, S82_THREAD float* st) {
     const float tcx = ((float)ox + 0.5f) / (float)P.Wo, tcy = ((float)oy + 0.5f) / (float)P.Ho;
     float frame_weight = 1.0f;
     // The dilated mask is sampled LINEAR (burst9_GT2 teacher-forced merge: 99.7% of the >2% errors under NEAREST
@@ -1044,8 +1062,15 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
     float s[2];
     s[0] = tcx + fl.x; s[1] = tcy + fl.y;
     s82_mirror(s, P.fbp);
-    float c[3];
-    s82_linear_plane(cov, P.Wg, P.Hg, 3, P.cov_row0, P.cov_nrows, s[0], s[1], c);
+    st[0] = tcx; st[1] = tcy; st[2] = s[0]; st[3] = s[1]; st[4] = frame_weight;
+}
+// c = the covariance texel fetched at (st[2], st[3]), still packed (0..1).
+S82_INLINE void s82_merge_accumulate(const S82_DEVICE float* raw, const S82_DEVICE uint8_t* mask, S82MergeParams P,
+                                     const S82_THREAD float* st, S82_THREAD float* c,
+                                     S82_THREAD float* color3, S82_THREAD float* weight3) {
+    const float tcx = st[0], tcy = st[1], frame_weight = st[4];
+    float s[2];
+    s[0] = st[2]; s[1] = st[3];
     c[0] = c[0] * P.unpack_rg[1] + P.unpack_rg[0];   // UNPACK_COV_RG
     c[1] = c[1] * P.unpack_rg[3] + P.unpack_rg[2];
     c[2] = c[2] * P.unpack_b[1] + P.unpack_b[0];     // UNPACK_COV_B
@@ -1075,6 +1100,24 @@ S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE fl
     }
     color3[0] = ai0 * frame_weight; color3[1] = ai1 * frame_weight; color3[2] = ai2 * frame_weight;
     weight3[0] = aw0 * frame_weight; weight3[1] = aw1 * frame_weight; weight3[2] = aw2 * frame_weight;
+}
+S82_INLINE void s82_merge_pixel(const S82_DEVICE float* raw, const S82_DEVICE float* cov,
+                                const S82_DEVICE float* flow, const S82_DEVICE uint8_t* mask,
+                                S82MergeParams P, int ox, int oy,
+                                S82_THREAD float* color3, S82_THREAD float* weight3) {
+    float st[5], c[3];
+    s82_merge_position(flow, mask, P, ox, oy, st);
+    s82_linear_plane(cov, P.Wg, P.Hg, 3, P.cov_row0, P.cov_nrows, st[2], st[3], c);
+    s82_merge_accumulate(raw, mask, P, st, c, color3, weight3);
+}
+S82_INLINE void s82_merge_pixel_u16(const S82_DEVICE float* raw, const S82_DEVICE S82_U16* cov,
+                                    const S82_DEVICE float* flow, const S82_DEVICE uint8_t* mask,
+                                    S82MergeParams P, int ox, int oy,
+                                    S82_THREAD float* color3, S82_THREAD float* weight3) {
+    float st[5], c[3];
+    s82_merge_position(flow, mask, P, ox, oy, st);
+    s82_linear_plane_u16(cov, P.Wg, P.Hg, 3, P.cov_row0, P.cov_nrows, st[2], st[3], c);
+    s82_merge_accumulate(raw, mask, P, st, c, color3, weight3);
 }
 
 #endif  // HHSR_SABRE82_SHARED_H

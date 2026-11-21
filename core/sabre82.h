@@ -45,6 +45,8 @@ struct CovTuning {
     float snr = 0.f, K = 0.f;
 };
 CovTuning cov_tuning(float snr, int num_frames);
+// Config::sabre_kernel_override: p0 (k_detail) and p1 (k_denoise) replaced by fixed values (> 0), cov1 / cov2 recomputed.
+void override_kernel(CovTuning& t, float k_detail, float k_denoise);
 // green_clipping_point (FUN_012c1998): FLT_MAX when K*wb_G1 >= 1 (the base frame, and any frame not brighter
 // than it), else 0.5*K*(wb_G1 + wb_G2)*(white - 3)/white -- compared against the guide's sqrt-space green.
 // K = exposure gain the loader applied to this frame (1 for the base); wb_G = 1 in our green-normalized space.

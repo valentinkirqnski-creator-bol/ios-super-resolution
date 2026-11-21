@@ -1,21 +1,16 @@
 // Port of Handheld-Multi-Frame-Super-Resolution/alignment (Halide) -- see hsr_align.h.
 #include "hsr_align.h"
+#include "hsr_align_shared.h"
 #include "parallel.h"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 namespace hhsr {
 namespace hsra {
 
 namespace {
-inline int round_even(float v) { return (int)std::nearbyint(v); }   // Halide::round: ties to even
-inline float clampf1(float v) { return v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v); }
-inline float flow_edge(const std::vector<float>& f, int nx, int ny, int x, int y) {
-    x = x < 0 ? 0 : (x >= nx ? nx - 1 : x);
-    y = y < 0 ? 0 : (y >= ny ? ny - 1 : y);
-    return f[(size_t)y * nx + x];
-}
 // Undo the loaders' white-balance prewhitening: the package aligns on the raw without white balance.
 inline float unwhite_gain(const Config& cfg, int c) {
     if (!cfg.raw_prewhitened || c < 0 || c > 2) return 1.f;
@@ -25,11 +20,12 @@ inline float unwhite_gain(const Config& cfg, int c) {
 }  // namespace
 
 // ------------------------------------------------------------------------------------------- settings
-Options options_for_snr(float snr_db) {
+Options options_for_snr(float snr_db, int force_tile) {
     Options o;
     const float snr = std::min(30.f, std::max(6.f, std::isfinite(snr_db) ? snr_db : 6.f));
     o.snr_db = snr;
     o.base_tile = snr <= 14.f ? 64 : (snr <= 22.f ? 32 : 16);
+    if (force_tile == 16 || force_tile == 32 || force_tile == 64) o.base_tile = force_tile;
     o.tiles.assign(1, o.base_tile);
     double cap = 64.0;
     for (size_t level = 1; level < o.radii.size(); ++level) {
@@ -41,45 +37,58 @@ Options options_for_snr(float snr_db) {
 }
 
 float estimate_image_snr_db(const Image& raw, const Config& cfg) {
-    double top = 0.0, bot = 0.0;
     const int H = raw.h & ~1, W = raw.w & ~1;
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            int c = cfg.cfa.p[y & 1][x & 1];
+    if (H <= 0 || W <= 0 || raw.data.size() < (size_t)raw.h * raw.w) return 6.f;
+    int site_c[2][2];
+    float site_g[2][2];
+    for (int sy = 0; sy < 2; ++sy)
+        for (int sx = 0; sx < 2; ++sx) {
+            int c = cfg.cfa.p[sy][sx];
             if (c < 0 || c > 2) c = 1;
-            const float v = raw.data[(size_t)y * raw.w + x] * unwhite_gain(cfg, c);
+            site_c[sy][sx] = c;
+            site_g[sy][sx] = unwhite_gain(cfg, c);
+        }
+    // Per-row double sums (rows in parallel), added in row order: deterministic.
+    std::vector<double> row_top((size_t)H, 0.0), row_bot((size_t)H, 0.0);
+    parallel_rows(H, 0, [&](int y) {
+        double top = 0.0, bot = 0.0;
+        const float* r = raw.data.data() + (size_t)y * raw.w;
+        for (int x = 0; x < W; ++x) {
+            const int c = site_c[y & 1][x & 1];
+            const float v = r[x] * site_g[y & 1][x & 1];
             if (!(v > 0.f && v < 1.f)) continue;
             top += (double)v * v;
             bot += (double)cfg.alpha_dng[c] * v + cfg.beta_dng[c];
         }
+        row_top[(size_t)y] = top;
+        row_bot[(size_t)y] = bot;
+    });
+    double top = 0.0, bot = 0.0;
+    for (int y = 0; y < H; ++y) { top += row_top[(size_t)y]; bot += row_bot[(size_t)y]; }
     if (!(bot > 0.0) || !(top > 0.0)) return 6.f;
     return (float)(20.0 * std::log10(std::sqrt(top / bot)));
+}
+
+void grey_gains(const Config& cfg, float g[4]) {
+    for (int sy = 0; sy < 2; ++sy)
+        for (int sx = 0; sx < 2; ++sx) g[sy * 2 + sx] = unwhite_gain(cfg, cfg.cfa.p[sy][sx]);
 }
 
 Plane grey_from_bayer(const Image& raw, const Config& cfg, int threads) {
     const int w = raw.w / 2, h = raw.h / 2;
     Plane q(w, h), t(w, h), out(w, h);
-    float g[2][2];
-    for (int sy = 0; sy < 2; ++sy)
-        for (int sx = 0; sx < 2; ++sx) g[sy][sx] = unwhite_gain(cfg, cfg.cfa.p[sy][sx]);
+    float g[4];
+    grey_gains(cfg, g);
     const float* r = raw.data.data();
     parallel_rows(h, threads, [&](int y) {
-        const float* r0 = r + (size_t)(2 * y) * raw.w;
-        const float* r1 = r0 + raw.w;
-        for (int x = 0; x < w; ++x)
-            q.at(x, y) = (((r0[2 * x] * g[0][0] + r0[2 * x + 1] * g[0][1]) + r1[2 * x] * g[1][0]) +
-                          r1[2 * x + 1] * g[1][1]) * 0.25f;
+        for (int x = 0; x < w; ++x) q.at(x, y) = hsra_grey_quad(r, raw.w, g[0], g[1], g[2], g[3], x, y);
     });
     // convolve1d([0.25, 0.5, 0.25], axis=0 then axis=1, mode="nearest")
     parallel_rows(h, threads, [&](int y) {
-        for (int x = 0; x < w; ++x)
-            t.at(x, y) = 0.25f * q.edge(x, y - 1) + 0.5f * q.at(x, y) + 0.25f * q.edge(x, y + 1);
+        for (int x = 0; x < w; ++x) t.at(x, y) = hsra_blur_v(q.d.data(), w, h, x, y);
     });
     parallel_rows(h, threads, [&](int y) {
-        for (int x = 0; x < w; ++x) {
-            const float v = 0.25f * t.edge(x - 1, y) + 0.5f * t.at(x, y) + 0.25f * t.edge(x + 1, y);
-            out.at(x, y) = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-        }
+        for (int x = 0; x < w; ++x) out.at(x, y) = hsra_blur_h_clip(t.d.data(), w, h, x, y);
     });
     return out;
 }
@@ -92,12 +101,10 @@ Plane downsample(const Plane& in, int factor, int threads) {
         const int w2 = cur.w / 2 + cur.w % 2, h2 = cur.h / 2 + cur.h % 2;
         Plane hz(w2, cur.h), out(w2, h2);
         parallel_rows(cur.h, threads, [&](int y) {
-            for (int x = 0; x < w2; ++x)
-                hz.at(x, y) = (cur.edge(2 * x - 1, y) + 2.0f * cur.edge(2 * x, y) + cur.edge(2 * x + 1, y)) * 0.25f;
+            for (int x = 0; x < w2; ++x) hz.at(x, y) = hsra_down_h(cur.d.data(), cur.w, cur.h, x, y);
         });
         parallel_rows(h2, threads, [&](int y) {
-            for (int x = 0; x < w2; ++x)
-                out.at(x, y) = (hz.edge(x, 2 * y - 1) + 2.0f * hz.edge(x, 2 * y) + hz.edge(x, 2 * y + 1)) * 0.25f;
+            for (int x = 0; x < w2; ++x) out.at(x, y) = hsra_down_v(hz.d.data(), w2, cur.h, x, y);
         });
         cur = std::move(out);
     }
@@ -109,21 +116,17 @@ void gradients(const Plane& in, int ts, Plane& gx, Plane& gy, Plane& sxx, Plane&
     gx = Plane(W, H); gy = Plane(W, H);
     parallel_rows(H, threads, [&](int y) {
         for (int x = 0; x < W; ++x) {
-            gx.at(x, y) = (in.edge(x - 2, y) - 8.0f * in.edge(x - 1, y) + 8.0f * in.edge(x + 1, y) - in.edge(x + 2, y)) / 12.0f;
-            gy.at(x, y) = (in.edge(x, y - 2) - 8.0f * in.edge(x, y - 1) + 8.0f * in.edge(x, y + 1) - in.edge(x, y + 2)) / 12.0f;
+            gx.at(x, y) = hsra_grad_x(in.d.data(), W, H, x, y);
+            gy.at(x, y) = hsra_grad_y(in.d.data(), W, H, x, y);
         }
     });
     const int tx_n = W / ts, ty_n = H / ts;
     sxx = Plane(tx_n, ty_n); sxy = Plane(tx_n, ty_n); syy = Plane(tx_n, ty_n);
     parallel_rows(ty_n, threads, [&](int ty) {
         for (int tx = 0; tx < tx_n; ++tx) {
-            float a = 0.0f, b = 0.0f, c = 0.0f;
-            for (int py = 0; py < ts; ++py)
-                for (int px = 0; px < ts; ++px) {
-                    const float u = gx.at(tx * ts + px, ty * ts + py), v = gy.at(tx * ts + px, ty * ts + py);
-                    a += u * u; b += u * v; c += v * v;
-                }
-            sxx.at(tx, ty) = a; sxy.at(tx, ty) = b; syy.at(tx, ty) = c;
+            float s3[3];
+            hsra_tile_structure(gx.d.data(), gy.d.data(), W, ts, tx, ty, s3);
+            sxx.at(tx, ty) = s3[0]; sxy.at(tx, ty) = s3[1]; syy.at(tx, ty) = s3[2];
         }
     });
 }
@@ -134,25 +137,11 @@ Flow block_matching(const Plane& ref, const Plane& mov, const Flow& init, int ts
     parallel_rows(rows, threads, [&](int ty) {
         for (int tx = 0; tx < cols; ++tx) {
             const size_t i = (size_t)ty * cols + tx;
-            const int cx = round_even(init.dx[i]), cy = round_even(init.dy[i]);
-            int bx = 0, by = 0;
-            float bc = INFINITY;
-            for (int sy = -radius; sy <= radius; ++sy)
-                for (int sx = -radius; sx <= radius; ++sx) {
-                    float cost = 0.0f;
-                    for (int py = 0; py < ts; ++py) {
-                        const int y = ty * ts + py;
-                        for (int px = 0; px < ts; ++px) {
-                            const int x = tx * ts + px;
-                            const float d = ref.at(x, y) - mov.edge(x + cx + sx, y + cy + sy);
-                            cost += l2 ? d * d : std::fabs(d);
-                        }
-                    }
-                    if (cost < bc) { bx = sx; by = sy; }
-                    bc = std::min(cost, bc);
-                }
-            out.dx[i] = (float)(cx + bx);
-            out.dy[i] = (float)(cy + by);
+            float o[2];
+            hsra_block_match_tile(ref.d.data(), mov.d.data(), ref.w, ref.h, init.dx[i], init.dy[i], ts, radius, l2 ? 1 : 0,
+                                  tx, ty, o);
+            out.dx[i] = o[0];
+            out.dy[i] = o[1];
         }
     });
     return out;
@@ -166,30 +155,11 @@ Flow ica(const Level& ref, const Plane& mov, const Flow& init, int iterations, i
         parallel_rows(rows, threads, [&](int ty) {
             for (int tx = 0; tx < cols; ++tx) {
                 const size_t i = (size_t)ty * cols + tx;
-                const float d0x = cur.dx[i], d0y = cur.dy[i];
-                float r0 = 0.0f, r1 = 0.0f;
-                for (int py = 0; py < ts; ++py) {
-                    const int y = ty * ts + py;
-                    for (int px = 0; px < ts; ++px) {
-                        const int x = tx * ts + px;
-                        const float wx = (float)x + d0x, wy = (float)y + d0y;
-                        const int ix = (int)std::floor(wx), iy = (int)std::floor(wy);
-                        const float fx = wx - (float)ix, fy = wy - (float)iy;
-                        const float a = mov.edge(ix, iy), b = mov.edge(ix + 1, iy);
-                        const float c = mov.edge(ix, iy + 1), d = mov.edge(ix + 1, iy + 1);
-                        const float top = a + fx * (b - a);
-                        const float bottom = c + fx * (d - c);
-                        const float warped = top + fy * (bottom - top);
-                        const float res = ref.img.at(x, y) - warped;
-                        r0 = r0 + ref.gx.at(x, y) * res;
-                        r1 = r1 + ref.gy.at(x, y) * res;
-                    }
-                }
-                const float a = ref.sxx.at(tx, ty), b = ref.sxy.at(tx, ty), c = ref.syy.at(tx, ty);
-                const float det = a * c - b * b + FLT_EPSILON;
-                const float ux = (c * r0 - b * r1) / det, uy = (a * r1 - b * r0) / det;
-                nxt.dx[i] = d0x + clampf1(ux);
-                nxt.dy[i] = d0y + clampf1(uy);
+                float o[2];
+                hsra_ica_tile(ref.img.d.data(), ref.gx.d.data(), ref.gy.d.data(), mov.d.data(), mov.w, mov.h, ts, tx, ty,
+                              cur.dx[i], cur.dy[i], ref.sxx.at(tx, ty), ref.sxy.at(tx, ty), ref.syy.at(tx, ty), o);
+                nxt.dx[i] = o[0];
+                nxt.dy[i] = o[1];
             }
         });
         cur = std::move(nxt);
@@ -201,57 +171,67 @@ Flow transfer_flow(const Flow& src, const Plane& ref, const Plane& mov, int tt, 
                    float flow_scale, float off_x, float off_y, int threads) {
     const int cols = (ref.w - tt) / stride + 1, rows = (ref.h - tt) / stride + 1;
     Flow out(cols, rows, tt, stride);
-    const float spacing = grid_scale_ratio * (float)stride;
+    HsraTransferParams P;
+    P.w = ref.w; P.h = ref.h; P.tt = tt; P.stride = stride; P.snx = src.nx; P.sny = src.ny;
+    P.spacing = grid_scale_ratio * (float)stride; P.flow_scale = flow_scale; P.off_x = off_x; P.off_y = off_y;
     parallel_rows(rows, threads, [&](int ty) {
         for (int tx = 0; tx < cols; ++tx) {
-            const float u = ((float)(tx * stride) - off_x) / spacing;
-            const float v = ((float)(ty * stride) - off_y) / spacing;
-            const int left = (int)std::floor(u), top = (int)std::floor(v);
-            const int nx = (int)std::floor(u + 0.5f), ny = (int)std::floor(v + 0.5f);
-            const int ox = nx == left ? left + 1 : left, oy = ny == top ? top + 1 : top;
-            const int cxs[3] = {nx, ox, nx}, cys[3] = {ny, ny, oy};
-            float cdx[3], cdy[3];
-            int best = 0;
-            float bc = INFINITY;
-            for (int c = 0; c < 3; ++c) {
-                cdx[c] = flow_edge(src.dx, src.nx, src.ny, cxs[c], cys[c]) * flow_scale;
-                cdy[c] = flow_edge(src.dy, src.nx, src.ny, cxs[c], cys[c]) * flow_scale;
-                const int sdx = round_even(cdx[c]), sdy = round_even(cdy[c]);
-                float cost = 0.0f;
-                for (int py = 0; py < tt; ++py) {
-                    const int y = ty * stride + py;
-                    for (int px = 0; px < tt; ++px) {
-                        const int x = tx * stride + px;
-                        cost += std::fabs(ref.edge(x, y) - mov.edge(x + sdx, y + sdy));
-                    }
-                }
-                if (cost < bc) best = c;
-                bc = std::min(cost, bc);
-            }
+            float o[2];
+            hsra_transfer_tile(src.dx.data(), src.dy.data(), ref.d.data(), mov.d.data(), P, tx, ty, o);
             const size_t i = (size_t)ty * cols + tx;
-            out.dx[i] = cdx[best];
-            out.dy[i] = cdy[best];
+            out.dx[i] = o[0];
+            out.dy[i] = o[1];
         }
     });
     return out;
+}
+
+Flow transfer_flow(const Flow& src, const Plane& ref, const Plane& mov, const HsraTransferParams& P, int threads) {
+    return transfer_flow(src, ref, mov, P.tt, P.stride, P.spacing / (float)P.stride, P.flow_scale, P.off_x, P.off_y,
+                         threads);
+}
+
+HsraTransferParams level_transfer_params(const Options& o, size_t source, int src_nx, int src_ny, int tw, int th) {
+    const size_t target = source - 1;
+    const int target_tile = o.tiles[target];
+    const int target_stride = target_tile;   // non-overlapping tiles between levels
+    const int src_tile = o.tiles[source], src_stride = o.tiles[source];
+    const float pixel_scale = (float)o.factors[target];
+    const float grid_scale_ratio = pixel_scale * (float)src_stride / (float)target_stride;
+    const float source_center_px = (float)src_tile * pixel_scale / 2.0f;
+    const float target_center_px = (float)target_tile / 2.0f;
+    const float offset_px = source_center_px - target_center_px;
+    HsraTransferParams P;
+    P.w = tw; P.h = th; P.tt = target_tile; P.stride = target_stride; P.snx = src_nx; P.sny = src_ny;
+    P.spacing = grid_scale_ratio * (float)target_stride; P.flow_scale = pixel_scale; P.off_x = offset_px; P.off_y = offset_px;
+    return P;
+}
+
+HsraTransferParams final_transfer_params(const Options& o, int src_nx, int src_ny, int w, int h) {
+    // Final overlapping grid: 16x16 tiles, stride 8, first tile corners aligned.
+    const int out_tile = 16, out_stride = 8;
+    const float grid_scale_ratio = (float)o.tiles[0] / (float)out_stride;
+    const float offset_px = (float)o.tiles[0] / 2.0f - (float)out_tile / 2.0f;
+    HsraTransferParams P;
+    P.w = w; P.h = h; P.tt = out_tile; P.stride = out_stride; P.snx = src_nx; P.sny = src_ny;
+    P.spacing = grid_scale_ratio * (float)out_stride; P.flow_scale = 1.0f; P.off_x = offset_px; P.off_y = offset_px;
+    return P;
+}
+
+void pyramid_dims(int w, int h, const Options& opt, std::vector<int>& ws, std::vector<int>& hs) {
+    ws.assign(1, w); hs.assign(1, h);
+    for (size_t i = 0; i < opt.factors.size(); ++i) {
+        for (int rem = opt.factors[i]; rem > 1; rem >>= 1) { w = w / 2 + w % 2; h = h / 2 + h % 2; }
+        ws.push_back(w); hs.push_back(h);
+    }
 }
 
 Flow median_filter(const Flow& src) {
     Flow out(src.nx, src.ny, src.tile, src.stride);
     for (int y = 0; y < src.ny; ++y)
         for (int x = 0; x < src.nx; ++x) {
-            float vx[9], vy[9];
-            int k = 0;
-            for (int j = -1; j <= 1; ++j)
-                for (int i = -1; i <= 1; ++i) {
-                    vx[k] = flow_edge(src.dx, src.nx, src.ny, x + i, y + j);
-                    vy[k] = flow_edge(src.dy, src.nx, src.ny, x + i, y + j);
-                    ++k;
-                }
-            std::nth_element(vx, vx + 4, vx + 9);
-            std::nth_element(vy, vy + 4, vy + 9);
-            out.dx[(size_t)y * src.nx + x] = vx[4];
-            out.dy[(size_t)y * src.nx + x] = vy[4];
+            out.dx[(size_t)y * src.nx + x] = hsra_median9(src.dx.data(), src.nx, src.ny, x, y);
+            out.dy[(size_t)y * src.nx + x] = hsra_median9(src.dy.data(), src.nx, src.ny, x, y);
         }
     return out;
 }
@@ -295,22 +275,12 @@ Flow align(const Pyramid& ref, const Pyramid& mov, int threads) {
         if (o.ica_iterations > 0) flow = ica(R, M, flow, o.ica_iterations, threads);
         if (level == 0) break;
         const size_t target = level - 1;
-        const int target_tile = o.tiles[target];
-        const int target_stride = target_tile;   // non-overlapping tiles between levels
-        const float pixel_scale = (float)o.factors[target];
-        const float grid_scale_ratio = pixel_scale * (float)flow.stride / (float)target_stride;
-        const float source_center_px = (float)flow.tile * pixel_scale / 2.0f;
-        const float target_center_px = (float)target_tile / 2.0f;
-        const float offset_px = source_center_px - target_center_px;
-        flow = transfer_flow(flow, ref.levels[target].img, mov.levels[target].img, target_tile, target_stride,
-                             grid_scale_ratio, pixel_scale, offset_px, offset_px, threads);
+        flow = transfer_flow(flow, ref.levels[target].img, mov.levels[target].img,
+                             level_transfer_params(o, level, flow.nx, flow.ny, ref.levels[target].img.w,
+                                                   ref.levels[target].img.h), threads);
     }
-    // Final overlapping grid: 16x16 tiles, stride 8, first tile corners aligned.
-    const int out_tile = 16, out_stride = 8;
-    const float grid_scale_ratio = (float)flow.stride / (float)out_stride;
-    const float offset_px = (float)flow.tile / 2.0f - (float)out_tile / 2.0f;
-    flow = transfer_flow(flow, ref.levels[0].img, mov.levels[0].img, out_tile, out_stride, grid_scale_ratio, 1.0f,
-                         offset_px, offset_px, threads);
+    flow = transfer_flow(flow, ref.levels[0].img, mov.levels[0].img,
+                         final_transfer_params(o, flow.nx, flow.ny, ref.levels[0].img.w, ref.levels[0].img.h), threads);
     return median_filter(flow);
 }
 

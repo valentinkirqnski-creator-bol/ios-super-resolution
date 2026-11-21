@@ -1762,6 +1762,19 @@ struct Config {
     // SABRE path: also write <stem>_reference.dng -- the reference frame ALONE through the same merge (same kernels,
     // same output size, same DNG encoding), i.e. what the merge makes of one frame. Saved to Photos with the output.
     bool  sabre_save_reference = false;
+    // SABRE 8.2 kernel override. Off = GCam's per-capture curves (K = sqrt(N/12) * SNR): base kernel p0 0.33 -> 0.25
+    // over K 7.2 -> 14.4 and the flat-area widening p1 4.2 -> 4.0 -> 3.0 over K 5.4 -> 11 -> 27. On = these two
+    // fixed values replace p0 (k_detail, raw px in GCam's exp2 kernel units) and p1 (k_denoise, multiple of k_detail
+    // in flat areas); the shrink / stretch / gradient curves stay GCam's. The RGB10_A2 kernel storage caps the
+    // across-edge precision at 24.8, so k_detail below ~0.30 no longer narrows edges, and k_detail * k_denoise above
+    // ~1.65 no longer widens flat areas.
+    bool  sabre_kernel_override = false;
+    float sabre_k_detail = 0.29f;
+    float sabre_k_denoise = 3.5f;
+    // SABRE path aligner (hsr_align) base tile size in grey px: 0 = the package's SNR rule (64 at SNR <= 14 dB,
+    // 32 at <= 22 dB, else 16); 16 / 32 / 64 forces it. Coarser levels follow the package's cap rule either way;
+    // the final 16/8 flow grid is unchanged.
+    int   sabre_align_tile = 0;
     // hhsr extension to the SABRE 8.2 path (not GCam): residual-shift test. SABRE's variance-normalized
     // rejection is blind to 0.3-1 px misalignment on strong edges (the doubled / fringed house edges on
     // burst12). This measures the across-edge shift of each warped frame against the base (7x7 Lucas-Kanade on

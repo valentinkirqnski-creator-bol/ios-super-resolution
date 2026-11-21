@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace hhsr {
 namespace sabre82 {
@@ -26,6 +27,12 @@ struct S82Gpu {
     // burst state: |grad L| of the base reference (residual-shift test; the rejection pass always reads it)
     id<MTLBuffer> gm_buf = nil;
     const float* gm_src = nullptr;
+    // burst state: each merge frame's flow and keep mask, uploaded on its first band (keyed by the frame and the
+    // host arrays, so a stale entry can never be reused), and the band accumulators, reused band after band
+    struct FrameBufs { const void* frame; const void* flow_src; const void* keep_src; id<MTLBuffer> flow, keep; };
+    std::vector<FrameBufs> frame_bufs;
+    id<MTLBuffer> accC = nil, accW = nil;
+    size_t acc_bytes = 0;
 };
 S82Gpu& gpu() {
     static S82Gpu g;
@@ -285,6 +292,8 @@ void metal_end_burst() {
     S82Gpu& g = gpu();
     g.base_ref_buf = nil; g.Wg = g.Hg = 0;
     g.gm_buf = nil; g.gm_src = nullptr;
+    g.frame_bufs.clear();
+    g.accC = nil; g.accW = nil; g.acc_bytes = 0;
 }
 
 bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandContext& ctx, int y0, int y1,
@@ -295,11 +304,21 @@ bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandCo
         id<MTLDevice> d = g.device;
         const int bh = y1 - y0, Wo = ctx.Wo;
         const int nfloat = bh * Wo * 3;
-        id<MTLBuffer> accC = buf(d, nullptr, (size_t)nfloat * 4), accW = buf(d, nullptr, (size_t)nfloat * 4);
-        if (!accC || !accW) return false;
-        std::memset(accC.contents, 0, (size_t)nfloat * 4);
-        std::memset(accW.contents, 0, (size_t)nfloat * 4);
+        const size_t acc_bytes = (size_t)nfloat * 4;
+        if (!g.accC || !g.accW || g.acc_bytes < acc_bytes) {   // sized by the first (= largest) band
+            g.accC = buf(d, nullptr, acc_bytes);
+            g.accW = buf(d, nullptr, acc_bytes);
+            g.acc_bytes = (g.accC && g.accW) ? acc_bytes : 0;
+            if (!g.acc_bytes) { g.accC = nil; g.accW = nil; return false; }
+        }
+        id<MTLBuffer> accC = g.accC, accW = g.accW;
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+        {
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl fillBuffer:accC range:NSMakeRange(0, acc_bytes) value:0];
+            [bl fillBuffer:accW range:NSMakeRange(0, acc_bytes) value:0];
+            [bl endEncoding];
+        }
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         std::vector<id<MTLBuffer>> keep_alive;
         for (size_t fi = 0; fi < frames.size(); ++fi) {
@@ -307,28 +326,36 @@ bool merge_band_metal(const std::vector<const MergeFrame*>& frames, const BandCo
             const bool is_base = (fi + 1 == frames.size());
             int r0, r1, g0, g1;
             band_rows(f, ctx, y0, y1, r0, r1, g0, g1);
+            // flow + keep mask: once per frame per burst
+            S82Gpu::FrameBufs* fb = nullptr;
+            for (auto& c : g.frame_bufs)
+                if (c.frame == &f && c.flow_src == f.flow.data.data() && c.keep_src == f.keep.data()) { fb = &c; break; }
+            if (!fb) {
+                S82Gpu::FrameBufs c;
+                c.frame = &f; c.flow_src = f.flow.data.data(); c.keep_src = f.keep.data();
+                c.flow = buf(d, f.flow.data.data(), f.flow.data.size() * 4);
+                c.keep = f.keep.empty() ? buf(d, nullptr, 16) : buf(d, f.keep.data(), f.keep.size());
+                if (!c.flow || !c.keep) { [e endEncoding]; return false; }
+                g.frame_bufs.push_back(c);
+                fb = &g.frame_bufs.back();
+            }
+            // raw rows and kernel-covariance codes the band reads (codes converted on the GPU)
             id<MTLBuffer> raw = buf(d, f.raw->data.data() + (size_t)r0 * ctx.Wr, (size_t)(r1 - r0) * ctx.Wr * 4);
-            id<MTLBuffer> cov = buf(d, nullptr, (size_t)(g1 - g0) * ctx.Wg * 3 * 4);
-            id<MTLBuffer> fl = buf(d, f.flow.data.data(), f.flow.data.size() * 4);
-            id<MTLBuffer> mk = (is_base && f.keep.empty()) ? buf(d, nullptr, 16) : buf(d, f.keep.data(), f.keep.size());
-            if (!raw || !cov || !fl || !mk) { [e endEncoding]; return false; }
-            float* cp = (float*)cov.contents;
-            const uint16_t* src = f.cov.data() + (size_t)g0 * ctx.Wg * 3;
-            const size_t ncov = (size_t)(g1 - g0) * ctx.Wg * 3;
-            for (size_t i = 0; i < ncov; ++i) cp[i] = (float)src[i] * (1.0f / 1023.0f);
+            id<MTLBuffer> cov = buf(d, f.cov.data() + (size_t)g0 * ctx.Wg * 3, (size_t)(g1 - g0) * ctx.Wg * 3 * 2);
+            if (!raw || !cov) { [e endEncoding]; return false; }
             const S82MergeParams P = merge_params(f, ctx, is_base, r0, r1, g0, g1, y0);
             [e setComputePipelineState:g.merge];
             [e setBuffer:raw offset:0 atIndex:0];
             [e setBuffer:cov offset:0 atIndex:1];
-            [e setBuffer:fl offset:0 atIndex:2];
-            [e setBuffer:mk offset:0 atIndex:3];
+            [e setBuffer:fb->flow offset:0 atIndex:2];
+            [e setBuffer:fb->keep offset:0 atIndex:3];
             [e setBytes:&P length:sizeof(P) atIndex:4];
             [e setBuffer:accC offset:0 atIndex:5];
             [e setBuffer:accW offset:0 atIndex:6];
             [e setBytes:&bh length:sizeof(int) atIndex:7];
             dispatch2d(e, g.merge, Wo, bh);
             [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            keep_alive.push_back(raw); keep_alive.push_back(cov); keep_alive.push_back(fl); keep_alive.push_back(mk);
+            keep_alive.push_back(raw); keep_alive.push_back(cov);
         }
         [e setComputePipelineState:g.dehomog];
         [e setBuffer:accC offset:0 atIndex:0];

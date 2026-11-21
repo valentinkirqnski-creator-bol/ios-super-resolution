@@ -156,6 +156,16 @@ CovTuning cov_tuning(float snr, int num_frames) {
     return t;
 }
 
+void override_kernel(CovTuning& t, float k_detail, float k_denoise) {
+    if (k_detail > 0.f && std::isfinite(k_detail)) t.p[0] = k_detail;
+    if (k_denoise > 0.f && std::isfinite(k_denoise)) t.p[1] = k_denoise;
+    const float p0 = t.p[0];
+    t.cov1[0] = 1.0f / (p0 / t.p[5]);
+    t.cov1[1] = 1.0f / (p0 * t.p[4]);
+    t.cov1[3] = 1.0f / p0;
+    t.cov2[0] = 1.0f / (p0 * t.p[1]);
+}
+
 float green_clip_point(float K, float white_level) {
     const int white = (int)white_level;
     if (!(K > 0.f) || K * 1.0f >= 1.0f || white <= 3) return FLT_MAX;
@@ -603,22 +613,20 @@ S82MergeParams merge_params(const MergeFrame& f, const BandContext& ctx, bool is
 static bool merge_band_cpu(const std::vector<const MergeFrame*>& frames, const BandContext& ctx, int y0, int y1,
                            std::vector<float>& out_rgb) {
     const int bh = y1 - y0, Wo = ctx.Wo;
-    std::vector<float> accC((size_t)bh * Wo * 3, 0.f), accW((size_t)bh * Wo * 3, 0.f), cov;
+    std::vector<float> accC((size_t)bh * Wo * 3, 0.f), accW((size_t)bh * Wo * 3, 0.f);
     for (size_t fi = 0; fi < frames.size(); ++fi) {
         const MergeFrame& f = *frames[fi];
         const bool is_base = (fi + 1 == frames.size());
         int r0, r1, g0, g1;
         band_rows(f, ctx, y0, y1, r0, r1, g0, g1);
-        cov.resize((size_t)(g1 - g0) * ctx.Wg * 3);
-        const uint16_t* src = f.cov.data() + (size_t)g0 * ctx.Wg * 3;
-        for (size_t i = 0; i < cov.size(); ++i) cov[i] = (float)src[i] * (1.0f / 1023.0f);
+        const uint16_t* cov = f.cov.data() + (size_t)g0 * ctx.Wg * 3;   // codes, read as code / 1023 per texel
         const S82MergeParams P = merge_params(f, ctx, is_base, 0, ctx.Hr, g0, g1, y0);   // full raw plane on CPU
         const float* rp = f.raw->data.data();
         const uint8_t* mk = (is_base && f.keep.empty()) ? nullptr : f.keep.data();   // base: 6.1 blur coverage
         parallel_rows(bh, ctx.threads, [&](int ly) {
             for (int ox = 0; ox < Wo; ++ox) {
                 float c3[3], w3[3];
-                s82_merge_pixel(rp, cov.data(), f.flow.data.data(), mk, P, ox, y0 + ly, c3, w3);
+                s82_merge_pixel_u16(rp, cov, f.flow.data.data(), mk, P, ox, y0 + ly, c3, w3);
                 float* ac = &accC[((size_t)ly * Wo + ox) * 3];
                 float* aw = &accW[((size_t)ly * Wo + ox) * 3];
                 for (int k = 0; k < 3; ++k) { ac[k] += c3[k]; aw[k] += w3[k]; }

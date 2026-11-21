@@ -700,6 +700,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"sabre_mali_noise_model"])   cfg.sabre_mali_noise_model = tuning[@"sabre_mali_noise_model"].boolValue;
     if (tuning[@"sabre_save_accumulated_mask"]) cfg.sabre_save_accumulated_mask = tuning[@"sabre_save_accumulated_mask"].boolValue;
     if (tuning[@"sabre_save_reference"]) cfg.sabre_save_reference = tuning[@"sabre_save_reference"].boolValue;
+    if (tuning[@"sabre_kernel_override"]) cfg.sabre_kernel_override = tuning[@"sabre_kernel_override"].boolValue;
+    if (tuning[@"sabre_k_detail"]) cfg.sabre_k_detail = tuning[@"sabre_k_detail"].floatValue;
+    if (tuning[@"sabre_k_denoise"]) cfg.sabre_k_denoise = tuning[@"sabre_k_denoise"].floatValue;
+    if (tuning[@"sabre_align_tile"]) {
+        const int t = tuning[@"sabre_align_tile"].intValue;
+        cfg.sabre_align_tile = (t == 16 || t == 32 || t == 64) ? t : 0;
+    }
     if (tuning[@"sabre_resid_shift_enabled"]) cfg.sabre_resid_shift_enabled = tuning[@"sabre_resid_shift_enabled"].boolValue;
     if (tuning[@"sabre_rejection_only_1x"]) cfg.sabre_rejection_only_1x = tuning[@"sabre_rejection_only_1x"].boolValue;
     if (tuning[@"sabre_frame_drop"]) cfg.sabre_frame_drop = tuning[@"sabre_frame_drop"].boolValue;

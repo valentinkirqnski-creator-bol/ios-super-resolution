@@ -1333,15 +1333,28 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     tune_config_snr(ref, work, &ref_brightness);   // reference brightness (kernel covariance SNR below)
     // ---- alignment: hsr_align, reference pyramid (package grey, SNR-selected level settings) ----
     const double t_ra = prof_now_ms();
-    const hsra::Options al_opt = hsra::options_for_snr(hsra::estimate_image_snr_db(ref, work));
-    hsra::Pyramid al_ref = hsra::build_pyramid(hsra::grey_from_bayer(ref, work, work.num_threads), al_opt,
-                                               true, work.num_threads);
+    const hsra::Options al_opt = hsra::options_for_snr(hsra::estimate_image_snr_db(ref, work), work.sabre_align_tile);
+    // GPU first (core/hsr_align_metal.mm: the reference pyramid stays resident, each frame aligns in one command
+    // buffer); the CPU pyramid is built only if the GPU is unavailable or fails.
+    hsra::Pyramid al_ref;
+    hsra::Plane al_ref_grey;   // the reference's full-resolution grey when the GPU built the pyramid (frame drop)
+    bool al_gpu = false;
+#if defined(__APPLE__)
+    al_gpu = hsra::metal_set_reference(ref, work, al_opt, work.sabre_frame_drop ? &al_ref_grey : nullptr);
+    struct HsraGpuGuard { ~HsraGpuGuard() { hsra::metal_release(); } } hsra_gpu_guard;
+#endif
+    auto build_cpu_ref = [&]() {
+        if (al_ref.levels.empty())
+            al_ref = hsra::build_pyramid(hsra::grey_from_bayer(ref, work, work.num_threads), al_opt, true, work.num_threads);
+    };
+    if (!al_gpu) build_cpu_ref();
     prof_add_cpu("sabre:align-ref", prof_now_ms() - t_ra);
     {
-        char ab[192];
-        std::snprintf(ab, sizeof(ab), "Alignment: Handheld-SR aligner (grey decimated, SNR %.1f dB, tiles %d/%d/%d/%d/%d, "
-                      "radii 1/3/3/3/3, ICA %d, 16/8 grid + 3x3 median)", al_opt.snr_db, al_opt.tiles[0], al_opt.tiles[1],
-                      al_opt.tiles[2], al_opt.tiles[3], al_opt.tiles[4], al_opt.ica_iterations);
+        char ab[224];
+        std::snprintf(ab, sizeof(ab), "Alignment: Handheld-SR aligner on the %s (grey decimated, SNR %.1f dB, tiles "
+                      "%d/%d/%d/%d/%d%s, radii 1/3/3/3/3, ICA %d, 16/8 grid + 3x3 median)", al_gpu ? "GPU" : "CPU",
+                      al_opt.snr_db, al_opt.tiles[0], al_opt.tiles[1], al_opt.tiles[2], al_opt.tiles[3], al_opt.tiles[4],
+                      work.sabre_align_tile ? " forced" : "", al_opt.ica_iterations);
         report(ab, 0.04f);
     }
     const int merge_ts = 16;                       // the package's final grid: 16 raw px per cell (16/8 grey tiles)
@@ -1363,7 +1376,8 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     if (zero_lut) std::fill(lut, lut + 80, 0.f);
     // Per-capture kernel covariance: EstimateSnr on the green noise model at the reference's mean level,
     // K = sqrt(N/12)*SNR through the 6 MergeOptions curves (same for every frame of the burst).
-    const CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
+    CovTuning cov_t = cov_tuning(estimate_snr(ref_brightness, slope[1], offset[1]), frame_count);
+    if (work.sabre_kernel_override) override_kernel(cov_t, work.sabre_k_detail, work.sabre_k_denoise);
     // green_clipping_point per frame from the exposure gain the loader applied (the base: 1 -> off).
     auto applied_gain = [&](const Image& im) {
         if (!work.exposure_match_enabled || !(ref.exposure > 0.f) || !(im.exposure > 0.f)) return 1.f;
@@ -1407,11 +1421,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         char buf[768];
         std::snprintf(buf, sizeof(buf),
                       "SABRE 8.2 on the %s: %dx%d -> %dx%d, %d frames, noise %s x%.2g%s, SNR %.3g K %.3g "
-                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s%s%s%s%s",
+                      "cov1 (%.4g %.4g %.4g %.4g) cov2 (%.4g %.4g)%s%s%s%s%s%s%s",
                       gpu ? (mali ? "GPU, Mali-G71 exact" : "GPU") : (mali ? "CPU, Mali-G71 exact" : "CPU"),
                       Wr, Hr, Wo, Ho, frame_count, work.has_noise_profile ? "DNG" : "fallback", noise_scale,
                       zero_lut ? " (noise LUT off)" : "", cov_t.snr, cov_t.K,
                       cov_t.cov1[0], cov_t.cov1[1], cov_t.cov1[2], cov_t.cov1[3], cov_t.cov2[0], cov_t.cov2[1],
+                      work.sabre_kernel_override ? ", custom k_detail/k_denoise" : "",
                       ro1x ? ", GCam 1x variant (linear guide, biquadratic)" : "",
                       rs.enabled ? ", edge shift test on" : "", base_t.force_rgb ? ", force RGB (SNR <= 10)" : "",
                       mali_gpu_status.empty() ? "" : (gpu ? " " : " [Mali GPU unavailable: "),
@@ -1427,7 +1442,8 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     // mode (low burst SNR) keeps every frame.
     const bool drop_on = work.sabre_frame_drop && cov_t.snr > work.sabre_frame_drop_night_snr;
     auto plane_image = [](const hsra::Plane& p) { Image im(p.h, p.w, 1); im.data = p.d; return im; };
-    const double base_sharp = drop_on ? sabre_frame_sharpness(plane_image(al_ref.levels[0].img)) : 0.0;
+    const double base_sharp = !drop_on ? 0.0
+        : sabre_frame_sharpness(plane_image(!al_ref.levels.empty() ? al_ref.levels[0].img : al_ref_grey));
     int dropped = 0;
     bool wr_merge = work.sabre_wronski_kernels;   // Wronski kernels + merge (cleared if a kernel field fails)
     int pos = 0;
@@ -1440,7 +1456,13 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         if (comp.h != ref.h || comp.w != ref.w || comp.data.size() < (size_t)comp.h * comp.w) continue;
         // ---- alignment: hsr_align ----
         const double t_al = prof_now_ms();
-        hsra::Plane comp_grey = hsra::grey_from_bayer(comp, work, work.num_threads);
+        hsra::Plane comp_grey;
+        hsra::Flow al_flow;
+        bool have_flow = false;
+#if defined(__APPLE__)
+        if (al_gpu) have_flow = hsra::metal_align(comp, work, al_flow, drop_on ? &comp_grey : nullptr);
+#endif
+        if (!have_flow) comp_grey = hsra::grey_from_bayer(comp, work, work.num_threads);
         if (drop_on && base_sharp > 0.0) {
             const double tw = 1.0 - (double)std::abs(k - ref_index) / 150.0;
             const double score = sabre_frame_sharpness(plane_image(comp_grey)) * tw;
@@ -1456,9 +1478,11 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
                 continue;
             }
         }
-        FlowField flow = hsra::to_raw_flow_field(
-            hsra::align(al_ref, hsra::build_pyramid(comp_grey, al_opt, false, work.num_threads), work.num_threads),
-            comp.w, comp.h);
+        if (!have_flow) {
+            build_cpu_ref();
+            al_flow = hsra::align(al_ref, hsra::build_pyramid(comp_grey, al_opt, false, work.num_threads), work.num_threads);
+        }
+        FlowField flow = hsra::to_raw_flow_field(al_flow, comp.w, comp.h);
         comp_grey = hsra::Plane();
         prof_add_cpu("sabre:align", prof_now_ms() - t_al);
         if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) continue;
@@ -1541,6 +1565,10 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
         frames.push_back(std::move(mf));
     }
     al_ref = hsra::Pyramid();   // the reference pyramid is done with once every frame is aligned
+    al_ref_grey = hsra::Plane();
+#if defined(__APPLE__)
+    hsra::metal_release();      // and its GPU copy: frees the memory before the merge
+#endif
     if (dropped > 0)
         report("SABRE: dropped " + std::to_string(dropped) + " of " + std::to_string(frame_count - 1) +
                " comparison frames as soft", 0.46f);
@@ -1601,13 +1629,12 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
                                    work.dng_codec, &dng_exif, work.num_threads);
     if (work.sabre_save_reference && !ref_out) report("SABRE: cannot open the reference DNG - not saved", 0.47f);
     Image ref_preview(ph, pw, 3);
-    std::vector<float> rgb_ref;
     std::vector<uint16_t> row16_ref;
     BandContext ctx;
     ctx.Wo = Wo; ctx.Ho = Ho; ctx.Wr = Wr; ctx.Hr = Hr; ctx.Wg = Wg; ctx.Hg = Hg; ctx.Wm = Wm; ctx.Hm = Hm;
     ctx.cfa = cfa; ctx.threads = work.num_threads;
     const int band = std::max(16, std::min(Ho, (int)((48ull << 20) / ((size_t)Wo * 3 * 4 * 2))));
-    std::vector<float> rgb, ones;
+    std::vector<float> ones;
     std::vector<uint16_t> row16;
     // Config::sabre_wronski_kernels: the Wronski merge (CPU) with the Wronski kernels, GCam's keep masks.
     CovField ref_wcov;
@@ -1648,33 +1675,53 @@ static Image process_burst_sabre(int frame_count, const RawFrameLoaderFn& loader
     };
     const std::vector<const MergeFrame*> base_only{&base};
     const double t_m = prof_now_ms();
+    // Band pipeline: while band n is converted to 16-bit RGB (+ preview) and handed to the DNG writer on a worker,
+    // band n + 1 merges (GPU, or the CPU merge's own threads). Two buffers per merge output alternate; the worker is
+    // joined before its buffers are reused, before any writer is closed and on every exit.
+    std::vector<float> rgb_buf[2], ref_buf[2];
+    ones.assign((size_t)band * Wo * 3, 1.f);
+    std::future<void> enc;
+    auto join_enc = [&]() { if (enc.valid()) enc.get(); };
+    int cur = 0;
     for (int y0 = 0; y0 < Ho; y0 += band) {
         const int y1 = std::min(Ho, y0 + band), bh = y1 - y0;
+        std::vector<float>& rgb = rgb_buf[cur];
+        std::vector<float>& rgb_ref = ref_buf[cur];
         const bool merged = wr_merge ? wronski_band(y0, y1, rgb) : merge_band(merge_frames, ctx, y0, y1, gpu || mali, rgb);
         if (!merged || rgb.size() < (size_t)bh * Wo * 3) {
+            join_enc();
             report("Error: SABRE merge failed", 1.f);
             writer.close();
+            if (ref_out) { ref_writer.close(); std::remove(ref_dng_path.c_str()); }
             return Image();
         }
-        if (ones.size() < rgb.size()) ones.assign(rgb.size(), 1.f);
-        encode_band_rows_ptr(rgb.data(), ones.data(), y0, bh, work, nch, preview, pscale, ph, pw, Wo, row16);
-        writer.write_rows(row16.data(), bh);
+        bool ref_band = false;
         if (ref_out) {
             const bool ok = wr_merge ? wronski_ref_band(y0, y1, rgb_ref)
                                      : merge_band(base_only, ctx, y0, y1, gpu || mali, rgb_ref);
             if (ok && rgb_ref.size() >= (size_t)bh * Wo * 3) {
-                encode_band_rows_ptr(rgb_ref.data(), ones.data(), y0, bh, work, nch, ref_preview, pscale, ph, pw, Wo,
-                                     row16_ref);
-                ref_writer.write_rows(row16_ref.data(), bh);
+                ref_band = true;
             } else {
+                join_enc();
                 ref_writer.close();
                 std::remove(ref_dng_path.c_str());
                 ref_out = false;
                 report("SABRE: reference merge failed - reference DNG not saved", 0.48f + 0.50f * (float)y1 / Ho);
             }
         }
+        join_enc();
+        enc = std::async(std::launch::async, [&, y0, bh, ref_band](const float* c, const float* r) {
+            encode_band_rows_ptr(c, ones.data(), y0, bh, work, nch, preview, pscale, ph, pw, Wo, row16);
+            writer.write_rows(row16.data(), bh);
+            if (ref_band) {
+                encode_band_rows_ptr(r, ones.data(), y0, bh, work, nch, ref_preview, pscale, ph, pw, Wo, row16_ref);
+                ref_writer.write_rows(row16_ref.data(), bh);
+            }
+        }, rgb.data(), rgb_ref.data());
+        cur ^= 1;
         report("SABRE: merging", 0.48f + 0.50f * (float)y1 / Ho);
     }
+    join_enc();
     prof_add_cpu("sabre:merge", prof_now_ms() - t_m);
     writer.close();
     if (ref_out) ref_writer.close();
