@@ -27,7 +27,7 @@ inline size_t fmt_bytes(Fmt f) {
 enum class K {
     prepare, unblocker, clear_flow, downsample, gradients, gradient_tile_sums,
     block_matching, ica_iteration, flow_transfer, flow_median, flow_pack,
-    guide, rejection, dilate_h, dilate_v, accumulate_weights, merge, denoise, count
+    guide, rejection, dilate_h, dilate_v, accumulate_weights, merge, denoise, mask_export, count
 };
 
 inline const char* kernel_name(K k) {
@@ -35,7 +35,8 @@ inline const char* kernel_name(K k) {
         "srsr_prepare", "srsr_unblocker", "srsr_clear_flow", "srsr_downsample", "srsr_gradients",
         "srsr_gradient_tile_sums", "srsr_block_matching", "srsr_ica_iteration", "srsr_flow_transfer",
         "srsr_flow_median", "srsr_flow_pack", "srsr_guide", "srsr_rejection", "srsr_dilate_horizontal",
-        "srsr_dilate_vertical", "srsr_accumulate_weights", "srsr_merge", "srsr_denoise"};
+        "srsr_dilate_vertical", "srsr_accumulate_weights", "srsr_merge", "srsr_denoise",
+        "srsr_mask_export"};
     return names[(int)k];
 }
 

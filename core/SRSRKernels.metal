@@ -811,6 +811,22 @@ kernel void srsr_accumulate_weights(array<texture2d<float, access::read>, kSRSRM
     outWeights.write(float4(saturate(total / u.accumulatedWeightScale)), gid);
 }
 
+// Robustness-mask export (Config::robustness_save_mask): the MEAN over the
+// comparison frames of each frame's dilated keep, 8-bit, into a host-visible
+// buffer -- the same quantity the standard pipeline saves as _robustness.pgm
+// (white = every frame merged, black = every frame rejected).
+kernel void srsr_mask_export(array<texture2d<float, access::read>, kSRSRMaxFrames> dilated [[texture(0)]],
+                             device uchar* outMask                     [[buffer(1)]],
+                             constant SRSRAccumulateUniforms &u        [[buffer(0)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(u.quadWidth) || gid.y >= uint(u.quadHeight)) return;
+    float total = 0.0f;
+    for (int f = 0; f < u.frameCount; ++f)
+        total += dilated[f].read(gid).x;
+    const float mean = saturate(total / float(max(1, u.frameCount)));
+    outMask[gid.y * uint(u.quadWidth) + gid.x] = uchar(mean * 255.0f + 0.5f);
+}
+
 //===----------------------------------------------------------------------===//
 // STAGE 3 + 3.5 -- MERGE (fused over frames: alts in burst order, base last),
 // dehomogenized in place, one output band. Distances are in Bayer pixels at any

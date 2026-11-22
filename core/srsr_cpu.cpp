@@ -182,6 +182,14 @@ public:
                 grid(w, h, [&](uint2 p) { srsr_denoise(in, acc, o, out, u, p); });
                 break;
             }
+            case K::mask_export: {
+                metal::array<texture2d<float, access::read>, kSRSRMaxFrames> d;
+                for (int i = 0; i < kSRSRMaxFrames; ++i) d[i] = R(i);
+                uchar* out = (uchar*)buf_[1]->contents();
+                const auto& u = U<SRSRAccumulateUniforms>(0);
+                grid(w, h, [&](uint2 p) { srsr_mask_export(d, out, u, p); });
+                break;
+            }
             case K::count: break;
         }
     }

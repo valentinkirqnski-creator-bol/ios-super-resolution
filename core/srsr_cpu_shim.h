@@ -13,6 +13,7 @@
 // Global, as in MSL (a same-type typedef may repeat one from sys/types.h).
 typedef unsigned int uint;
 typedef unsigned short ushort;
+typedef unsigned char uchar;
 
 namespace metal {
 

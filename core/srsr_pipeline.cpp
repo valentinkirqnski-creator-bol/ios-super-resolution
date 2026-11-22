@@ -21,6 +21,7 @@
 #include "srsr_pipeline.h"
 #include "srsr_backend.h"
 #include "dng_writer.h"
+#include "pipeline.h"
 #include "raw_io.h"
 #include "parallel.h"
 #include "prof.h"
@@ -426,6 +427,7 @@ struct Resources {
     std::unique_ptr<Tex> accW, dummyR8, dummyFlow;
     std::unique_ptr<Tex> bandA, bandB;
     std::unique_ptr<Buf> out[2];
+    std::unique_ptr<Buf> maskOut;      // Config::robustness_save_mask
     void free_analysis() {
         guideBase.reset(); guideScratch.reset(); rejection.reset(); dilatePartial.reset(); unblocker.reset();
         refChain.clear(); movChain.clear(); gx.clear(); gy.clear(); hess.clear();
@@ -683,7 +685,8 @@ Image process_burst_srsr_to_dng(int frame_count, const RawFrameLoaderFn& loader,
     const double host_frames = 3.0 * (double)ref.w * ref.h * 4;   // ref + decode in flight + upload
     int band = 1024;
     auto peak_for = [&](int nf, int b) {
-        const double resident = (double)nf * G.frame_bytes() + (double)G.quadW * G.quadH;
+        const double resident = (double)nf * G.frame_bytes() + (double)G.quadW * G.quadH *
+                                (work.robustness_save_mask ? 2.0 : 1.0);
         const double analysis = resident + (double)G.analysis_bytes() + host_frames;
         const double output = resident + (double)(b + 2 * halo) * row_bytes + 64.0 * 1024 * 1024;  // + writer
         return base_fp + std::max(analysis, output);
@@ -844,6 +847,14 @@ Image process_burst_srsr_to_dng(int frame_count, const RawFrameLoaderFn& loader,
         be->tex((int)kSRSRMaxFrames, R.accW.get());
         be->bytes(0, &u, sizeof u);
         be->dispatch(K::accumulate_weights, G.quadW, G.quadH);
+        // Same bindings: the dilated masks stay at 0..15 and the uniforms at 0.
+        if (work.robustness_save_mask) {
+            R.maskOut = be->make_buf((size_t)G.quadW * G.quadH, "srsr.mask");
+            if (R.maskOut) {
+                be->buf(1, R.maskOut.get());
+                be->dispatch(K::mask_export, G.quadW, G.quadH);
+            }
+        }
         be->commit("srsr:copy-mask");
     }
 
@@ -982,6 +993,21 @@ Image process_burst_srsr_to_dng(int frame_count, const RawFrameLoaderFn& loader,
     const double tc = prof_now_ms();
     writer.close();
     prof_add_cpu("srsr:dng-close", prof_now_ms() - tc);
+    // The copy-mask batch was committed before the bands, so it is complete by
+    // now on an in-order queue; waiting makes that explicit.
+    if (R.maskOut && be->wait_all()) {
+        // <stem>_robustness.pgm, the file the app picks up for "Save Robustness
+        // Mask": mean keep over the comparison frames, nearest-upsampled from the
+        // quad grid to the Bayer grid (raw resolution), as the standard pipeline.
+        const double tm = prof_now_ms();
+        Image m(G.quadH, G.quadW, 1);
+        const uint8_t* src = (const uint8_t*)R.maskOut->contents();
+        for (size_t i = 0; i < m.data.size(); ++i) m.data[i] = (f32)src[i] * (1.f / 255.f);
+        R.maskOut.reset();
+        if (write_robustness_mask_pgm(m, 1, dng_path, "", G.bayerH, G.bayerW))
+            report("Wrote robustness mask", 0.99f);
+        prof_add_cpu("srsr:mask-write", prof_now_ms() - tm);
+    }
     prof_mark_memory("srsr:end");
 
     if (prof_enabled()) {
