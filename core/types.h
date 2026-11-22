@@ -1406,6 +1406,22 @@ struct Config {
     // hires buffers because its own statistics are already full resolution, and
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
+    // Wronski path, raw-resolution robustness (Algorithm 6): the guide statistics are always
+    // Dodgson-upsampled and flow-warped to raw resolution and R is computed there; with this
+    // on, Eq. 9's 5x5 minimum ALSO runs on that raw-resolution R. Off = the previous form:
+    // 2x2 min-reduce to the guide lattice, 5x5 min there, nearest-upsample back.
+    bool wronski_raw_res_min = true;
+    // Wronski path (raw-res mask): replace the motion prior M (the r_Mt test that picks the
+    // strict s1 on irregular-motion tiles) by GCam's motion boost. s stays s2 everywhere and
+    // the normalized distance d^2/sigma^2 is multiplied by gcam_sabre_boost (x6) where the
+    // reference is textured (variance > gcam_sabre_boost_var_mult x noise) AND the 3x3 tile
+    // flow spread exceeds the GCam Motion Boost Threshold (gcam_sabre_motion_thresh x tile x 258).
+    bool wronski_motion_boost = false;
+    // Wronski raw-res mask, Algorithm 6 lines 28-29 as printed: sigma_p is the MOVING frame's
+    // local variance (Dodgson-upsampled and flow-warped like its means, line 25) and the noise
+    // curves sigma_t / d_t are looked up at the moving frame's mean mu_p. Off = the authors'
+    // Python (1.4 / 460-main) form: the reference's variance and the reference mean.
+    bool wronski_alg6_moving_stats = true;
     bool robustness_raw_resolution_active() const {
         // ALWAYS the Dodgson-x2 upscale+warp path for a Bayer burst: the half-res
         // 3-channel guide statistics are upscaled and flow-warped to raw resolution
@@ -1819,6 +1835,16 @@ struct Config {
     float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold (UV); converted to raw px as x tile_size x (4128/16) so the boost arms at GCam's flow GRADIENT independent of grid density/sensor res
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
+    // §7 window (half-size) and the factor the rejection sum is multiplied by before the
+    // dead-zone. GCam: 2 (5x5) and 1. Set per call by the operator, not a tuning knob.
+    int   gcam_sabre_dilate_radius   = 2;
+    float gcam_sabre_dilate_scale    = 1.0f;
+    // Raw-resolution mask (gcam_sabre_raw_res): run the soft dilate over the raw area of GCam's
+    // 5x5 GUIDE footprint (9x9 raw) with the sum scaled back to guide pixels (x 25/81). The
+    // plain 5x5 at raw resolution counted every upsampled guide pixel ~4 times, so mild noise
+    // in flat areas crossed the 0.2 dead-zone and became dark dots: on pure noise with zero
+    // motion, 1.6% of flat pixels under 0.5 at raw res vs 0.16% for GCam's guide-res dilate.
+    bool  gcam_sabre_dilate_guide_equiv = true;
     // §7 2x downsample: dilate AND halve the mask (guide-res -> quarter-Bayer), then
     // nearest-upsample back. DEFAULT OFF: the recovered DilateMask shader does a plain
     // same-resolution 5x5 dilate (gather at tex_coord +-{0.5,1.5} texels, no 2x on the

@@ -2525,7 +2525,8 @@ kernel void rob_gcam_prefilter(device float* out [[buffer(0)]],
 // dilate_2x (GCam default): sample the 5x5 centred at the 2x-downsampled grid texel
 // (2*o+1) and nearest-upsample -> each output in a 2x2 block shares one decision,
 // matching the CPU coarse.at(o)=dilate_at(2o+1) + nearest-upsample.
-struct RobGcamDilateParams { uint h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+// radius: window half-size (0 = 2, GCam's 5x5); scale: multiplies the rejection sum (0 = 1).
+struct RobGcamDilateParams { uint h, w, dilate_2x, radius; float deadzone, div, scale, _p2; };
 kernel void rob_gcam_dilate(device float* out [[buffer(0)]],
                             device const float* R [[buffer(1)]],
                             constant RobGcamDilateParams& p [[buffer(2)]],
@@ -2535,14 +2536,16 @@ kernel void rob_gcam_dilate(device float* out [[buffer(0)]],
     int cy, cx;
     if (p.dilate_2x != 0u) { cy = 2 * (int(gid.y) / 2) + 1; cx = 2 * (int(gid.x) / 2) + 1; }
     else                   { cy = int(gid.y);               cx = int(gid.x); }
+    const int rr = (p.radius == 0u) ? 2 : min(int(p.radius), 8);
     float sum = 0.f;
-    for (int i = -2; i <= 2; ++i) {
+    for (int i = -rr; i <= rr; ++i) {
         int yy = clamp(cy + i, 0, H - 1);
-        for (int j = -2; j <= 2; ++j) {
+        for (int j = -rr; j <= rr; ++j) {
             int xx = clamp(cx + j, 0, W - 1);
             sum += 1.f - clamp(R[uint(yy) * p.w + uint(xx)], 0.f, 1.f);   // rejection
         }
     }
+    if (p.scale != 0.f && p.scale != 1.f) sum *= p.scale;
     const float dv = (p.div != 0.f) ? p.div : 1.f;
     out[gid.y * p.w + gid.x] = clamp(1.f - (sum - p.deadzone) / dv, 0.f, 1.f);
 }
@@ -3269,6 +3272,17 @@ struct RobMaskRawParams {
     // kFilterVarianceScale (Config::gcam_filter_var_scale). Keep in lockstep with
     // RobMaskRawParamsCPU.
     float gcam_fvs;
+    // Config::wronski_motion_boost: GCam's boost replaces the motion prior on the Wronski
+    // mask -- s = wb_s2 everywhere, d^2/sigma^2 x wb_boost where textured (sum ref var >
+    // wb_var_mult x sum noise var) AND the 3x3 tile flow spread > wb_motion_px.
+    uint wb_enabled;
+    float wb_boost;
+    float wb_var_mult;
+    float wb_motion_px;
+    float wb_s2;
+    // Config::wronski_alg6_moving_stats: sigma_p = comp_vars (moving frame, upsampled +
+    // warped) and the noise curves looked up at comp_means (mu_p).
+    uint alg6_moving;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -3415,9 +3429,12 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
-        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+        // Alg. 6: noise lookup at the moving frame's mean (reference mean if out of frame).
+        float lookup = brightness;
+        if (p.alg6_moving != 0u && isfinite(comp_means[o])) lookup = comp_means[o];
+        float bidx = (p.sqrt_index != 0u) ? lookup * lookup : lookup;
         int id_noise = lround_away(1000.f * bidx);
-        if (!isfinite(brightness))
+        if (!isfinite(lookup))
             id_noise = 0;
         else if (id_noise < 0)
             id_noise = 0;
@@ -3427,7 +3444,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        float sigma_p_sq = ref_vars[o];
+        float sigma_p_sq = (p.alg6_moving != 0u) ? comp_vars[o] : ref_vars[o];
         float sigma_c = max(sigma_p_sq, sigma_t * sigma_t);
         sigma_sq_ += sigma_c;
         float comp = comp_means[o];
@@ -3450,10 +3467,27 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     } else {
         s = S[pidx];
     }
+    if (p.wb_enabled != 0u) s = p.wb_s2;   // motion prior replaced by the boost below
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
     if (p.chain_reject_enabled != 0u && chain_inconsistent[pidx] != 0u)
         s = min(s, p.r_s_chain);
+    // GCam motion boost for the Wronski mask (twin of wronski_boost_at in robustness.cpp).
+    float wb = 1.f;
+    if (p.wb_enabled != 0u &&
+        rob_flow_irr(flow, p.flow_ny, p.flow_nx, int(patch_idy), int(patch_idx)) > p.wb_motion_px) {
+        uint ncl = min(p.nch, 3u);
+        float rv = 0.f, nv = 0.f;
+        for (uint ch = 0u; ch < ncl; ++ch) {
+            uint o = out_o * p.nch + ch;
+            float r = ref_means[o];
+            float nvc = p.gcam_na * clamp(r, 0.f, 1.f) + p.gcam_nb;
+            if (p.nch == 3u && ch == 1u) nvc *= 0.5f;
+            rv += ref_vars[o];
+            nv += max(nvc, 1e-12f);
+        }
+        if (rv > p.wb_var_mult * nv) wb = p.wb_boost;
+    }
     bool motion_magnitude_reject_tile =
         p.motion_magnitude_veto_enabled != 0u &&
         motion_magnitude_reject[pidx] != 0u;
@@ -3530,7 +3564,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         for (uint ch = 0u; ch < rob_nch; ++ch) R[obase + ch] = 0.f;
     } else if (p.per_channel != 0u) {
         for (uint ch = 0u; ch < rob_nch; ++ch) {
-            float rc = clamp(s * exp(-d_ch[ch] / sig_ch[ch]) - p.r_t, 0.f, 1.f);
+            float rc = clamp(s * exp(-wb * d_ch[ch] / sig_ch[ch]) - p.r_t, 0.f, 1.f);
             if (!isfinite(rc)) rc = 0.f;        // OOB Dodgson -> NaN -> 0 (CPU parity)
             R[obase + ch] = rc * emc;
         }
@@ -3585,7 +3619,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         if (!isfinite(r_val)) r_val = 0.f;
         R[obase] = r_val * emc;
     } else {
-        float r_val = clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
+        float r_val = clamp(s * exp(-wb * d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
         // An OOB Dodgson sample arrives as +inf -> d_sq_ = +inf -> NaN; force 0.
         if (!isfinite(r_val)) r_val = 0.f;
         R[obase] = r_val * emc;

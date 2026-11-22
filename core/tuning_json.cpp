@@ -133,6 +133,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("k_stretch")) cfg.k_stretch = fv("k_stretch");
     if (has("k_shrink"))  cfg.k_shrink  = fv("k_shrink");
     if (has("kernel_tensor16")) cfg.kernel_tensor16 = bv("kernel_tensor16");
+    if (has("wronski_raw_res_min")) cfg.wronski_raw_res_min = bv("wronski_raw_res_min");
+    if (has("wronski_motion_boost")) cfg.wronski_motion_boost = bv("wronski_motion_boost");
+    if (has("wronski_alg6_moving_stats")) cfg.wronski_alg6_moving_stats = bv("wronski_alg6_moving_stats");
     if (has("frame_drop_enabled")) cfg.frame_drop_enabled = bv("frame_drop_enabled");
     if (has("frame_drop_radius")) cfg.frame_drop_radius = std::max(1, std::min(16, iv("frame_drop_radius")));
     if (has("frame_drop_tile_score")) cfg.frame_drop_tile_score = fv("frame_drop_tile_score");
@@ -266,6 +269,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_gpu"))          cfg.gcam_sabre_gpu = bv("gcam_sabre_gpu");
     if (has("gcam_sabre_gpu_guide"))    cfg.gcam_sabre_gpu_guide = bv("gcam_sabre_gpu_guide");
     if (has("gcam_sabre_raw_res"))      cfg.gcam_sabre_raw_res = bv("gcam_sabre_raw_res");
+    if (has("gcam_sabre_dilate_guide_equiv")) cfg.gcam_sabre_dilate_guide_equiv = bv("gcam_sabre_dilate_guide_equiv");
     if (has("gcam_save_reference"))     cfg.gcam_save_reference = bv("gcam_save_reference");
     if (has("gcam_sabre_bilinear_upscale")) cfg.gcam_sabre_bilinear_upscale = bv("gcam_sabre_bilinear_upscale");
     if (has("gcam_sabre_min5x5"))       cfg.gcam_sabre_min5x5 = bv("gcam_sabre_min5x5");

@@ -100,6 +100,12 @@ struct TuningParams: Equatable, Codable {
     var k_shrink: Float = 1.0
     /// Merge-kernel structure tensor from 16 Bayer-green gradients (GCam's tensor) instead of 4.
     var kernel_tensor16: Bool = true
+    /// Wronski raw-res robustness: Eq. 9's 5x5 minimum on the raw-resolution R.
+    var wronski_raw_res_min: Bool = true
+    /// Wronski path: GCam's x6 motion boost instead of the Mth motion prior.
+    var wronski_motion_boost: Bool = false
+    /// Wronski raw-res: Algorithm 6 literal noise correction (moving-frame sigma_p, lookup at mu_p).
+    var wronski_alg6_moving_stats: Bool = true
     /// Coarse gradient-overlay frame gate (drop rotated / parallax frames).
     var frame_drop_enabled: Bool = false
     var frame_drop_radius: Int = 9
@@ -338,6 +344,7 @@ struct TuningParams: Equatable, Codable {
     var gcam_sabre_gpu_guide: Bool = true
     // DEFAULT ON: gcam stats are upsampled+warped to input-frame res; R + §7 run there.
     var gcam_sabre_raw_res: Bool = true
+    var gcam_sabre_dilate_guide_equiv: Bool = true
     var gcam_save_reference: Bool = false
     /// GCam mode: request optical image stabilization (OIS) for every burst frame.
     var gcam_burst_ois: Bool = false
@@ -610,7 +617,7 @@ struct TuningParams: Equatable, Codable {
         case hf_min_texture_snr
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
-        case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16
+        case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16, wronski_raw_res_min, wronski_motion_boost, wronski_alg6_moving_stats
         case frame_drop_enabled, frame_drop_radius, frame_drop_tile_score, frame_drop_max_bad_pct, frame_drop_min_frames
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
@@ -639,7 +646,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
         case gcam_sabre_gpu_guide = "gcam_sabre_gpu_guide_v2"
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu = "gcam_sabre_gpu_v2", gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_save_reference, gcam_burst_ois, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu = "gcam_sabre_gpu_v2", gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_dilate_guide_equiv, gcam_save_reference, gcam_burst_ois, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only, gcam_sabre_flow_bilinear, gcam_sabre_kernel, gcam_cov_scale,
              gcam_unblocker_enabled, gcam_unblocker_scale, gcam_unblocker_offset,
              gcam_structure_match, gcam_structure_tau_strength, gcam_structure_tau_angle, gcam_structure_noise_k, gcam_structure_min_window
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
@@ -699,6 +706,9 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_tensor16 = try c.decodeIfPresent(Bool.self, forKey: .kernel_tensor16) ?? kernel_tensor16
+        wronski_raw_res_min = try c.decodeIfPresent(Bool.self, forKey: .wronski_raw_res_min) ?? wronski_raw_res_min
+        wronski_motion_boost = try c.decodeIfPresent(Bool.self, forKey: .wronski_motion_boost) ?? wronski_motion_boost
+        wronski_alg6_moving_stats = try c.decodeIfPresent(Bool.self, forKey: .wronski_alg6_moving_stats) ?? wronski_alg6_moving_stats
         frame_drop_enabled = try c.decodeIfPresent(Bool.self, forKey: .frame_drop_enabled) ?? frame_drop_enabled
         frame_drop_radius = try c.decodeIfPresent(Int.self, forKey: .frame_drop_radius) ?? frame_drop_radius
         frame_drop_tile_score = try c.decodeIfPresent(Float.self, forKey: .frame_drop_tile_score) ?? frame_drop_tile_score
@@ -811,6 +821,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
         gcam_sabre_gpu_guide = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu_guide) ?? gcam_sabre_gpu_guide
         gcam_sabre_raw_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_raw_res) ?? gcam_sabre_raw_res
+        gcam_sabre_dilate_guide_equiv = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_guide_equiv) ?? gcam_sabre_dilate_guide_equiv
         gcam_save_reference = try c.decodeIfPresent(Bool.self, forKey: .gcam_save_reference) ?? gcam_save_reference
         gcam_burst_ois = try c.decodeIfPresent(Bool.self, forKey: .gcam_burst_ois) ?? gcam_burst_ois
         gcam_sabre_bilinear_upscale = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_bilinear_upscale) ?? gcam_sabre_bilinear_upscale
@@ -2629,7 +2640,8 @@ final class CameraModel: NSObject, ObservableObject {
         // The output-resolution choice only means anything when nothing is
         // cropped away; any zoom is realised as crop-then-2x, which is what the
         // 2x lens button always did and is now what every magnification does.
-        let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
+        // Imports honour the 12MP / 48MP choice too (they used to be forced to 48MP).
+        let useSelectedOutputScale = cropZoomForCapture <= 1.0001
         let algorithmScale: Float = useSelectedOutputScale
             ? outputResolutionMode.algorithmScale
             : 2.0
@@ -2659,6 +2671,9 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "kernel_tensor16": NSNumber(value: tuningParams.kernel_tensor16),
+            "wronski_raw_res_min": NSNumber(value: tuningParams.wronski_raw_res_min),
+            "wronski_motion_boost": NSNumber(value: tuningParams.wronski_motion_boost),
+            "wronski_alg6_moving_stats": NSNumber(value: tuningParams.wronski_alg6_moving_stats),
             "frame_drop_enabled": NSNumber(value: tuningParams.frame_drop_enabled),
             "frame_drop_radius": NSNumber(value: tuningParams.frame_drop_radius),
             "frame_drop_tile_score": NSNumber(value: tuningParams.frame_drop_tile_score),
@@ -2756,6 +2771,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
             "gcam_sabre_gpu_guide": NSNumber(value: tuningParams.gcam_sabre_gpu_guide),
             "gcam_sabre_raw_res": NSNumber(value: tuningParams.gcam_sabre_raw_res),
+            "gcam_sabre_dilate_guide_equiv": NSNumber(value: tuningParams.gcam_sabre_dilate_guide_equiv),
             "gcam_save_reference": NSNumber(value: tuningParams.gcam_save_reference),
             "gcam_sabre_bilinear_upscale": NSNumber(value: tuningParams.gcam_sabre_bilinear_upscale),
             "gcam_sabre_min5x5": NSNumber(value: tuningParams.gcam_sabre_min5x5),
@@ -2824,12 +2840,15 @@ final class CameraModel: NSObject, ObservableObject {
         lastPipelineError = ""
         let progressBlock: (String, Float) -> Void = { [weak self] stage, frac in
             DispatchQueue.main.async {
-                self?.progress = 0.15 + frac * 0.85
+                // Never backwards within one run: merge fallback paths re-report from an
+                // earlier stage, which used to rewind the progress animation.
+                guard let self = self else { return }
+                self.progress = max(self.progress, 0.15 + frac * 0.85)
                 // The per-frame "Frame N: analyze" and "Noise ..." (alpha/beta/SNR)
                 // stage strings are no longer surfaced in the UI; only the progress
                 // bar advances and the sticky "Processing…" line stays. Errors are
                 // still captured so finish() can report them.
-                if stage.hasPrefix("Error") { self?.lastPipelineError = stage }
+                if stage.hasPrefix("Error") { self.lastPipelineError = stage }
             }
         }
         // Gyro-seeded pre-alignment: turn the buffered device attitude + per-frame

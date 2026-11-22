@@ -3364,7 +3364,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Config main_cfg = cfg;
     main_cfg.internal_reference_pass = false;
     int ref_index = 0;
-    Image preview = process_burst_loader_to_dng_impl(frame_count, loader_in, main_cfg, dng_path, progress,
+    // One continuous progress range for the whole call: with the Save Reference Frame pass
+    // the main merge fills [0, 0.8] and the reference pass [0.8, 1]; before, the reference
+    // pass reported from 0 again after the main one had reached 1, so the app's progress
+    // animation ran to the end and then started over.
+    const bool ref_pass_on = cfg.robustness_gcam_enabled && cfg.gcam_save_reference;
+    const float main_span = ref_pass_on ? 0.8f : 1.f;
+    const ProgressFn main_progress = [&progress, main_span](const std::string& s, float f) {
+        if (progress) progress(s, f * main_span);
+    };
+    Image preview = process_burst_loader_to_dng_impl(frame_count, loader_in, main_cfg, dng_path, main_progress,
                                                      maxPreviewDim, &ref_index);
     if (preview.h <= 0 || !cfg.robustness_gcam_enabled || !cfg.gcam_save_reference) return preview;
 
@@ -3382,8 +3391,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         return loader_in(ri, c, is_reference, crop_h, crop_w);
     };
     // Statuses prefixed so the app shows them as a second step and never reads them as the output's error.
-    const ProgressFn ref_progress = [&progress](const std::string& s, float f) {
-        if (progress) progress("Reference frame: " + s, f);
+    const ProgressFn ref_progress = [&progress, main_span](const std::string& s, float f) {
+        if (progress) progress("Reference frame: " + s, main_span + (1.f - main_span) * f);
     };
     const Image ref_preview = process_burst_loader_to_dng_impl(2, ref_loader, rc, ref_dng.string(), ref_progress,
                                                                std::max(1, std::min(maxPreviewDim, 64)), nullptr);

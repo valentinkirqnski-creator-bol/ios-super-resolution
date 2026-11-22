@@ -1305,12 +1305,16 @@ static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
 // (same sum-across-channels-then-combine-once order); an out-of-bounds
 // Dodgson sample arrives as +inf in comp_means and must stay +inf in the
 // difference so R lands at 0 downstream.
+// sigma_vars / index_means (optional, Algorithm 6 literal): the variance used for sigma_p
+// and the means the noise curves are looked up at; default = ref_vars / ref_means.
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
                                     Image& d_sq, Image& sigma_sq, int num_threads,
                                     bool sqrt_index = false,
-                                    Image* d_sq_ch = nullptr, Image* sigma_sq_ch = nullptr) {
+                                    Image* d_sq_ch = nullptr, Image* sigma_sq_ch = nullptr,
+                                    const Image* sigma_vars = nullptr,
+                                    const Image* index_means = nullptr) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
@@ -1323,8 +1327,16 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
+                // Noise lookup at the moving frame's mean when given (Alg. 6: sigma_t(mu_p));
+                // an out-of-frame comparison sample falls back to the reference mean (that
+                // pixel is rejected anyway through d_p).
+                f32 lookup = brightness;
+                if (index_means) {
+                    const f32 m = index_means->at(y, x, ch);
+                    if (std::isfinite(m)) lookup = m;
+                }
                 // sqrt guide (1.4): index by mean^2 -- see apply_noise_model.
-                f32 bidx = sqrt_index ? brightness * brightness : brightness;
+                f32 bidx = sqrt_index ? lookup * lookup : lookup;
                 int id_noise = (int)std::lround(1000.f * bidx);
                 if (!std::isfinite(bidx))
                     id_noise = 0;
@@ -1334,7 +1346,7 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                const f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                const f32 sigma_p_sq = sigma_vars ? sigma_vars->at(y, x, ch) : ref_vars.at(y, x, ch);
                 const f32 sigma_c = std::max(sigma_p_sq, sigma_t * sigma_t);
                 sigma_sq_ += sigma_c;
                 const f32 comp = comp_means.at(y, x, ch);
@@ -2194,17 +2206,20 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
     if (R.h <= 0 || R.w <= 0) return R;
     const f32 dz = cfg.gcam_sabre_dilate_deadzone;
     const f32 dv = (cfg.gcam_sabre_dilate_div != 0.f) ? cfg.gcam_sabre_dilate_div : 1.f;
-    // 5x5 sum of neighbour rejection (1 - keep) centred at (cy,cx) -> keep weight,
+    const int rr = std::max(1, std::min(8, cfg.gcam_sabre_dilate_radius));   // GCam: 2 (5x5)
+    const f32 dsc = cfg.gcam_sabre_dilate_scale;                              // GCam: 1
+    // (2rr+1)^2 sum of neighbour rejection (1 - keep) centred at (cy,cx) -> keep weight,
     // via the (sum - deadzone)/div contrast rule. Edge-clamped.
     auto dilate_at = [&](int cy, int cx) -> f32 {
         f32 sum = 0.f;
-        for (int i = -2; i <= 2; ++i) {
+        for (int i = -rr; i <= rr; ++i) {
             const int yy = (int)clampf((f32)(cy + i), 0.f, (f32)(R.h - 1));
-            for (int j = -2; j <= 2; ++j) {
+            for (int j = -rr; j <= rr; ++j) {
                 const int xx = (int)clampf((f32)(cx + j), 0.f, (f32)(R.w - 1));
                 sum += 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);   // rejection
             }
         }
+        if (dsc != 1.f) sum *= dsc;
         return clampf(1.f - (sum - dz) / dv, 0.f, 1.f);
     };
     Image out(R.h, R.w, 1);
@@ -2245,28 +2260,29 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
     // pixel recomputing 25 clamped reads with float->int edge clamps. The 5x5 sum then
     // adds the SAME values in the SAME order (row-major i, j) -> bit-identical to
     // dilate_at.
-    const int h = R.h, w = R.w, pw = w + 4;
+    const int h = R.h, w = R.w, pw = w + 2 * rr;
     constexpr int kBand = 32;
     const int n_bands = (h + kBand - 1) / kBand;
     parallel_rows(n_bands, 0, [&](int bi) {
         const int y0 = bi * kBand, y1 = std::min(h, y0 + kBand);
-        const int r0 = y0 - 2, nr = (y1 - y0) + 4;
+        const int r0 = y0 - rr, nr = (y1 - y0) + 2 * rr;
         std::vector<f32> rej((size_t)nr * pw);
         for (int r = 0; r < nr; ++r) {
             const int yy = std::min(h - 1, std::max(0, r0 + r));
             f32* row = &rej[(size_t)r * pw];
             for (int px = 0; px < pw; ++px) {
-                const int xx = std::min(w - 1, std::max(0, px - 2));
+                const int xx = std::min(w - 1, std::max(0, px - rr));
                 row[px] = 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);
             }
         }
         for (int y = y0; y < y1; ++y)
             for (int x = 0; x < w; ++x) {
                 f32 sum = 0.f;
-                for (int i = -2; i <= 2; ++i) {
-                    const f32* row = &rej[(size_t)(y + i - r0) * pw + x + 2];
-                    for (int j = -2; j <= 2; ++j) sum += row[j];
+                for (int i = -rr; i <= rr; ++i) {
+                    const f32* row = &rej[(size_t)(y + i - r0) * pw + x + rr];
+                    for (int j = -rr; j <= rr; ++j) sum += row[j];
                 }
+                if (dsc != 1.f) sum *= dsc;
                 out.at(y, x, 0) = clampf(1.f - (sum - dz) / dv, 0.f, 1.f);
             }
     });
@@ -3150,6 +3166,12 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     Image dil;
     if (resample) {
         Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
+        // Raw-res: the guide-equivalent footprint (9x9 raw ~ GCam's 5x5 guide) and the sum
+        // back in guide pixels (x 25/81) -- see Config::gcam_sabre_dilate_guide_equiv.
+        if (raw_res && cfg.gcam_sabre_dilate_guide_equiv) {
+            c2.gcam_sabre_dilate_radius = 4;
+            c2.gcam_sabre_dilate_scale = 25.f / 81.f;
+        }
         dil = robustness_gcam_dilate(R, c2);
     } else {
         dil = robustness_gcam_dilate(R, cfg);
@@ -3213,13 +3235,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // is on we keep it and Dodgson-upscale+warp it the same way as comp_means
     // (one extra hires buffer -- opt-in RAM cost).
     const bool gcam = cfg.robustness_gcam_enabled;
+    // Config::wronski_alg6_moving_stats: sigma_p and the noise lookup from the MOVING frame
+    // (Algorithm 6 lines 25, 28, 29), so its variance is upsampled and warped as well.
+    const bool alg6 = !gcam && cfg.wronski_alg6_moving_stats;
     Image comp_means, comp_vars;
     {
         Image comp_means_guide, comp_vars_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
-            if (!gcam) comp_vars_guide = Image();  // free unless GCam needs std_comp
+            if (!gcam && !alg6) comp_vars_guide = Image();  // free unless GCam / Alg. 6 need it
         }
         // GCam's SampleBicubic is a cubic B-spline; force that interpolant for the
         // gcam comp-stats warp (not Catmull-Rom).
@@ -3229,7 +3254,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                                         /*bilinear_flow=*/cfg.gcam_flow_bilinear_active(),
                                         cfg.affine_flow_enabled, gcam_bicubic,
                                         /*catmull=*/false);
-        if (gcam)
+        if (gcam || alg6)
             comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
                                            tile_size, cfg.num_threads,
                                            /*bilinear_flow=*/cfg.gcam_flow_bilinear_active(),
@@ -3256,7 +3281,9 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     else
         apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
                                 cfg.num_threads, cfg.robustness_guide_sqrt_active(),
-                                &d_sq_ch, &sigma_sq_ch);
+                                &d_sq_ch, &sigma_sq_ch,
+                                (alg6 && comp_vars.h == h && comp_vars.w == w) ? &comp_vars : nullptr,
+                                alg6 ? &comp_means : nullptr);
     // HF-artifact rejection needs the per-tile irregular-motion flags (the r_Mt
     // test); request them from compute_s only when the feature is on.
     std::vector<uint32_t> motion_irregular;
@@ -3270,6 +3297,11 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // Per-tile flow irregularity for the GCam strictness boost.
     std::vector<f32> gcam_irr;
     if (gcam) gcam_irr = compute_flow_irregularity(flow);
+    // Config::wronski_motion_boost: GCam's x6 boost replaces the motion prior M.
+    const bool wboost = !gcam && cfg.wronski_motion_boost;
+    std::vector<f32> wb_irr;
+    if (wboost) wb_irr = compute_flow_irregularity(flow);
+    const f32 wb_motion_px = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, tile_size) * (4128.f / 16.f);
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -3280,6 +3312,22 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     const int rch = per_channel ? nmc : 1;
     Image R(h, w, rch);
     if (s_select_out) *s_select_out = Image(h, w, 1);
+    // GCam motion boost for the Wronski mask: textured (mean reference variance above
+    // gcam_sabre_boost_var_mult x mean noise variance) AND the tile's 3x3 flow spread above the
+    // GCam motion threshold -> gcam_sabre_boost, else 1.
+    auto wronski_boost_at = [&](int y, int x) -> f32 {
+        const int ty = y / tile_size, tx = x / tile_size;
+        const size_t t = (size_t)ty * flow.nx + tx;
+        const f32 irr = (t < wb_irr.size()) ? wb_irr[t] : 0.f;
+        if (!(irr > wb_motion_px)) return 1.f;
+        const int ncl = std::min(ref_means.c, 3);
+        f32 rv = 0.f, nv = 0.f;
+        for (int ch = 0; ch < ncl; ++ch) {
+            rv += ref_vars.at(y, x, ch);
+            nv += std::max(guide_noise_var(cfg, ref_means.c, ch, std::max(ref_means.at(y, x, ch), 0.f)), 1e-12f);
+        }
+        return (rv > cfg.gcam_sabre_boost_var_mult * nv) ? cfg.gcam_sabre_boost : 1.f;
+    };
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             // Raw resolution throughout -- a plain tile_size divide is
@@ -3293,7 +3341,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 if (s_select_out) s_select_out->at(y, x) = 0.f;
                 continue;
             }
-            f32 s = S[pidx];
+            f32 s = wboost ? cfg.r_s2 : S[pidx];
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
@@ -3399,15 +3447,17 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                                                     cfg.gcam_mult, cfg.gcam_thresh, boost);
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             } else if (per_channel) {
+                const f32 wb = wboost ? wronski_boost_at(y, x) : 1.f;
                 for (int ch = 0; ch < rch; ++ch) {
                     f32 sc = sigma_sq_ch.at(y, x, ch);
-                    f32 rc = clampf(s * std::exp(-d_sq_ch.at(y, x, ch) / sc) - cfg.r_t, 0.f, 1.f);
+                    f32 rc = clampf(s * std::exp(-wb * d_sq_ch.at(y, x, ch) / sc) - cfg.r_t, 0.f, 1.f);
                     if (!std::isfinite(rc)) rc = 0.f;
                     R.at(y, x, ch) = rc;
                 }
             } else {
                 f32 sig = sigma_sq.at(y, x);
-                f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+                const f32 wb = wboost ? wronski_boost_at(y, x) : 1.f;
+                f32 r_val = clampf(s * std::exp(-wb * d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
                 if (!std::isfinite(r_val)) r_val = 0.f;
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             }
@@ -3420,8 +3470,40 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // on the guide lattice (Super Res Zoom's dilate pass), blended by
     // gcam_dilate_soft. (robustness_guide_res_bilinear does not reach here -- it
     // routes to the guide-res mask path instead.)
-    return gcam ? local_min_5x5_on_guide_grow(R, cfg.gcam_dilate_soft)
-                : local_min_5x5_on_guide(R);
+    if (gcam) return local_min_5x5_on_guide_grow(R, cfg.gcam_dilate_soft);
+    // Config::wronski_raw_res_min: Eq. 9 on the raw-resolution R itself.
+    return cfg.wronski_raw_res_min ? robustness_local_min_raw(R, 5) : local_min_5x5_on_guide(R);
+}
+
+Image robustness_local_min_raw(const Image& R, int n) {
+    if (R.h <= 0 || R.w <= 0) return R;
+    if (n < 1) n = 1;
+    const int lo = -((n - 1) / 2), hi = n / 2;
+    const int h = R.h, w = R.w, c = R.c;
+    Image tmp(h, w, c), out(h, w, c);
+    parallel_rows(h, 0, [&](int y) {
+        for (int x = 0; x < w; ++x)
+            for (int ch = 0; ch < c; ++ch) {
+                f32 mn = std::numeric_limits<f32>::infinity();
+                for (int dx = lo; dx <= hi; ++dx) {
+                    const int xx = std::min(w - 1, std::max(0, x + dx));
+                    mn = std::min(mn, R.at(y, xx, ch));
+                }
+                tmp.at(y, x, ch) = mn;
+            }
+    });
+    parallel_rows(h, 0, [&](int y) {
+        for (int x = 0; x < w; ++x)
+            for (int ch = 0; ch < c; ++ch) {
+                f32 mn = std::numeric_limits<f32>::infinity();
+                for (int dy = lo; dy <= hi; ++dy) {
+                    const int yy = std::min(h - 1, std::max(0, y + dy));
+                    mn = std::min(mn, tmp.at(yy, x, ch));
+                }
+                out.at(y, x, ch) = mn;
+            }
+    });
+    return out;
 }
 
 Image robustness_local_min_on_guide(const Image& R) {

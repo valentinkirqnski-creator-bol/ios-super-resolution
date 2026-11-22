@@ -1832,8 +1832,15 @@ struct RobMaskRawParamsCPU {
     float    gcam_na = 0.0f;
     float    gcam_nb = 0.0f;
     float    gcam_fvs = 1.0f;  // kFilterVarianceScale (Config::gcam_filter_var_scale)
+    // Config::wronski_motion_boost (twin of RobMaskRawParams' wb_* block).
+    uint32_t wb_enabled = 0;
+    float    wb_boost = 1.0f;
+    float    wb_var_mult = 25.0f;
+    float    wb_motion_px = 1e30f;
+    float    wb_s2 = 12.0f;
+    uint32_t alg6_moving = 0;   // Config::wronski_alg6_moving_stats
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 180, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 204, "RobMaskRawParamsCPU");
 
 // Twin of GcamSabreParams in HHSRKernels.metal (same order, all 4-byte scalars).
 struct GcamSabreParamsCPU {
@@ -2842,7 +2849,9 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // std_dev = max(min(std_ref, std_comp), min_std). Warp it the same way as
     // comp_means (opt-in RAM: one extra hires buffer). Inert dummy otherwise.
     id<MTLBuffer> b_comp_vars_hires = b_comp_means_hires;
-    if (cfg.robustness_gcam_enabled) {
+    // Also for the Wronski mask with Algorithm 6's moving-frame sigma_p.
+    const bool alg6_moving = !cfg.robustness_gcam_enabled && cfg.wronski_alg6_moving_stats;
+    if (cfg.robustness_gcam_enabled || alg6_moving) {
         int cvh = 0, cvw = 0;
         if (!rob_dogson(b_gvars, b_comp_vars_hires, gh, gw, nch, /*is_ref=*/false,
                         &flow, tile_size, cvh, cvw, cmd,
@@ -2989,6 +2998,13 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.gcam_na = cfg.noise_alpha_robustness();
     mp.gcam_nb = cfg.noise_beta_robustness();
     mp.gcam_fvs = cfg.gcam_filter_var_scale;
+    // Wronski: GCam motion boost instead of the motion prior (CPU twin: wronski_boost_at).
+    mp.wb_enabled = (!cfg.robustness_gcam_enabled && cfg.wronski_motion_boost) ? 1u : 0u;
+    mp.wb_boost = cfg.gcam_sabre_boost;
+    mp.wb_var_mult = cfg.gcam_sabre_boost_var_mult;
+    mp.wb_motion_px = cfg.gcam_sabre_motion_thresh * (float)std::max(1, tile_size) * (4128.f / 16.f);
+    mp.wb_s2 = cfg.r_s2;
+    mp.alg6_moving = alg6_moving ? 1u : 0u;
     // Flow (+ optional Jacobian) for the geometry test. Bound unconditionally
     // (the kernel declares them); inert single-element dummies when off.
     id<MTLBuffer> b_geom_flow = !flow.flow.empty()
@@ -3043,6 +3059,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     Image r;
     if (cfg.robustness_gcam_enabled)
         r = robustness_local_min_on_guide_grow(R_pre, cfg.gcam_dilate_soft);
+    else if (cfg.wronski_raw_res_min)
+        r = robustness_local_min_raw(R_pre, 5);     // Eq. 9 on the raw-resolution R
     else
         r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     // Learned refinement of the finished mask (Config::robust_nn_enabled). The
@@ -3294,11 +3312,15 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     if (dpipe) {
         id<MTLBuffer> b_dil = buf(nullptr, mask_b);
         if (b_dil) {
-            struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+            struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, radius; float deadzone, div, scale, _p2; };
             RobGcamDilateParamsCPU dp{};
             dp.h = (uint32_t)th; dp.w = (uint32_t)tw;
             dp.dilate_2x = (!resample && cfg.gcam_sabre_dilate_2x) ? 1u : 0u;
             dp.deadzone = cfg.gcam_sabre_dilate_deadzone; dp.div = cfg.gcam_sabre_dilate_div;
+            // Raw-res: guide-equivalent footprint and scale (twin of the CPU operator).
+            const bool guide_equiv = raw_res && cfg.gcam_sabre_dilate_guide_equiv;
+            dp.radius = guide_equiv ? 4u : 2u;
+            dp.scale = guide_equiv ? 25.f / 81.f : 1.f;
             bool dil_ok = false;
             @autoreleasepool {
                 id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
@@ -3333,6 +3355,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
         // Raw-res: the 2x guide->quarter downsample is forced OFF (already finer than guide).
         if (resample) {
             Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
+            if (raw_res && cfg.gcam_sabre_dilate_guide_equiv) {
+                c2.gcam_sabre_dilate_radius = 4;
+                c2.gcam_sabre_dilate_scale = 25.f / 81.f;
+            }
             dil = robustness_gcam_dilate(R_pre, c2);
         } else {
             dil = robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)

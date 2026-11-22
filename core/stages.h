@@ -192,6 +192,8 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // (which runs the mask kernel on GPU and this stage on CPU so both paths
 // stay bit-identical without a new shader).
 Image robustness_local_min_on_guide(const Image& R);
+// Eq. 9 directly on the raw-resolution R: n x n minimum per channel (edge-clamped).
+Image robustness_local_min_raw(const Image& R, int n = 5);
 
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
 // mode). Exposed so callers besides robustness.cpp (neural_flow's caller)

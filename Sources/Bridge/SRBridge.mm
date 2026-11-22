@@ -481,6 +481,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"kernel_tensor16"]) cfg.kernel_tensor16 = tuning[@"kernel_tensor16"].boolValue;
+    if (tuning[@"wronski_raw_res_min"]) cfg.wronski_raw_res_min = tuning[@"wronski_raw_res_min"].boolValue;
+    if (tuning[@"wronski_motion_boost"]) cfg.wronski_motion_boost = tuning[@"wronski_motion_boost"].boolValue;
+    if (tuning[@"wronski_alg6_moving_stats"])
+        cfg.wronski_alg6_moving_stats = tuning[@"wronski_alg6_moving_stats"].boolValue;
     if (tuning[@"frame_drop_enabled"]) cfg.frame_drop_enabled = tuning[@"frame_drop_enabled"].boolValue;
     if (tuning[@"frame_drop_radius"])
         cfg.frame_drop_radius = std::max(1, std::min(16, tuning[@"frame_drop_radius"].intValue));
@@ -682,6 +686,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_gpu"])            cfg.gcam_sabre_gpu = tuning[@"gcam_sabre_gpu"].boolValue;
     if (tuning[@"gcam_sabre_gpu_guide"])      cfg.gcam_sabre_gpu_guide = tuning[@"gcam_sabre_gpu_guide"].boolValue;
     if (tuning[@"gcam_sabre_raw_res"])        cfg.gcam_sabre_raw_res = tuning[@"gcam_sabre_raw_res"].boolValue;
+    if (tuning[@"gcam_sabre_dilate_guide_equiv"])
+        cfg.gcam_sabre_dilate_guide_equiv = tuning[@"gcam_sabre_dilate_guide_equiv"].boolValue;
     if (tuning[@"gcam_save_reference"])       cfg.gcam_save_reference = tuning[@"gcam_save_reference"].boolValue;
     if (tuning[@"gcam_sabre_bilinear_upscale"]) cfg.gcam_sabre_bilinear_upscale = tuning[@"gcam_sabre_bilinear_upscale"].boolValue;
     if (tuning[@"gcam_sabre_min5x5"]) cfg.gcam_sabre_min5x5 = tuning[@"gcam_sabre_min5x5"].boolValue;
