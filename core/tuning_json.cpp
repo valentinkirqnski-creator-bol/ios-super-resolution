@@ -136,6 +136,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("wronski_raw_res_min")) cfg.wronski_raw_res_min = bv("wronski_raw_res_min");
     if (has("wronski_motion_boost")) cfg.wronski_motion_boost = bv("wronski_motion_boost");
     if (has("wronski_alg6_moving_stats")) cfg.wronski_alg6_moving_stats = bv("wronski_alg6_moving_stats");
+    if (has("srsr_enabled")) cfg.srsr_enabled = bv("srsr_enabled");
+    if (has("srsr_denoise")) cfg.srsr_denoise = bv("srsr_denoise");
+    if (has("srsr_unblocker")) cfg.srsr_unblocker = bv("srsr_unblocker");
     if (has("frame_drop_enabled")) cfg.frame_drop_enabled = bv("frame_drop_enabled");
     if (has("frame_drop_radius")) cfg.frame_drop_radius = std::max(1, std::min(16, iv("frame_drop_radius")));
     if (has("frame_drop_tile_score")) cfg.frame_drop_tile_score = fv("frame_drop_tile_score");

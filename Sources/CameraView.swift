@@ -1412,6 +1412,20 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("SRSR Pipeline (GCam 6.1, Metal)")) {
+                    Toggle("Use SRSR Pipeline", isOn: $cam.tuningParams.srsr_enabled)
+                    Text("Replaces the ENTIRE processing pipeline with SRSR: the GCam 6.1 SABRE algorithm (Wronski et al. as Google ships it) running on the GPU. Halide-reference alignment (pyramid block matching, 3 inverse-compositional iterations, flow transfer, 3x3 flow median), the YCoCg square-root guide and per-pixel kernel covariance, ComputeFrameWeight rejection with the extra ×6 motion boost, the 5x5 dilate, the frame-fused anisotropic merge at 12MP or 48MP (the 12/48 pill), and the 3-level bilateral denoiser. The noise model is a Monte Carlo of each frame's DNG NoiseProfile through its white balance, sensor clip, exposure-match gain and square root. Peak memory is planned under 2.3 GB: frames stream through two GPU staging buffers and the output is merged, denoised and written to the DNG in bands, so the full image never sits in memory. Up to 16 frames; the first frame is the reference. If SRSR cannot run, the standard pipeline is used. None of the other settings apply while this is on. Off by default.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.srsr_enabled {
+                        Toggle("SRSR: Post-Merge Denoiser", isOn: $cam.tuningParams.srsr_denoise)
+                        Text("SABRE stage 4: three symmetric bilateral passes (1, 2, 4 pixels apart, doubled at 48MP) in GCam's luma/chroma space, stronger where few frames merged. Off = the merged image as is.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SRSR: Unblocker (reconstructed)", isOn: $cam.tuningParams.srsr_unblocker)
+                        Text("SABRE stage 2f, rebuilt from its constants (Google compiles it from Halide, so its arithmetic is not recoverable): caps merging where fine green detail would be lost under irregular motion. GCam's own map measured zero on the device, so off by default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
                 Section(header: Text("Motion Model")) {
                     Toggle("Bilinear Flow Upsample", isOn: Binding(
                         get: { !cam.tuningParams.flow_upsample_candidates },

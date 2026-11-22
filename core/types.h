@@ -1422,6 +1422,19 @@ struct Config {
     // curves sigma_t / d_t are looked up at the moving frame's mean mu_p. Off = the authors'
     // Python (1.4 / 460-main) form: the reference's variance and the reference mean.
     bool wronski_alg6_moving_stats = true;
+    // SRSR: replace the WHOLE pipeline with the GCam 6.1 SABRE port in
+    // core/SRSRKernels.metal + core/srsr_pipeline.cpp (Documents/srsr): Halide-
+    // reference alignment, YCoCg sqrt guide + kernel covariance, ComputeFrameWeight
+    // rejection with a per-frame Monte-Carlo noise LUT (DNG NoiseProfile x WB x
+    // exposure-match gain), 5x5 /3 dilate, COPY_MASK, the frame-fused RBF merge at
+    // 1x or 2x, the 3-level bilateral denoiser, and the DNG rows straight from the
+    // GPU in bands. Nothing of the normal pipeline runs; if SRSR cannot run (no
+    // GPU, out of memory, bad input) the normal pipeline is used instead.
+    bool  srsr_enabled = false;
+    bool  srsr_denoise = true;        // STAGE 4 three-level denoiser (off = merge only)
+    bool  srsr_unblocker = false;     // STAGE 2f reconstructed unblocker (GCam's is zero on device)
+    int   srsr_max_frames = 16;       // <= kSRSRMaxFrames (merge texture slots)
+    float srsr_memory_budget_mb = 2300.f;   // whole-process footprint ceiling the run plans for
     bool robustness_raw_resolution_active() const {
         // ALWAYS the Dodgson-x2 upscale+warp path for a Bayer burst: the half-res
         // 3-channel guide statistics are upscaled and flow-warped to raw resolution

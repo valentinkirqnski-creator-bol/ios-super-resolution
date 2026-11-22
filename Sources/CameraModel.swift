@@ -106,6 +106,10 @@ struct TuningParams: Equatable, Codable {
     var wronski_motion_boost: Bool = false
     /// Wronski raw-res: Algorithm 6 literal noise correction (moving-frame sigma_p, lookup at mu_p).
     var wronski_alg6_moving_stats: Bool = true
+    /// SRSR: the whole burst through the GCam 6.1 SABRE Metal pipeline (core/SRSRKernels.metal).
+    var srsr_enabled: Bool = false
+    var srsr_denoise: Bool = true
+    var srsr_unblocker: Bool = false
     /// Coarse gradient-overlay frame gate (drop rotated / parallax frames).
     var frame_drop_enabled: Bool = false
     var frame_drop_radius: Int = 9
@@ -617,7 +621,8 @@ struct TuningParams: Equatable, Codable {
         case hf_min_texture_snr
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
-        case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16, wronski_raw_res_min, wronski_motion_boost, wronski_alg6_moving_stats
+        case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16, wronski_raw_res_min, wronski_motion_boost, wronski_alg6_moving_stats,
+             srsr_enabled, srsr_denoise, srsr_unblocker
         case frame_drop_enabled, frame_drop_radius, frame_drop_tile_score, frame_drop_max_bad_pct, frame_drop_min_frames
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
@@ -709,6 +714,9 @@ struct TuningParams: Equatable, Codable {
         wronski_raw_res_min = try c.decodeIfPresent(Bool.self, forKey: .wronski_raw_res_min) ?? wronski_raw_res_min
         wronski_motion_boost = try c.decodeIfPresent(Bool.self, forKey: .wronski_motion_boost) ?? wronski_motion_boost
         wronski_alg6_moving_stats = try c.decodeIfPresent(Bool.self, forKey: .wronski_alg6_moving_stats) ?? wronski_alg6_moving_stats
+        srsr_enabled = try c.decodeIfPresent(Bool.self, forKey: .srsr_enabled) ?? srsr_enabled
+        srsr_denoise = try c.decodeIfPresent(Bool.self, forKey: .srsr_denoise) ?? srsr_denoise
+        srsr_unblocker = try c.decodeIfPresent(Bool.self, forKey: .srsr_unblocker) ?? srsr_unblocker
         frame_drop_enabled = try c.decodeIfPresent(Bool.self, forKey: .frame_drop_enabled) ?? frame_drop_enabled
         frame_drop_radius = try c.decodeIfPresent(Int.self, forKey: .frame_drop_radius) ?? frame_drop_radius
         frame_drop_tile_score = try c.decodeIfPresent(Float.self, forKey: .frame_drop_tile_score) ?? frame_drop_tile_score
@@ -2674,6 +2682,9 @@ final class CameraModel: NSObject, ObservableObject {
             "wronski_raw_res_min": NSNumber(value: tuningParams.wronski_raw_res_min),
             "wronski_motion_boost": NSNumber(value: tuningParams.wronski_motion_boost),
             "wronski_alg6_moving_stats": NSNumber(value: tuningParams.wronski_alg6_moving_stats),
+            "srsr_enabled": NSNumber(value: tuningParams.srsr_enabled),
+            "srsr_denoise": NSNumber(value: tuningParams.srsr_denoise),
+            "srsr_unblocker": NSNumber(value: tuningParams.srsr_unblocker),
             "frame_drop_enabled": NSNumber(value: tuningParams.frame_drop_enabled),
             "frame_drop_radius": NSNumber(value: tuningParams.frame_drop_radius),
             "frame_drop_tile_score": NSNumber(value: tuningParams.frame_drop_tile_score),

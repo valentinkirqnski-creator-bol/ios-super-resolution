@@ -22,6 +22,7 @@
 #include "fb_confidence.h"
 #include "burst_consensus.h"
 #include "cref.h"
+#include "srsr_pipeline.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1260,6 +1261,13 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 }
 
 } // namespace
+
+// The preview sampler, for the SRSR pipeline (srsr_pipeline.cpp) -- one place
+// decides how a linear sample becomes a preview pixel.
+void srsr_preview_store_sample(Image& preview, int py, int px, f32 cn0, f32 cn1, f32 cn2,
+                               const Config& work, int nch) {
+    preview_store_sample(preview, py, px, cn0, cn1, cn2, work, nch);
+}
 
 static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoaderFn& loader_in,
                                               const Config& cfg, const std::string& dng_path,
@@ -3360,6 +3368,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                              (fs::path(dng_path).stem().string() + "_reference.dng");
     std::error_code ec;
     fs::remove(ref_dng, ec);
+
+#if defined(__APPLE__) || defined(HHSR_WITH_SRSR)
+    // Config::srsr_enabled: the whole burst through the SRSR pipeline. If it cannot
+    // run (no GPU, memory, input), the standard pipeline below produces the DNG.
+    if (cfg.srsr_enabled && !cfg.internal_reference_pass) {
+        std::string why;
+        Image p = process_burst_srsr_to_dng(frame_count, loader_in, cfg, dng_path, progress, maxPreviewDim, &why);
+        if (p.h > 0) return p;
+        if (progress) progress("SRSR unavailable (" + why + "), using the standard pipeline", 0.01f);
+    }
+#endif
 
     Config main_cfg = cfg;
     main_cfg.internal_reference_pass = false;

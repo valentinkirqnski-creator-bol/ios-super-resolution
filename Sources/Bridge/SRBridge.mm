@@ -485,6 +485,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"wronski_motion_boost"]) cfg.wronski_motion_boost = tuning[@"wronski_motion_boost"].boolValue;
     if (tuning[@"wronski_alg6_moving_stats"])
         cfg.wronski_alg6_moving_stats = tuning[@"wronski_alg6_moving_stats"].boolValue;
+    if (tuning[@"srsr_enabled"]) cfg.srsr_enabled = tuning[@"srsr_enabled"].boolValue;
+    if (tuning[@"srsr_denoise"]) cfg.srsr_denoise = tuning[@"srsr_denoise"].boolValue;
+    if (tuning[@"srsr_unblocker"]) cfg.srsr_unblocker = tuning[@"srsr_unblocker"].boolValue;
     if (tuning[@"frame_drop_enabled"]) cfg.frame_drop_enabled = tuning[@"frame_drop_enabled"].boolValue;
     if (tuning[@"frame_drop_radius"])
         cfg.frame_drop_radius = std::max(1, std::min(16, tuning[@"frame_drop_radius"].intValue));

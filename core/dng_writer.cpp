@@ -320,7 +320,13 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(254, 0);                 // NewSubfileType
     ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make);
     ifd.ascii(272, camera_model.empty() ? "HandheldSR-x2" : camera_model);
-    ifd.longv(256, (uint32_t)W);
+    // A tiled lossless-JPEG file stores TileWidth columns per row (TIFF wants
+    // 16-multiples). When W is not one (SRSR's 4030), the stored image is
+    // declared at the padded width and DefaultCropSize trims it back to W:
+    // LibRaw (and everything built on it) wraps a padded tile row at
+    // ImageWidth, which sheared every row by the padding.
+    const uint32_t stored_w = tile_width > W ? (uint32_t)tile_width : (uint32_t)W;
+    ifd.longv(256, stored_w);
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
     // 7 = lossless JPEG (SOF3), 8 = Adobe Deflate (ZIP), 1 = uncompressed.
@@ -372,7 +378,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     ifd.longs(50719, {0, 0});
     ifd.longs(50720, {(uint32_t)W, (uint32_t)H});
-    ifd.longs(50829, {0, 0, (uint32_t)H, (uint32_t)W});
+    ifd.longs(50829, {0, 0, (uint32_t)H, stored_w});
 
     ifd.bytes4(50706, 1, 4, 0, 0);     // DNGVersion 1.4.0.0
     ifd.bytes4(50707, 1, 3, 0, 0);     // DNGBackwardVersion 1.3.0.0
@@ -1174,7 +1180,7 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     uint32_t width = 0, height = 0, strip_off = 0, strip_bc = 0, rows_per_strip = 0;
     uint16_t compression = 1, predictor = 1, spp = 0;
     uint32_t tile_w = 0, tile_h = 0;
-    std::vector<uint32_t> strip_offs, strip_bcs;
+    std::vector<uint32_t> strip_offs, strip_bcs, crop_size;
     // Pull a LONG/SHORT array out of an entry, inline or from the heap. A
     // lossless-JPEG DNG carries one entry per strip, so StripOffsets and
     // StripByteCounts are no longer single values.
@@ -1219,6 +1225,7 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
             case 324: read_array(type, count, val, strip_offs); break;
             case 325: read_array(type, count, val, strip_bcs); break;
             case 317: predictor = (uint16_t)as_long(predictor); break;
+            case 50720: read_array(type, count, val, crop_size); break;   // DefaultCropSize
             default: break;
         }
     }
@@ -1297,6 +1304,17 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
             undo_hdiff_rgb16(rgb.data() + (size_t)y * width * 3, (int)width);
     }
 
+    // Files whose stored width is padded to the tile width carry the real
+    // width in DefaultCropSize (origin 0,0); keep only those columns.
+    if (crop_size.size() == 2 && crop_size[0] > 0 && crop_size[0] < width &&
+        crop_size[1] == height) {
+        const uint32_t cw = crop_size[0];
+        for (uint32_t y = 1; y < height; ++y)
+            std::memmove(rgb.data() + (size_t)y * cw * 3, rgb.data() + (size_t)y * width * 3,
+                         (size_t)cw * 3u * sizeof(uint16_t));
+        rgb.resize((size_t)cw * height * 3);
+        width = cw;
+    }
     W = (int)width;
     H = (int)height;
     return true;
