@@ -488,6 +488,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"srsr_enabled"]) cfg.srsr_enabled = tuning[@"srsr_enabled"].boolValue;
     if (tuning[@"srsr_denoise"]) cfg.srsr_denoise = tuning[@"srsr_denoise"].boolValue;
     if (tuning[@"srsr_unblocker"]) cfg.srsr_unblocker = tuning[@"srsr_unblocker"].boolValue;
+    if (tuning[@"srsr_align_overlap16"]) cfg.srsr_align_overlap16 = tuning[@"srsr_align_overlap16"].boolValue;
     if (tuning[@"frame_drop_enabled"]) cfg.frame_drop_enabled = tuning[@"frame_drop_enabled"].boolValue;
     if (tuning[@"frame_drop_radius"])
         cfg.frame_drop_radius = std::max(1, std::min(16, tuning[@"frame_drop_radius"].intValue));
@@ -532,6 +533,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.cref_enabled = tuning[@"cref_enabled"].boolValue;
     if (tuning[@"hfnn_enabled"])
         cfg.hfnn_enabled = tuning[@"hfnn_enabled"].boolValue;
+    if (tuning[@"fusion_nn_enabled"])
+        cfg.fusion_nn_enabled = tuning[@"fusion_nn_enabled"].boolValue;
     if (tuning[@"hfnn_gate"])
         cfg.hfnn_gate = tuning[@"hfnn_gate"].floatValue;
     if (tuning[@"hfnn_strictness"])

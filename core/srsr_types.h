@@ -58,11 +58,14 @@ typedef struct {
 } SRSRPrepareUniforms;
 
 typedef struct { SRSRInt inWidth, inHeight, outWidth, outHeight; } SRSRDownsampleUniforms;
-typedef struct { SRSRInt width, height, tileSize, tilesX, tilesY; } SRSRGradientUniforms;
+// tileStride: tile origins are tileStride apart (tile i starts at i * tileStride); 0 = tileSize
+// (abutting tiles, the Halide reference). The finest level can use overlapping tiles.
+typedef struct { SRSRInt width, height, tileSize, tilesX, tilesY, tileStride; } SRSRGradientUniforms;
 typedef struct {
     SRSRInt width, height, tileSize, tilesX, tilesY, searchRadius, candidateCount, useL2;
+    SRSRInt tileStride;
 } SRSRBlockMatchingUniforms;
-typedef struct { SRSRInt width, height, tileSize, tilesX, tilesY; } SRSRICAUniforms;
+typedef struct { SRSRInt width, height, tileSize, tilesX, tilesY, tileStride; } SRSRICAUniforms;
 typedef struct {
     SRSRInt width, height;
     SRSRInt sourceTilesX, sourceTilesY;

@@ -74,7 +74,12 @@ static const int kOutputTile = 16, kOutputStride = 8;
 static const int kLevels = 4;
 
 // ---------------------------------------------------------------- geometry
-struct LevelGeo { int w, h, tile, radius; bool l2; int tx() const { return w / tile; } int ty() const { return h / tile; } };
+// stride: tile origins this far apart (= tile: abutting, the Halide reference; < tile: overlapping).
+struct LevelGeo {
+    int w, h, tile, radius; bool l2; int stride;
+    int tx() const { return (w - tile) / stride + 1; }
+    int ty() const { return (h - tile) / stride + 1; }
+};
 struct TransferGeo { int targetTile, targetStride, targetTilesX, targetTilesY; float gridScaleRatio, flowScale, offsetPx; };
 
 struct Geometry {
@@ -86,6 +91,7 @@ struct Geometry {
     std::vector<int> levelChain;                  // chain index of each level
     int flowTX = 0, flowTY = 0;
     TransferGeo finalTransfer{};
+    bool finalIsLevel0 = false;                   // level 0 already on the output flow grid: no final transfer
     float flowScaleX = 1, flowScaleY = 1, flowOffsetX = 0, flowOffsetY = 0;
     int unbW = 1, unbH = 1;
     float unbScaleX = 1, unbScaleY = 1;
@@ -93,7 +99,7 @@ struct Geometry {
     float borderMinX = 0, borderMinY = 0, borderMaxX = 1, borderMaxY = 1;
 
     // SRSRGeometry.swift, with the output grid decoupled from the Bayer grid.
-    bool build(int rw, int rh, const CFA& cfa, float scale, const Tuning& t, std::string& err) {
+    bool build(int rw, int rh, const CFA& cfa, float scale, const Tuning& t, bool overlap16, std::string& err) {
         rawW = rw; rawH = rh;
         // Crop phase so the first quad reads R G1 / G2 B (Documents/srsr D1).
         int ri = -1, rj = -1;
@@ -127,16 +133,22 @@ struct Geometry {
         }
         levels.clear();
         for (int i = 0; i < kLevels; ++i) {
-            const LevelGeo lv{shapes[i].first, shapes[i].second, kTileSizes[i], kSearchRadii[i], kNormL2[i]};
+            // Config::srsr_align_overlap16: the finest level matches and refines 16x16-quad tiles
+            // every 8 quads (half-overlapping) -- the merge's own flow grid -- instead of 32x32
+            // abutting tiles that are then resampled onto it.
+            const bool ov = overlap16 && i == 0;
+            const int tile = ov ? kOutputTile : kTileSizes[i];
+            const LevelGeo lv{shapes[i].first, shapes[i].second, tile, kSearchRadii[i], kNormL2[i],
+                              ov ? kOutputStride : tile};
             if (lv.w < lv.tile || lv.h < lv.tile) { err = "image too small for the alignment pyramid"; return false; }
             levels.push_back(lv);
         }
         const int coarsest = kLevels - 1;
         transfers.clear();
-        int flowTile = levels[coarsest].tile, flowStride = levels[coarsest].tile;
+        int flowTile = levels[coarsest].tile, flowStride = levels[coarsest].stride;
         for (int level = coarsest; level > 0; --level) {
             const int target = level - 1;
-            const int tt = levels[target].tile, ts = tt;
+            const int tt = levels[target].tile, ts = levels[target].stride;
             const float px = (float)kScaleFactors[target];
             TransferGeo tg;
             tg.targetTile = tt; tg.targetStride = ts;
@@ -151,6 +163,8 @@ struct Geometry {
         flowTX = (quadW - kOutputTile) / kOutputStride + 1;
         flowTY = (quadH - kOutputTile) / kOutputStride + 1;
         if (flowTX <= 0 || flowTY <= 0) { err = "image too small for the flow grid"; return false; }
+        finalIsLevel0 = flowTile == kOutputTile && flowStride == kOutputStride &&
+                        levels[0].tx() == flowTX && levels[0].ty() == flowTY;
         finalTransfer = TransferGeo{kOutputTile, kOutputStride, flowTX, flowTY,
                                     (float)flowStride / (float)kOutputStride, 1.0f,
                                     (float)flowTile / 2.0f - (float)kOutputTile / 2.0f};
@@ -472,7 +486,7 @@ struct Run {
     void reference_gradients() {
         for (int l = 0; l < kLevels; ++l) {
             const LevelGeo& lv = G.levels[l];
-            SRSRGradientUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty()};
+            SRSRGradientUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty(), lv.stride};
             be.tex(0, R.refChain[G.levelChain[l]].get());
             be.tex(1, R.gx[l].get());
             be.tex(2, R.gy[l].get());
@@ -518,7 +532,7 @@ struct Run {
             Tex* mov = R.movChain[G.levelChain[level]].get();
             {
                 const int span = 2 * lv.radius + 1, cand = span * span;
-                SRSRBlockMatchingUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty(), lv.radius, cand, lv.l2 ? 1 : 0};
+                SRSRBlockMatchingUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty(), lv.radius, cand, lv.l2 ? 1 : 0, lv.stride};
                 be.tex(0, ref); be.tex(1, mov); be.tex(2, cur); be.tex(3, R.flowA[level].get());
                 be.bytes(0, &u, sizeof u);
                 be.dispatch_bm(lv.tx(), lv.ty(), cand, r16((size_t)cand * 4), r16((size_t)lv.tile * lv.tile * 4));
@@ -527,7 +541,7 @@ struct Run {
             Tex* srcT = R.flowA[level].get();
             Tex* dstT = R.flowB[level].get();
             for (int it = 0; it < kIcaIterations; ++it) {
-                SRSRICAUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty()};
+                SRSRICAUniforms u{lv.w, lv.h, lv.tile, lv.tx(), lv.ty(), lv.stride};
                 be.tex(0, ref); be.tex(1, mov);
                 be.tex(2, R.gx[level].get()); be.tex(3, R.gy[level].get()); be.tex(4, R.hess[level].get());
                 be.tex(5, srcT); be.tex(6, dstT);
@@ -540,10 +554,13 @@ struct Run {
             flow_transfer(G.transfers[coarsest - level], level - 1, lv.tx(), lv.ty(), cur, R.flowIn[level - 1].get());
             cur = R.flowIn[level - 1].get();
         }
-        flow_transfer(G.finalTransfer, 0, G.levels[0].tx(), G.levels[0].ty(), cur, R.flowFinal.get());
+        if (!G.finalIsLevel0) {
+            flow_transfer(G.finalTransfer, 0, G.levels[0].tx(), G.levels[0].ty(), cur, R.flowFinal.get());
+            cur = R.flowFinal.get();
+        }
         {
             SRSRFlowMedianUniforms u{G.flowTX, G.flowTY};
-            be.tex(0, R.flowFinal.get()); be.tex(1, R.flowMedian.get());
+            be.tex(0, cur); be.tex(1, R.flowMedian.get());
             be.bytes(0, &u, sizeof u);
             be.dispatch(K::flow_median, G.flowTX, G.flowTY);
         }
@@ -673,7 +690,7 @@ Image process_burst_srsr_to_dng(int frame_count, const RawFrameLoaderFn& loader,
 
     Geometry G;
     std::string gerr;
-    if (!G.build(ref.w, ref.h, work.cfa, work.scale, T, gerr)) return fail(gerr);
+    if (!G.build(ref.w, ref.h, work.cfa, work.scale, T, work.srsr_align_overlap16, gerr)) return fail(gerr);
 
     // ---- frames and the memory budget
     int n = std::min({frame_count, (int)kSRSRMaxFrames, std::max(2, work.srsr_max_frames)});

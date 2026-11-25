@@ -51,6 +51,7 @@ targets:
           - "cref.cpp"
           - "ref_demosaic.cpp"
           - "hfnn.cpp"
+          - "fusion_nn.cpp"
           - "mann.cpp"
           - "fb_confidence.cpp"
           - "burst_consensus.cpp"

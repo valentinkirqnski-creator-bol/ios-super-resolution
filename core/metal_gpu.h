@@ -263,6 +263,9 @@ bool cref_refine_bands_metal(const Image& ref_grey, const Image& comp_aligned, c
                              int ny, int nx, int tile_size, const Config& cfg, Image& Rout);
 // HF-artifact NN (core/hfnn.h): 3 convs of one band on the GPU (cref_conv kernel) from
 // host-built features; returns the head's delta for the band's out_rows rows.
+// Fusion NN band (core/fusion_nn.cpp): logits of band rows keep0.. (keep_rows x w); false = use CPU.
+bool fusion_nn_band_metal(const float* X, int rows, int w, int row0, int img_h, int keep0,
+                          int keep_rows, float* out);
 bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int out_rows,
                      int vlo, int vhi, std::vector<float>& delta_out);
 // Misalignment-artifact NN (core/mann.h): the 4 convs of one window on the GPU

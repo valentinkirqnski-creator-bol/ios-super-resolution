@@ -337,8 +337,9 @@ kernel void srsr_gradient_tile_sums(texture2d<float, access::read>  gx    [[text
                                     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(u.tilesX) || gid.y >= uint(u.tilesY)) return;
     const int ts = u.tileSize;
-    const int originX = int(gid.x) * ts;
-    const int originY = int(gid.y) * ts;
+    const int st = u.tileStride > 0 ? u.tileStride : ts;
+    const int originX = int(gid.x) * st;
+    const int originY = int(gid.y) * st;
     float sum_gxx = 0.0f, sum_gxy = 0.0f, sum_gyy = 0.0f;
     for (int ry = 0; ry < ts; ++ry) {
         for (int rx = 0; rx < ts; ++rx) {
@@ -409,8 +410,9 @@ kernel void srsr_block_matching(texture2d<float, access::read>  reference  [[tex
     const float2 seed = xy(initial.read(tileID));
     const int centerX = int(rint(seed.x));
     const int centerY = int(rint(seed.y));
-    const int originX = int(tileID.x) * ts;
-    const int originY = int(tileID.y) * ts;
+    const int st = u.tileStride > 0 ? u.tileStride : ts;
+    const int originX = int(tileID.x) * st;
+    const int originY = int(tileID.y) * st;
     const int threadCount = int(tgSize.x * tgSize.y);
     for (int i = int(lane); i < ts * ts; i += threadCount)
         referenceTile[i] = reference.read(uint2(uint(originX + i % ts), uint(originY + i / ts))).x;
@@ -451,8 +453,9 @@ static inline void srsr_block_matching_tile(texture2d<float, access::read>  refe
     const float2 seed = xy(initial.read(tileID));
     const int centerX = int(rint(seed.x));
     const int centerY = int(rint(seed.y));
-    const int originX = int(tileID.x) * ts;
-    const int originY = int(tileID.y) * ts;
+    const int st = u.tileStride > 0 ? u.tileStride : ts;
+    const int originX = int(tileID.x) * st;
+    const int originY = int(tileID.y) * st;
     for (int i = 0; i < ts * ts; ++i)
         refTile[i] = reference.read(uint2(uint(originX + i % ts), uint(originY + i / ts))).x;
     int bestX = 0, bestY = 0;
@@ -486,8 +489,9 @@ kernel void srsr_ica_iteration(texture2d<float, access::read>  reference  [[text
     const int ts = u.tileSize;
     const int2 extent = int2(u.width, u.height);
     const float2 flow = xy(initial.read(gid));
-    const int originX = int(gid.x) * ts;
-    const int originY = int(gid.y) * ts;
+    const int st = u.tileStride > 0 ? u.tileStride : ts;
+    const int originX = int(gid.x) * st;
+    const int originY = int(gid.y) * st;
     float rhsX = 0.0f, rhsY = 0.0f;
     for (int py = 0; py < ts; ++py) {
         for (int px = 0; px < ts; ++px) {

@@ -1420,6 +1420,9 @@ struct CameraView: View {
                         Toggle("SRSR: Post-Merge Denoiser", isOn: $cam.tuningParams.srsr_denoise)
                         Text("SABRE stage 4: three symmetric bilateral passes (1, 2, 4 pixels apart, doubled at 48MP) in GCam's luma/chroma space, stronger where few frames merged. Off = the merged image as is.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("SRSR: 16px Overlapping Alignment", isOn: $cam.tuningParams.srsr_align_overlap16)
+                        Text("The finest alignment level matches and refines 16x16 tiles (32x32 sensor pixels) every 8, half-overlapping, so every motion vector the merge reads is measured on its own tile. Off = GCam's reference: 32x32 tiles (64x64 sensor pixels) side by side, resampled onto the merge's grid -- steadier in flat or very noisy areas, but one translation per 64 pixels, so rotation leaves steps at tile borders. On by default.")
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("SRSR: Unblocker (reconstructed)", isOn: $cam.tuningParams.srsr_unblocker)
                         Text("SABRE stage 2f, rebuilt from its constants (Google compiles it from Halide, so its arithmetic is not recoverable): caps merging where fine green detail would be lost under irregular motion. GCam's own map measured zero on the device, so off by default.")
                             .font(.footnote).foregroundColor(.secondary)
@@ -1790,6 +1793,12 @@ struct CameraView: View {
                         Text("Disagreement at which the confidence falls to 61%. Lower = stricter. Default 0.75.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                }
+
+                Section(header: Text("Learned Fusion Weights")) {
+                    Toggle("Fusion NN", isOn: $cam.tuningParams.fusion_nn_enabled)
+                    Text("Replaces the Wronski robustness mask with a small network (~2k weights) that decides, per pixel, how much each frame contributes to the merge, the reference included. It compares each aligned frame with the reference and with the average of the whole burst, so a frame that disagrees with the rest is down-weighted where it disagrees. Trained end to end through this app's merge on the final image (synthetic bursts made from two of this camera's DNGs), with the app's own alignment. Costs one extra decode + alignment pass over the burst; the network runs on the GPU (CPU fallback). Wronski path only: ignored when the GCam mask is on. Experimental; off by default.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {

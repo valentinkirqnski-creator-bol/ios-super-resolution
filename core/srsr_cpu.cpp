@@ -10,12 +10,16 @@
 #undef constant
 
 #include "srsr_backend.h"
+#include "srsr_cpu_hook.h"
 #include <cstdio>
 #include <memory>
 #include <vector>
 
 namespace hhsr {
 namespace srsr {
+
+void (*g_cpu_dispatch_hook)(const CpuDispatchView&) = nullptr;
+
 namespace {
 
 struct CTex : Tex {
@@ -78,6 +82,29 @@ public:
     }
 
     void dispatch(K k, int w, int h) override {
+        run(k, w, h);
+        if (g_cpu_dispatch_hook) notify(k, w, h);
+    }
+
+private:
+    void notify(K k, int w, int h) const {
+        CpuDispatchView v;
+        v.kernel = k; v.w = w; v.h = h;
+        v.tex = [this](int i) {
+            CpuSlotView s;
+            const CTex* t = (i >= 0 && i < 80) ? tex_[i] : nullptr;
+            if (!t) return s;
+            s.bound = true; s.fmt = t->fmt; s.w = t->t.w; s.h = t->t.h; s.nc = t->t.nc;
+            s.f = t->t.f.empty() ? nullptr : t->t.f.data();
+            s.u = t->t.u.empty() ? nullptr : t->t.u.data();
+            return s;
+        };
+        v.bytes = bytes_;
+        v.buf = [this](int i) -> void* { return (i >= 0 && i < 8 && buf_[i]) ? buf_[i]->contents() : nullptr; };
+        g_cpu_dispatch_hook(v);
+    }
+
+    void run(K k, int w, int h) {
         switch (k) {
             case K::prepare: {
                 const float* src = (const float*)buf_[1]->contents();

@@ -139,6 +139,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("srsr_enabled")) cfg.srsr_enabled = bv("srsr_enabled");
     if (has("srsr_denoise")) cfg.srsr_denoise = bv("srsr_denoise");
     if (has("srsr_unblocker")) cfg.srsr_unblocker = bv("srsr_unblocker");
+    if (has("srsr_align_overlap16")) cfg.srsr_align_overlap16 = bv("srsr_align_overlap16");
     if (has("frame_drop_enabled")) cfg.frame_drop_enabled = bv("frame_drop_enabled");
     if (has("frame_drop_radius")) cfg.frame_drop_radius = std::max(1, std::min(16, iv("frame_drop_radius")));
     if (has("frame_drop_tile_score")) cfg.frame_drop_tile_score = fv("frame_drop_tile_score");
@@ -172,6 +173,7 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("cref_enabled")) cfg.cref_enabled = bv("cref_enabled");
     if (has("ref_demosaic_fallback")) cfg.ref_demosaic_fallback = bv("ref_demosaic_fallback");
     if (has("hfnn_enabled")) cfg.hfnn_enabled = bv("hfnn_enabled");
+    if (has("fusion_nn_enabled")) cfg.fusion_nn_enabled = bv("fusion_nn_enabled");
     if (has("hfnn_gate")) cfg.hfnn_gate = fv("hfnn_gate");
     if (has("hfnn_strictness")) cfg.hfnn_strictness = fv("hfnn_strictness");
     if (has("mann_enabled")) cfg.mann_enabled = bv("mann_enabled");

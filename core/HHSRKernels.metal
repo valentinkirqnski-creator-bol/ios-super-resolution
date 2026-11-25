@@ -13,6 +13,8 @@ using namespace metal;
 #include "robust_nn_shared.h"
 // 16-gradient merge-kernel structure tensor (Config::kernel_tensor16), shared with kernels.cpp.
 #include "tensor16_shared.h"
+// Fusion NN (Config::fusion_nn_enabled): per-pixel layers shared with core/fusion_nn.cpp.
+#include "fusion_nn_shared.h"
 
 constant float PI = 3.14159265358979323846f;
 
@@ -5596,4 +5598,39 @@ kernel void cref_head(device const float* act [[buffer(0)]],
     const float r0 = clamp(F[q], 0.02f, 0.98f);
     const float z = log(r0 / (1.f - r0)) + d;
     Rout[gid.y * p.w + gid.x] = 1.f / (1.f + exp(-z));
+}
+
+// ---- Fusion NN (Config::fusion_nn_enabled, core/fusion_nn.cpp, tools/fusion_nn) ----------------
+// One band (FnnBand: rows x w, image row row0, zero padding outside the image) through the
+// network, layer by layer; the per-pixel arithmetic is fusion_nn_shared.h, verbatim the CPU path's.
+// pad0 / pad1 of FnnBand carry the head's kept rows (first band row, count).
+kernel void fnn_stem(device const float* X [[buffer(0)]],
+                     device float* A [[buffer(1)]],
+                     constant float* Wt [[buffer(2)]],
+                     constant float* Bt [[buffer(3)]],
+                     constant FnnBand& p [[buffer(4)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= p.w || (int)gid.y >= p.rows) return;
+    fnn_stem_px(X, A, Wt, Bt, p, (int)gid.x, (int)gid.y);
+}
+
+kernel void fnn_block(device const float* src [[buffer(0)]],
+                      device float* dst [[buffer(1)]],
+                      constant float* dw [[buffer(2)]],
+                      constant float* dwb [[buffer(3)]],
+                      constant float* pw [[buffer(4)]],
+                      constant float* pwb [[buffer(5)]],
+                      constant FnnBand& p [[buffer(6)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= p.w || (int)gid.y >= p.rows) return;
+    fnn_block_px(src, dst, dw, dwb, pw, pwb, p, (int)gid.x, (int)gid.y);
+}
+
+kernel void fnn_head(device const float* src [[buffer(0)]],
+                     device float* logits [[buffer(1)]],
+                     constant float* hw [[buffer(2)]],
+                     constant FnnBand& p [[buffer(3)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= p.w || (int)gid.y >= p.pad1) return;
+    logits[gid.y * (uint)p.w + gid.x] = fnn_head_px(src, hw, p, (int)gid.x, p.pad0 + (int)gid.y);
 }

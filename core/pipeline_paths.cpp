@@ -22,6 +22,7 @@
 #include "fb_confidence.h"
 #include "burst_consensus.h"
 #include "cref.h"
+#include "fusion_nn.h"
 #include "srsr_pipeline.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1260,6 +1261,48 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
     return con;
 }
 
+// Fusion NN burst mean (Config::fusion_nn_enabled): the variance-stabilised quad-RGB guide of
+// every frame, each comparison frame sampled where its flow puts the reference pixel, averaged
+// over the burst with the reference included -- the network's "frame - burst mean" input
+// (tools/fusion_nn/fusion.py net_inputs). Decodes and aligns every comparison frame once more,
+// with the same steps as compute_mask_nn_consensus; frames whose flow is not plain per-tile
+// vectors are left out. Empty on failure (the analytic mask is then kept).
+static Image compute_fusion_nn_consensus(const RawFrameLoaderFn& loader,
+                                         const std::vector<int>& comp_indices,
+                                         const Image& ref_gat, const Image& ref_grey,
+                                         const Pyramid& ref_pyr, int tile_size, int cons_ts,
+                                         int ref_h, int ref_w, float a, float b, Config& work) {
+    if (ref_gat.h <= 0 || ref_gat.w <= 0) return Image();
+    Image sum = ref_gat;
+    int cnt = 1;
+    for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
+        const int k = comp_indices[(size_t)pos];
+        Image comp = loader(k, work, false, ref_h, ref_w);
+        if (comp.h != ref_h || comp.w != ref_w) continue;
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        GlobalWarp gw = estimate_global_warp(ref_grey, comp_grey, comp.h, comp.w, k, work);
+        if (gw.warped) continue;
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size, 0.f, 0.f, 0.f);
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w,
+                                     cons_ts, work.r_Mt, work.num_threads,
+                                     work.grey_tile_size(cons_ts));
+        comp_grey = Image();
+        if (!fusion_nn_flow_supported(flow)) continue;
+        Image g = fusion_nn_guide(comp, work);
+        comp = Image();
+        Image wg = fusion_nn_warp_guide(g, flow, cons_ts, work.num_threads);
+        g = Image();
+        fusion_nn_gat(wg, a, b, work.num_threads);
+        if (wg.h != sum.h || wg.w != sum.w) continue;
+        for (size_t i = 0; i < sum.data.size(); ++i) sum.data[i] += wg.data[i];
+        ++cnt;
+    }
+    if (cnt < 2) return Image();
+    const float inv = 1.f / (float)cnt;
+    for (float& v : sum.data) v *= inv;
+    return sum;
+}
+
 } // namespace
 
 // The preview sampler, for the SRSR pipeline (srsr_pipeline.cpp) -- one place
@@ -1548,7 +1591,8 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
     // pushed into the frame's slot by metal_frame_put_rob only AFTER those steps), so they
     // keep residency there; only the Wronski resident path (mask produced inside a GPU
     // slice, no host copy) still has to give it up for them.
-    const bool host_mask_editors = work.hfnn_enabled || work.mann_enabled || work.fb_conf_enabled;
+    const bool host_mask_editors = work.hfnn_enabled || work.mann_enabled || work.fb_conf_enabled ||
+                                   work.fusion_nn_enabled;
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled && !work.cref_enabled &&
                       !(host_mask_editors && !work.robustness_gcam_enabled) &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
@@ -1984,6 +2028,38 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
                                                       ref_h, ref_w, work);
         prof_add_cpu("mask_nn:consensus-ms", prof_now_ms() - t_cons);
         prof_add_cpu("mask_nn:consensus-ok", mask_nn_consensus.h > 0 ? 1.0 : 0.0);
+    }
+    // ---- Fusion NN (Config::fusion_nn_enabled): reference guide, burst mean (pre-pass) and
+    // the reference's own logits, once per burst. Each comparison frame's mask is replaced
+    // below by its weight relative to the reference, exp(l_f - l_ref). Wronski path only;
+    // memory-guarded (fails closed to the analytic mask).
+    bool fnn_ready = false;
+    Image fnn_ref_gat, fnn_mean_gat, fnn_ref_logits;
+    float fnn_a = 0.f, fnn_b = 0.f;
+    if (work.fusion_nn_enabled && work.bayer_mode && !work.robustness_gcam_enabled &&
+        fusion_nn_noise(work, fnn_a, fnn_b) && ref.h > 0 && ref.w > 0 && !ref.data.empty()) {
+        const double t_fnn = prof_now_ms();
+        const uint64_t avail = prof_available_bytes();
+        const uint64_t need = (uint64_t)fusion_nn_frame_bytes(ref.h, ref.w, ref.h, ref.w, 3) +
+                              300ull * 1024ull * 1024ull;
+        if (avail != 0 && avail < need) {
+            prof_add_cpu("fusion_nn#skipped-lowmem", 1.0);
+        } else {
+            report("Fusion NN: burst pre-pass", 0.07f);
+            fnn_ref_gat = fusion_nn_guide(ref, work);
+            fusion_nn_gat(fnn_ref_gat, fnn_a, fnn_b, work.num_threads);
+            fnn_mean_gat = compute_fusion_nn_consensus(loader, comp_indices, fnn_ref_gat, ref_grey,
+                                                       ref_pyr, tile_size, cons_ts, ref_h, ref_w,
+                                                       fnn_a, fnn_b, work);
+            if (fnn_mean_gat.h == fnn_ref_gat.h && fnn_mean_gat.w == fnn_ref_gat.w) {
+                fnn_ref_logits = fusion_nn_logits(fnn_ref_gat, fnn_ref_gat, fnn_mean_gat, true,
+                                                  fnn_a, fnn_b, work.num_threads);
+                fnn_ready = fnn_ref_logits.h == fnn_ref_gat.h && fnn_ref_logits.w == fnn_ref_gat.w;
+            }
+        }
+        prof_add_cpu("fusion_nn:prepass-ms", prof_now_ms() - t_fnn);
+        prof_add_cpu("fusion_nn:ready", fnn_ready ? 1.0 : 0.0);
+        if (!fnn_ready) { fnn_ref_gat = Image(); fnn_mean_gat = Image(); fnn_ref_logits = Image(); }
     }
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
@@ -2461,6 +2537,30 @@ static Image process_burst_loader_to_dng_impl(int frame_count, const RawFrameLoa
                 rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
                                                           work.frame_discard_enabled);
             prof_add_cpu("comp:mann", prof_now_ms() - t_mann);
+        }
+        // Fusion NN: this frame's learned weight relative to the reference replaces the mask,
+        // in the mask's own shape, before the confidence / discard steps below see it.
+        if (fnn_ready && rob8.empty() && rob.h > 0 && rob.w > 0 && rob.c > 0 &&
+            comp.h == ref_h && comp.w == ref_w && !comp.data.empty() && fusion_nn_flow_supported(flow)) {
+            const double t_fnn = prof_now_ms();
+            Image g = fusion_nn_guide(comp, work);
+            Image wg = fusion_nn_warp_guide(g, flow, merge_ts, work.num_threads);
+            g = Image();
+            fusion_nn_gat(wg, fnn_a, fnn_b, work.num_threads);
+            Image lf = fusion_nn_logits(fnn_ref_gat, wg, fnn_mean_gat, false, fnn_a, fnn_b,
+                                        work.num_threads);
+            wg = Image();
+            Image R = (lf.h > 0) ? fusion_nn_mask(lf, fnn_ref_logits, rob.h, rob.w, rob.c, work.num_threads)
+                                 : Image();
+            if (R.h == rob.h && R.w == rob.w && R.c == rob.c && !R.data.empty()) {
+                rob = std::move(R);
+                rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero, &rob_accept_frac,
+                                                          work.frame_discard_enabled);
+                prof_add_cpu("fusion_nn#frames", 1.0);
+            } else {
+                prof_add_cpu("fusion_nn#failed", 1.0);
+            }
+            prof_add_cpu("comp:fusion-nn", prof_now_ms() - t_fnn);
         }
         // Forward-backward confidence: multiply the finished mask (host fp32 and/or the
         // 8-bit merge-res mask) by C(e). Last, so no refiner can raise it back.

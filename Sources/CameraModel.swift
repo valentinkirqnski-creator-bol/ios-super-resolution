@@ -110,6 +110,7 @@ struct TuningParams: Equatable, Codable {
     var srsr_enabled: Bool = false
     var srsr_denoise: Bool = true
     var srsr_unblocker: Bool = false
+    var srsr_align_overlap16: Bool = true
     /// Coarse gradient-overlay frame gate (drop rotated / parallax frames).
     var frame_drop_enabled: Bool = false
     var frame_drop_radius: Int = 9
@@ -141,6 +142,8 @@ struct TuningParams: Equatable, Codable {
     /// is rejected, blend the reference toward its own edge-directed demosaic.
     /// HF-artifact NN (core/hfnn.h): replaces HF artifact rejection (exclusive); no second alignment.
     var hfnn_enabled: Bool = false
+    /// Fusion NN (core/fusion_nn.h): learned per-frame merge weights replace the Wronski mask.
+    var fusion_nn_enabled: Bool = false
     var hfnn_gate: Float = 0.35
     var hfnn_strictness: Float = 0
     /// Misalignment-artifact NN (core/mann.h): irregular-flow tiles only; replaces HF rejection,
@@ -622,7 +625,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink, kernel_tensor16, wronski_raw_res_min, wronski_motion_boost, wronski_alg6_moving_stats,
-             srsr_enabled, srsr_denoise, srsr_unblocker
+             srsr_enabled, srsr_denoise, srsr_unblocker, srsr_align_overlap16
         case frame_drop_enabled, frame_drop_radius, frame_drop_tile_score, frame_drop_max_bad_pct, frame_drop_min_frames
         case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta, coarsest_search_radius_fixed4
         case global_prealignment_enabled, global_prealignment_choose_reference
@@ -631,6 +634,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_enabled, robustness_save_mask, structure_map_save, cref_enabled
         case ref_demosaic_fallback, ref_demosaic_share_lo, ref_demosaic_share_hi
         case hfnn_enabled, hfnn_gate, hfnn_strictness
+        case fusion_nn_enabled
         case mann_enabled, mann_gate, mann_strictness
         case fb_conf_enabled, fb_conf_full, fb_conf_tau_px, fb_conf_subdiv
         case fb_consensus_enabled, fb_consensus_tau_px, fb_conf_along_edges
@@ -717,6 +721,7 @@ struct TuningParams: Equatable, Codable {
         srsr_enabled = try c.decodeIfPresent(Bool.self, forKey: .srsr_enabled) ?? srsr_enabled
         srsr_denoise = try c.decodeIfPresent(Bool.self, forKey: .srsr_denoise) ?? srsr_denoise
         srsr_unblocker = try c.decodeIfPresent(Bool.self, forKey: .srsr_unblocker) ?? srsr_unblocker
+        srsr_align_overlap16 = try c.decodeIfPresent(Bool.self, forKey: .srsr_align_overlap16) ?? srsr_align_overlap16
         frame_drop_enabled = try c.decodeIfPresent(Bool.self, forKey: .frame_drop_enabled) ?? frame_drop_enabled
         frame_drop_radius = try c.decodeIfPresent(Int.self, forKey: .frame_drop_radius) ?? frame_drop_radius
         frame_drop_tile_score = try c.decodeIfPresent(Float.self, forKey: .frame_drop_tile_score) ?? frame_drop_tile_score
@@ -737,6 +742,7 @@ struct TuningParams: Equatable, Codable {
         cref_enabled = try c.decodeIfPresent(Bool.self, forKey: .cref_enabled) ?? cref_enabled
         ref_demosaic_fallback = try c.decodeIfPresent(Bool.self, forKey: .ref_demosaic_fallback) ?? ref_demosaic_fallback
         hfnn_enabled = try c.decodeIfPresent(Bool.self, forKey: .hfnn_enabled) ?? hfnn_enabled
+        fusion_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .fusion_nn_enabled) ?? fusion_nn_enabled
         hfnn_gate = try c.decodeIfPresent(Float.self, forKey: .hfnn_gate) ?? hfnn_gate
         hfnn_strictness = try c.decodeIfPresent(Float.self, forKey: .hfnn_strictness) ?? hfnn_strictness
         mann_enabled = try c.decodeIfPresent(Bool.self, forKey: .mann_enabled) ?? mann_enabled
@@ -2685,6 +2691,7 @@ final class CameraModel: NSObject, ObservableObject {
             "srsr_enabled": NSNumber(value: tuningParams.srsr_enabled),
             "srsr_denoise": NSNumber(value: tuningParams.srsr_denoise),
             "srsr_unblocker": NSNumber(value: tuningParams.srsr_unblocker),
+            "srsr_align_overlap16": NSNumber(value: tuningParams.srsr_align_overlap16),
             "frame_drop_enabled": NSNumber(value: tuningParams.frame_drop_enabled),
             "frame_drop_radius": NSNumber(value: tuningParams.frame_drop_radius),
             "frame_drop_tile_score": NSNumber(value: tuningParams.frame_drop_tile_score),
@@ -2705,6 +2712,7 @@ final class CameraModel: NSObject, ObservableObject {
             "cref_enabled": NSNumber(value: tuningParams.cref_enabled),
             "ref_demosaic_fallback": NSNumber(value: tuningParams.ref_demosaic_fallback),
             "hfnn_enabled": NSNumber(value: tuningParams.hfnn_enabled),
+            "fusion_nn_enabled": NSNumber(value: tuningParams.fusion_nn_enabled),
             "hfnn_gate": NSNumber(value: tuningParams.hfnn_gate),
             "hfnn_strictness": NSNumber(value: tuningParams.hfnn_strictness),
             "mann_enabled": NSNumber(value: tuningParams.mann_enabled),

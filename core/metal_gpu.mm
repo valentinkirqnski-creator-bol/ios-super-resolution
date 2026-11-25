@@ -9,6 +9,8 @@
 #include "cref_weights.h"
 #include "hfnn.h"
 #include "hfnn_weights.h"
+#include "fusion_nn.h"
+#include "fusion_nn_shared.h"
 #include "mann.h"
 #include "mann_weights.h"
 #include "dng_writer.h"
@@ -6751,6 +6753,65 @@ bool hfnn_band_metal(const std::vector<float>& F, int rows, int w, int halo, int
             for (int ch = 0; ch < kHfnnCh; ++ch) d += kHfnnWO[ch] * act[(size_t)ch * plane + q];
             delta_out[(size_t)r * w + x] = d;
         }
+    return true;
+  }
+}
+
+// Fusion NN band on the GPU (core/fusion_nn.cpp twin, Config::fusion_nn_enabled): X is the band's
+// 8 input planes interleaved per pixel (rows x w), the same buffer the CPU path reads; runs the
+// stem, the 4 residual depthwise-separable blocks and the head with fusion_nn_shared.h and writes
+// the logits of band rows keep0 .. keep0 + keep_rows - 1 to out (keep_rows x w). False on any
+// failure -- the caller then runs the identical CPU path.
+bool fusion_nn_band_metal(const float* X, int rows, int w, int row0, int img_h, int keep0,
+                          int keep_rows, float* out) {
+  @autoreleasepool {
+    if (!X || !out || rows <= 0 || w <= 0 || keep_rows <= 0 || !metal_gpu_init()) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> ps = c.pipe("fnn_stem");
+    id<MTLComputePipelineState> pb = c.pipe("fnn_block");
+    id<MTLComputePipelineState> ph = c.pipe("fnn_head");
+    if (!ps || !pb || !ph) return false;
+    const FusionNnWeights W = fusion_nn_weights();
+    const size_t px = (size_t)rows * (size_t)w;
+    id<MTLBuffer> bX = buf(X, px * FNN_K_CIN * sizeof(float));
+    id<MTLBuffer> bA = buf(nullptr, px * FNN_K_C * sizeof(float));
+    id<MTLBuffer> bB = buf(nullptr, px * FNN_K_C * sizeof(float));
+    id<MTLBuffer> bO = buf(nullptr, (size_t)keep_rows * (size_t)w * sizeof(float));
+    if (!bX || !bA || !bB || !bO) return false;
+    FnnBand p{w, rows, row0, img_h, 1, keep0, keep_rows, 0};
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return false;
+    [enc setBuffer:bX offset:0 atIndex:0];
+    [enc setBuffer:bA offset:0 atIndex:1];
+    [enc setBytes:W.stem length:9 * FNN_K_CIN * FNN_K_C * sizeof(float) atIndex:2];
+    [enc setBytes:W.stem_b length:FNN_K_C * sizeof(float) atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    dispatch2(enc, ps, (NSUInteger)w, (NSUInteger)rows);
+    id<MTLBuffer> cur = bA, nxt = bB;
+    for (int b = 0; b < 4; ++b) {
+        p.dil = W.dil[b];
+        [enc setBuffer:cur offset:0 atIndex:0];
+        [enc setBuffer:nxt offset:0 atIndex:1];
+        [enc setBytes:W.dw[b] length:9 * FNN_K_C * sizeof(float) atIndex:2];
+        [enc setBytes:W.dw_b[b] length:FNN_K_C * sizeof(float) atIndex:3];
+        [enc setBytes:W.pw[b] length:FNN_K_C * FNN_K_C * sizeof(float) atIndex:4];
+        [enc setBytes:W.pw_b[b] length:FNN_K_C * sizeof(float) atIndex:5];
+        [enc setBytes:&p length:sizeof(p) atIndex:6];
+        dispatch2(enc, pb, (NSUInteger)w, (NSUInteger)rows);
+        std::swap(cur, nxt);
+    }
+    [enc setBuffer:cur offset:0 atIndex:0];
+    [enc setBuffer:bO offset:0 atIndex:1];
+    [enc setBytes:W.head length:(FNN_K_C + 1) * sizeof(float) atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    dispatch2(enc, ph, (NSUInteger)w, (NSUInteger)keep_rows);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:fusion-nn");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    memcpy(out, [bO contents], (size_t)keep_rows * (size_t)w * sizeof(float));
     return true;
   }
 }

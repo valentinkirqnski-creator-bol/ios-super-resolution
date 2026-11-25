@@ -1433,6 +1433,9 @@ struct Config {
     bool  srsr_enabled = false;
     bool  srsr_denoise = true;        // STAGE 4 three-level denoiser (off = merge only)
     bool  srsr_unblocker = false;     // STAGE 2f reconstructed unblocker (GCam's is zero on device)
+    // Finest alignment level on 16x16-quad tiles every 8 quads (half-overlapping, the merge's own
+    // flow grid) instead of the Halide reference's 32x32 abutting tiles resampled onto it.
+    bool  srsr_align_overlap16 = true;
     int   srsr_max_frames = 16;       // <= kSRSRMaxFrames (merge texture slots)
     float srsr_memory_budget_mb = 2300.f;   // whole-process footprint ceiling the run plans for
     bool robustness_raw_resolution_active() const {
@@ -2053,6 +2056,12 @@ struct Config {
     // alignment. Forces hf_artifact_removal_enabled off for the burst. OFF by default;
     // a no-op until trained weights are compiled in (core/hfnn_weights.h).
     bool  hfnn_enabled = false;
+    // Fusion NN (core/fusion_nn.h, tools/fusion_nn model r1): a learned per-frame, per-pixel
+    // merge weight replaces the analytic robustness on the Wronski path -- trained end to end
+    // through this merge on the final image (synthetic bursts from two of this camera's DNGs).
+    // Needs a pre-pass (decode + align every frame once more) for its burst-mean input.
+    // Ignored on the GCam path. OFF by default.
+    bool  fusion_nn_enabled = false;
     float hfnn_gate = 0.35f;
     // Logit offset subtracted from the network output: + = stricter (rejects more),
     // - = more lenient. 0 = the validated operating point baked into the weights
