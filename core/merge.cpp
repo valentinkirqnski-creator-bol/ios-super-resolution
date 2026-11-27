@@ -132,11 +132,18 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const int py = (int)(lr_y / (f32)tile_size);
             // Bilinear between tile centres: block matching gives one vector
             // per tile, and consuming it nearest makes the warp piecewise
-            // constant, which rotation turns into a visible tile grid. The
-            // mask samples the SAME way, so it still grades the fetch that
-            // actually happens. See FlowField::sample_bilinear.
-            f32 flowx = flow.dx(py, px);
-            f32 flowy = flow.dy(py, px);
+            // constant, which rotation turns into a visible tile grid and puts
+            // a staircase on every sharp edge at the tile seams. The mask
+            // samples the SAME way (robustness.cpp uses sample_bilinear), so it
+            // still grades the fetch that actually happens. Default on; set
+            // Config::merge_flow_bilinear=false for the old nearest behaviour.
+            f32 flowx, flowy;
+            if (cfg.merge_flow_bilinear) {
+                flow.sample_bilinear(lr_y, lr_x, tile_size, flowx, flowy);
+            } else {
+                flowx = flow.dx(py, px);
+                flowy = flow.dy(py, px);
+            }
 
             // Which coordinate space R lives in is decided by R's ACTUAL
             // dimensions, not Config::robustness_raw_resolution_active():

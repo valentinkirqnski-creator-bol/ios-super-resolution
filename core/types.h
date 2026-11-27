@@ -880,6 +880,19 @@ struct Config {
     // still reachable.
     bool merge_robustness_bilinear = true;
 
+    // Fetch the per-tile flow bilinearly in the merge (FlowField::sample_bilinear)
+    // rather than nearest. One vector per tile consumed nearest makes the warp
+    // piecewise constant, so a sharp edge is reconstructed at a slightly
+    // different position in each tile and reads as a staircase at tile seams --
+    // visible on edges even at 1x, and magnified at 2x. The step is sub-pixel
+    // and flips at every boundary, so it sits below the mask's d/sigma threshold
+    // (local statistics barely change under a sub-pixel shift) yet above the
+    // viewer's. Bilinear removes the discontinuity. The robustness/mask path
+    // already samples the flow bilinearly (robustness.cpp), so this makes the
+    // merge the same consumer the mask grades -- the comment on
+    // FlowField::sample_bilinear requires every consumer to agree.
+    bool merge_flow_bilinear = true;
+
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
     // anywhere in the chain.
